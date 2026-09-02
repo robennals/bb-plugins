@@ -1,14 +1,19 @@
 ---
 name: pr-review
-description: Use when asked to review a GitHub pull request and report findings to the BB Code Review panel — i.e. whenever a prompt names a review id like "owner/repo#123" or tells you to run `bb code-review submit`. Covers the findings JSON contract and the submit step.
+description: Use when asked to review a GitHub pull request and report findings to BB's Code Review plugin — i.e. whenever a prompt names a review id like "owner/repo#123" or tells you to run `bb code-review submit`. Covers the findings JSON contract, the submit step, and the issue-list tools you keep afterwards.
 ---
 
 # Reporting pull request review findings
 
-The Code Review panel starts a review by spawning a thread with a review id
-(`owner/repo#123`) and a findings path. Your job is to review the PR and hand
-the findings back as structured JSON. The user then edits and posts each
-comment themselves.
+The Code Review plugin starts a review by spawning a thread — *this* thread —
+with a review id (`owner/repo#123`) and a findings path. Your job is to review
+the PR and hand the findings back as structured JSON. They then appear in the
+**Findings** tab of this thread's side panel, where the reviewer reads them and
+posts each comment themselves.
+
+The review pass is not the end of the thread. The reviewer works through the
+issues in that tab and asks you about them here, and you have `code_review_*`
+tools for the issue list while you are on a review thread (see "Afterwards").
 
 ## The loop
 
@@ -49,6 +54,24 @@ comment themselves.
    `bb code-review context --review <owner/repo#123> --json` reprints the
    configured skills and the findings path if you lose them.
 
+## Afterwards: the issue list is yours to read and edit
+
+Once the findings are in, they are rows the reviewer is looking at, and these
+tools are that list:
+
+| Tool | What it does |
+| --- | --- |
+| `code_review_list_issues` | Every issue with its **id**, severity, location, and state. Call this first: ids change when a review is re-run. |
+| `code_review_get_issue` | One issue in full, including the comment as it currently stands — which may be the reviewer's own edit, not your suggestion. |
+| `code_review_set_issue_comment` | Re-word what an issue would post. Only when asked, and say what you changed. |
+| `code_review_set_issue_state` | Dismiss an issue that turned out to be wrong, or restore a dismissed one. |
+| `code_review_add_issue` | Add one issue the conversation turned up. Appended to the end, so the reviewer's place in the list does not move. |
+
+Answer from these rather than from memory: the reviewer may have edited a
+comment or dismissed an issue since you wrote it. Use a tool for a single
+change; write and submit a whole findings file only for a fresh review pass,
+which replaces every issue the reviewer has not yet acted on.
+
 ## Writing good findings
 
 Each finding has these parts, and they are not interchangeable:
@@ -67,9 +90,10 @@ Each finding has these parts, and they are not interchangeable:
 - **`references`** — other places in the repo the finding depends on: the
   function it contradicts, the existing pattern it diverges from, the test that
   should have caught it. Each is `{ file, startLine, endLine, note }`, and the
-  panel shows that code next to the finding, so a reference saves the reviewer
-  the lookup. Citing `path/to/file.ts:42` inline in your prose works too — the
-  panel picks those up — but a `references` entry with a `note` is better.
+  Findings tab shows that code next to the finding, so a reference saves the
+  reviewer the lookup. Citing `path/to/file.ts:42` inline in your prose works
+  too — the tab picks those up — but a `references` entry with a `note` is
+  better.
 - **`file` / `startLine` / `endLine`** — where the comment anchors. Use line
   numbers in the **new** file (`side: "RIGHT"`); use `"LEFT"` and old-file line
   numbers only when commenting on a deleted line. A finding with no line
@@ -95,7 +119,8 @@ the whole file** if any path does not exist, listing the bad ones with the
 likely intended path. Fix them and submit again. `bb code-review files` lists
 the PR's paths; the diff shows them too.
 
-This matters because the panel shows the code at each path next to the finding.
+This matters because the Findings tab shows the code at each path next to the
+finding.
 A bare filename is ambiguous — a real repo has dozens of `index.ts` — so the
 reviewer either sees the wrong file or none.
 
@@ -105,7 +130,9 @@ reviewer either sees the wrong file or none.
   `bb code-review`, fetched server-side where GitHub access is configured. The
   agent sandbox often cannot reach `gh` anyway.
 - **Never post to GitHub yourself**, and never approve or request changes. Every
-  comment is reviewed and posted by hand from the panel.
+  comment is reviewed and posted by hand by the reviewer, from the Findings
+  tab. There is deliberately no tool that posts — editing an issue's comment is
+  as far as you go.
 - **Never modify the PR**, push commits, or edit files in the checkout.
 - A single malformed finding is dropped with a warning and the rest are
   imported, so a stray field will not lose the whole review — but check the

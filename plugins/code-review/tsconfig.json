@@ -24,6 +24,7 @@
     "server.ts",
     "app.tsx",
     "review-core.ts",
+    "code-location.ts",
     "*.test.ts",
     "*.test.tsx",
     "components",

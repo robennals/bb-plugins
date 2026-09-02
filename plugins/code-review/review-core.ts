@@ -305,62 +305,27 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "",
     `    bb code-review submit --review ${args.reviewId} --file ${args.findingsPath}`,
     "",
-    "That imports the findings into the Code Review panel and is the last step.",
+    "That imports the findings and is the last step of the review pass. They appear",
+    "in the Findings tab of this thread's side panel, where the reviewer reads them.",
+    "",
+    "## 5. Then stay for the questions",
+    "",
+    "The reviewer works through the issues in that tab and will ask you about them",
+    "here. You have `code_review_*` tools for the issue list — use them to answer",
+    "from what was actually recorded, and to act on what the reviewer decides",
+    "(re-word a comment, dismiss an issue that turned out to be wrong, add one you",
+    "and the reviewer find together). Re-submitting a findings file is for a whole",
+    "re-review; a single change is a tool call.",
     "",
     "## Rules",
     "",
     "- Do NOT post anything to GitHub, approve, or request changes. Each comment is",
-    "  reviewed and posted by hand from the Code Review panel.",
+    "  reviewed and posted by hand by the reviewer.",
     "- Do NOT modify the PR, push commits, or edit files in the checkout.",
     "- If you find nothing, still submit a file with an empty `findings` array.",
   ]
     // Only the conditional lines above are dropped; the literal blank strings
     // are the paragraph breaks that make this render as Markdown.
-    .filter((line): line is string => line !== null)
-    .join("\n");
-}
-
-export function buildDiscussionPrompt(args: {
-  repo: string;
-  number: number;
-  prTitle: string;
-  finding: {
-    file: string;
-    startLine: number | null;
-    endLine: number | null;
-    title: string;
-    background: string;
-    problem: string;
-    suggestedFix: string;
-    suggestedComment: string;
-  };
-}): string {
-  const { finding } = args;
-  const location =
-    finding.startLine === null
-      ? finding.file
-      : finding.endLine !== null && finding.endLine !== finding.startLine
-        ? `${finding.file}:${finding.startLine}-${finding.endLine}`
-        : `${finding.file}:${finding.startLine}`;
-  return [
-    `I am reviewing GitHub pull request ${args.repo}#${args.number} — ${args.prTitle}.`,
-    "",
-    `A review pass raised this finding on \`${location}\`:`,
-    "",
-    `**${finding.title}**`,
-    "",
-    finding.background === "" ? null : `Background: ${finding.background}`,
-    `Problem: ${finding.problem}`,
-    finding.suggestedFix === "" ? null : `Suggested fix: ${finding.suggestedFix}`,
-    "",
-    "Draft comment:",
-    "",
-    "> " + finding.suggestedComment.split("\n").join("\n> "),
-    "",
-    "Read the relevant code and the PR diff, then tell me whether this finding is",
-    "correct, overstated, or wrong, and what the comment should actually say.",
-    "Do not post anything to GitHub.",
-  ]
     .filter((line): line is string => line !== null)
     .join("\n");
 }

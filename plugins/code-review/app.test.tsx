@@ -36,6 +36,7 @@ const PR: PullRequestDto = {
   labels: [],
   reviewRequests: [{ login: "robennals", teamSlug: null }],
   reviewStatus: "reported",
+  reviewThreadId: "thr_1",
   openFindings: 1,
   postedFindings: 0,
 };
@@ -77,7 +78,6 @@ const FINDING: FindingDto = {
   postedAt: null,
   postedAs: "comment",
   postAnchor: { kind: "line" as const, line: 12, startLine: 10, adjusted: false },
-  discussionThreadId: null,
   references: [],
 };
 
@@ -130,25 +130,49 @@ function rpc(overrides: Record<string, unknown> = {}) {
       hasPendingReview: false,
     }),
     getFindingCode: () => CODE,
+    reviewForThread: () => ({ review: REVIEW, openFindings: 1, configuredSkills: ["code-review"] }),
     getPanelState: () => ({ repo: null, filter: null }),
     setPanelState: () => ({ repo: null, filter: null }),
     ...overrides,
   };
 }
 
+/** Props the host hands a thread panel tab. */
+const FINDINGS_TAB = { threadId: "thr_1", params: null };
+
+/** The Findings tab, on its issue list. */
+const findingsTab = (app: Awaited<ReturnType<typeof load>>) => app.threadPanelActions[0]!;
+
+/**
+ * The Findings tab, opened on the issue rather than the list. The tab has no
+ * route, so the only way in is the one the reviewer uses: click the row.
+ */
+async function renderIssue(options: Parameters<typeof renderSlot>[2]) {
+  const app = await load();
+  const slot = renderSlot(findingsTab(app), FINDINGS_TAB, options);
+  const row = await slot.findByText("Off by one");
+  fireEvent.click(row.closest("button") ?? row);
+  await slot.findByText("All issues");
+  return slot;
+}
+
 describe("registrations", () => {
-  it("registers one nav panel with a discussion fixed tab that names it", async () => {
-    // loadPluginApp applies the host's own validation, so this catches slot-id,
-    // path, and fixed-tab/panel mismatches that would break the real panel.
+  it("registers the inbox panel, the Findings tab, and the header control", async () => {
+    // loadPluginApp applies the host's own validation, so this catches slot-id
+    // and path mistakes that would break the real surfaces.
     const app = await load();
     expect(app.navPanels).toHaveLength(1);
     const panel = app.navPanels[0];
     expect(panel?.id).toBe("code-review");
     expect(panel?.path).toBe("code-review");
-    expect(panel?.fixedTabs).toHaveLength(1);
-    // A fixed tab whose panelId does not match its panel is rejected by BB.
-    expect(panel?.fixedTabs?.[0]?.panelId).toBe(panel?.id);
-    expect(panel?.fixedTabs?.[0]?.id).toBe("discussion");
+    // The issue list is a thread panel tab now, not a fixed tab on the panel.
+    expect(panel?.fixedTabs ?? []).toHaveLength(0);
+    expect(app.threadPanelActions).toHaveLength(1);
+    expect(app.threadPanelActions[0]?.id).toBe("findings");
+    // "flush": the tab owns its own padding and scrolling.
+    expect(app.threadPanelActions[0]?.layout).toBe("flush");
+    expect(app.threadHeaderActions).toHaveLength(1);
+    expect(app.threadHeaderActions[0]?.id).toBe("findings");
   });
 });
 
@@ -196,6 +220,106 @@ describe("the pull request list", () => {
     slot.lifecycle.unmount();
   });
 
+  it("opens the review thread of a PR that already has one", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
+    const row = await slot.findByText("Add a thing");
+    fireEvent.click(row.closest("button") ?? row);
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual({
+        method: "toThread",
+        threadId: "thr_1",
+      });
+    });
+    // Opening an existing review must not start another one.
+    expect(slot.inspection.rpcCalls.some((entry) => entry.method === "startReview")).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("starts the review of a PR that has none, then opens its thread", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: rpc({
+          listPullRequests: () => ({
+            pullRequests: [
+              { ...PR, reviewStatus: "none", reviewThreadId: null, openFindings: 0 },
+            ],
+          }),
+          startReview: () => ({ review: { ...REVIEW, threadId: "thr_9" } }),
+        }),
+      },
+    );
+    // The row says what pressing it does, because pressing it spawns an agent.
+    await slot.findByText("Review");
+    const row = await slot.findByText("Add a thing");
+    fireEvent.click(row.closest("button") ?? row);
+    await waitFor(() => {
+      expect(slot.inspection.rpcCalls).toContainEqual({
+        method: "startReview",
+        input: { repo: "acme/app", number: 7 },
+      });
+      expect(slot.inspection.navigateCalls).toContainEqual({
+        method: "toThread",
+        threadId: "thr_9",
+      });
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("says so when a started review somehow has no thread to open", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: rpc({
+          listPullRequests: () => ({
+            pullRequests: [
+              { ...PR, reviewStatus: "none", reviewThreadId: null, openFindings: 0 },
+            ],
+          }),
+          startReview: () => ({ review: { ...REVIEW, threadId: null } }),
+        }),
+      },
+    );
+    const row = await slot.findByText("Add a thing");
+    fireEvent.click(row.closest("button") ?? row);
+    await waitFor(() => expect(slot.queryByText("starting")).toBeNull());
+    // Nowhere to go, so it says nothing happened rather than navigating.
+    expect(slot.inspection.navigateCalls).toEqual([]);
+    slot.lifecycle.unmount();
+  });
+
+  it("says why nothing happened when starting a review fails", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: rpc({
+          listPullRequests: () => ({
+            pullRequests: [
+              { ...PR, reviewStatus: "none", reviewThreadId: null, openFindings: 0 },
+            ],
+          }),
+          startReview: () => {
+            throw new Error("no project for acme/app");
+          },
+        }),
+      },
+    );
+    const row = await slot.findByText("Add a thing");
+    fireEvent.click(row.closest("button") ?? row);
+    // The row comes back rather than staying stuck on "starting".
+    await waitFor(() => expect(slot.queryByText("starting")).toBeNull());
+    await slot.findByText("Review");
+    expect(slot.inspection.navigateCalls).toEqual([]);
+    slot.lifecycle.unmount();
+  });
+
   it("tells the user how to fix an unconfigured gh instead of failing silently", async () => {
     const app = await load();
     const slot = renderSlot(
@@ -216,7 +340,7 @@ describe("the pull request list", () => {
 describe("a PR's issue list", () => {
   it("deep-links to a PR through the panel's subPath", async () => {
     const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7" }, { rpc: rpc() });
+    const slot = renderSlot(findingsTab(app), FINDINGS_TAB, { rpc: rpc() });
     await slot.findByText("Add a thing");
     const call = slot.inspection.rpcCalls.find((entry) => entry.method === "getPullRequest");
     expect(call?.input).toEqual({ repo: "acme/app", number: 7 });
@@ -225,7 +349,7 @@ describe("a PR's issue list", () => {
 
   it("shows each issue as a title, a gist, and a location — not the full detail", async () => {
     const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7" }, { rpc: rpc() });
+    const slot = renderSlot(findingsTab(app), FINDINGS_TAB, { rpc: rpc() });
     await slot.findByText("Off by one");
     await slot.findByText("The loop runs one past the end of the buffer.");
     await slot.findByText("src/a.ts:10-12");
@@ -237,7 +361,7 @@ describe("a PR's issue list", () => {
 
   it("offers a way into the PR on GitHub", async () => {
     const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7" }, { rpc: rpc() });
+    const slot = renderSlot(findingsTab(app), FINDINGS_TAB, { rpc: rpc() });
     const link = await slot.findByText("Open on GitHub");
     expect(link.closest("a")?.getAttribute("href")).toBe("https://github.com/acme/app/pull/7");
     slot.lifecycle.unmount();
@@ -246,8 +370,8 @@ describe("a PR's issue list", () => {
   it("falls back to the problem when the agent wrote no summary", async () => {
     const app = await load();
     const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7" },
+      findingsTab(app),
+      FINDINGS_TAB,
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -266,8 +390,8 @@ describe("a PR's issue list", () => {
   it("explains a review that has not run yet", async () => {
     const app = await load();
     const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7" },
+      findingsTab(app),
+      FINDINGS_TAB,
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -287,8 +411,8 @@ describe("a PR's issue list", () => {
   it("surfaces a failed review's error", async () => {
     const app = await load();
     const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7" },
+      findingsTab(app),
+      FINDINGS_TAB,
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -309,8 +433,7 @@ describe("an issue and its code", () => {
   const detailPath = "pr/acme/app/7/f/f1";
 
   it("shows the full detail above the code", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: detailPath }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     await slot.findByText("Off by one");
     await slot.findByText("The loop walks the buffer.");
     await slot.findByText("It runs one past the end.");
@@ -321,8 +444,7 @@ describe("an issue and its code", () => {
   });
 
   it("asks for the code with a small amount of context by default", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: detailPath }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     await slot.findByText("const x = 1;");
     const call = slot.inspection.rpcCalls.find((entry) => entry.method === "getFindingCode");
     expect(call?.input).toEqual({ findingId: "f1", context: 3 });
@@ -331,8 +453,7 @@ describe("an issue and its code", () => {
 
   it("numbers snippet lines by their real position in the file", async () => {
     // The whole value of this view is that the numbers match the finding.
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: detailPath }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     await slot.findByText("const x = 1;");
     for (const lineNumber of ["9", "10", "11", "12", "13"]) {
       await slot.findByText(lineNumber);
@@ -342,8 +463,7 @@ describe("an issue and its code", () => {
   });
 
   it("stacks every file the issue points at, with the reference's note", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: detailPath }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     await slot.findByText("src/a.ts:10-12");
     await slot.findByText("src/other.ts:20");
     await slot.findByText("the pattern this should match");
@@ -352,8 +472,7 @@ describe("an issue and its code", () => {
   });
 
   it("links each file to its place in the PR diff on GitHub", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: detailPath }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     const link = await slot.findByText("src/a.ts:10-12");
     expect(link.closest("a")?.getAttribute("href")).toBe(
       "https://github.com/acme/app/pull/7/files#diff-abc123R10",
@@ -362,10 +481,7 @@ describe("an issue and its code", () => {
   });
 
   it("says why a file could not be shown instead of rendering nothing", async () => {
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: detailPath },
+    const slot = await renderIssue(
       {
         rpc: rpc({
           getFindingCode: () => ({
@@ -381,22 +497,28 @@ describe("an issue and its code", () => {
     slot.lifecycle.unmount();
   });
 
-  it("explains a finding that a re-run has replaced", async () => {
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7/f/gone" },
-      { rpc: rpc() },
-    );
+  it("explains an issue that a re-run replaced while you were reading it", async () => {
+    let findings = [FINDING];
+    const slot = await renderIssue({
+      rpc: rpc({
+        getPullRequest: () => ({
+          pullRequest: PR,
+          review: REVIEW,
+          findings,
+          hasPendingReview: false,
+        }),
+      }),
+    });
+    await slot.findByText("It runs one past the end.");
+    // A re-run drops the open findings and announces it.
+    findings = [];
+    await slot.behavior.emitRealtime("code-review-changed", { at: "now" });
     await slot.findByText("This issue is gone");
     slot.lifecycle.unmount();
   });
 
   it("shows a posted issue as a link rather than an editable draft", async () => {
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: detailPath },
+    const slot = await renderIssue(
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -420,12 +542,155 @@ describe("an issue and its code", () => {
   });
 });
 
-describe("the discussion tab", () => {
-  it("explains itself before a discussion is opened", async () => {
+describe("asking about an issue", () => {
+  it("quotes the issue into the review thread's composer rather than spawning a thread", async () => {
+    const slot = await renderIssue({ rpc: rpc() });
+    const button = await slot.findByText("Ask about this");
+    fireEvent.click(button.closest("button") ?? button);
+    await waitFor(() => expect(slot.inspection.composer.quotes).toHaveLength(1));
+    const quote = slot.inspection.composer.quotes[0] ?? "";
+    expect(quote).toContain("src/a.ts:10-12");
+    expect(quote).toContain("acme/app#7");
+    expect(quote).toContain("Off by one");
+    expect(quote).toContain("Please fix the bound here.");
+    slot.lifecycle.unmount();
+  });
+
+  it("quotes the reviewer's own edit, not the original suggestion", async () => {
+    const slot = await renderIssue({
+      rpc: rpc({
+        getPullRequest: () => ({
+          pullRequest: PR,
+          review: REVIEW,
+          findings: [{ ...FINDING, draftComment: "My own wording." }],
+          hasPendingReview: false,
+        }),
+      }),
+    });
+    const button = await slot.findByText("Ask about this");
+    fireEvent.click(button.closest("button") ?? button);
+    await waitFor(() => expect(slot.inspection.composer.quotes).toHaveLength(1));
+    expect(slot.inspection.composer.quotes[0]).toContain("My own wording.");
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("moving between the issue list and an issue", () => {
+  it("goes back to the list, since the browser's back no longer does", async () => {
     const app = await load();
-    const tab = app.navPanels[0]?.fixedTabs?.[0];
-    const slot = renderSlot(tab!, { subPath: "" }, { rpc: rpc() });
-    await slot.findByText("No discussion open");
+    const slot = renderSlot(findingsTab(app), FINDINGS_TAB, { rpc: rpc() });
+    const row = await slot.findByText("Off by one");
+    fireEvent.click(row.closest("button") ?? row);
+    // On the issue: the long-form fields the list deliberately omits.
+    await slot.findByText("The loop walks the buffer.");
+    const back = await slot.findByText("All issues");
+    fireEvent.click(back.closest("button") ?? back);
+    await waitFor(() => expect(slot.queryByText("All issues")).toBeNull());
+    // Back on the list: the gist, and no comment box.
+    await slot.findByText("The loop runs one past the end of the buffer.");
+    expect(slot.queryByLabelText("Comment for Off by one")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("the Findings tab on a thread that is not a review", () => {
+  it("says so instead of showing an empty issue list", async () => {
+    const app = await load();
+    const slot = renderSlot(findingsTab(app), FINDINGS_TAB, {
+      rpc: rpc({
+        reviewForThread: () => ({ review: null, openFindings: 0, configuredSkills: [] }),
+      }),
+    });
+    await slot.findByText("Not a code review");
+    slot.lifecycle.unmount();
+  });
+
+  it("resolves the review from the thread, not from tab params", async () => {
+    const app = await load();
+    const slot = renderSlot(findingsTab(app), FINDINGS_TAB, { rpc: rpc() });
+    await slot.findByText("Off by one");
+    const call = slot.inspection.rpcCalls.find((entry) => entry.method === "reviewForThread");
+    expect(call?.input).toEqual({ threadId: "thr_1" });
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("the thread-header control", () => {
+  const HEADER = { threadId: "thr_1", projectId: "proj_1", isCompactViewport: false };
+
+  it("opens the Findings tab on arrival at a review thread", async () => {
+    const app = await load();
+    const slot = renderSlot(app.threadHeaderActions[0]!, HEADER, {
+      rpc: rpc(),
+      openThreadPanel: () => true,
+    });
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({
+          method: "openThreadPanel",
+          options: expect.objectContaining({ actionId: "findings" }),
+        }),
+      );
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the open issue count", async () => {
+    const app = await load();
+    const slot = renderSlot(app.threadHeaderActions[0]!, HEADER, {
+      rpc: rpc({
+        reviewForThread: () => ({ review: REVIEW, openFindings: 3, configuredSkills: [] }),
+      }),
+      openThreadPanel: () => true,
+    });
+    await slot.findByText("3 open");
+    slot.lifecycle.unmount();
+  });
+
+  it("says so when the host will not open the tab here", async () => {
+    const app = await load();
+    const slot = renderSlot(app.threadHeaderActions[0]!, HEADER, {
+      rpc: rpc(),
+      // A surface with no side panel declines rather than throwing.
+      openThreadPanel: () => false,
+    });
+    await slot.findByText("1 open");
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({ method: "openThreadPanel" }),
+      );
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("renders nothing at all on a thread that is not a review", async () => {
+    const app = await load();
+    const slot = renderSlot(app.threadHeaderActions[0]!, HEADER, {
+      rpc: rpc({
+        reviewForThread: () => ({ review: null, openFindings: 0, configuredSkills: [] }),
+      }),
+      openThreadPanel: () => true,
+    });
+    await waitFor(() => {
+      expect(
+        slot.inspection.rpcCalls.some((entry) => entry.method === "reviewForThread"),
+      ).toBe(true);
+    });
+    expect(slot.inspection.navigateCalls).toEqual([]);
+    expect(slot.queryByRole("button")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("re-opens the tab when pressed, so closing it is not final", async () => {
+    const app = await load();
+    const slot = renderSlot(app.threadHeaderActions[0]!, HEADER, {
+      rpc: rpc(),
+      openThreadPanel: () => true,
+    });
+    const button = await slot.findByText("1 open");
+    await waitFor(() => expect(slot.inspection.navigateCalls).toHaveLength(1));
+    fireEvent.click(button.closest("button") ?? button);
+    await waitFor(() => expect(slot.inspection.navigateCalls).toHaveLength(2));
     slot.lifecycle.unmount();
   });
 });
@@ -505,10 +770,7 @@ describe("links out to GitHub", () => {
   const detailPath = "pr/acme/app/7/f/f1";
 
   it("opens through BB's URL routing rather than a raw navigation", async () => {
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: detailPath },
+    const slot = await renderIssue(
       { rpc: rpc(), openUrl: () => true },
     );
     const link = await slot.findByText("src/a.ts:10-12");
@@ -527,8 +789,8 @@ describe("links out to GitHub", () => {
   it("routes the PR link too", async () => {
     const app = await load();
     const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7" },
+      findingsTab(app),
+      FINDINGS_TAB,
       { rpc: rpc(), openUrl: () => true },
     );
     const link = await slot.findByText("Open on GitHub");
@@ -542,8 +804,7 @@ describe("links out to GitHub", () => {
   });
 
   it("keeps a real href so the link can be copied or opened in a new tab", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: detailPath }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     const link = await slot.findByText("src/a.ts:10-12");
     expect(link.closest("a")?.getAttribute("href")).toBe(
       "https://github.com/acme/app/pull/7/files#diff-abc123R10",
@@ -553,10 +814,7 @@ describe("links out to GitHub", () => {
 
   it("leaves a modifier-click to the browser", async () => {
     // Cmd-click means "new tab"; swallowing it would be worse than useless.
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: detailPath },
+    const slot = await renderIssue(
       { rpc: rpc(), openUrl: () => true },
     );
     const link = await slot.findByText("src/a.ts:10-12");
@@ -599,10 +857,7 @@ describe("the comment to post", () => {
   const detailPath = "pr/acme/app/7/f/f1";
 
   const withFinding = async (overrides: Partial<FindingDto>) => {
-    const app = await load();
-    return renderSlot(
-      app.navPanels[0]!,
-      { subPath: detailPath },
+    return await renderIssue(
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -701,10 +956,7 @@ describe("a comment added to a pending review", () => {
   it("says it is a draft, not a published comment", async () => {
     // Nobody else can see it until the review is submitted on GitHub, so
     // calling it "posted" would be a lie.
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7/f/f1" },
+    const slot = await renderIssue(
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -729,10 +981,7 @@ describe("a comment added to a pending review", () => {
   });
 
   it("still says posted for an ordinary published comment", async () => {
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7/f/f1" },
+    const slot = await renderIssue(
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -763,10 +1012,7 @@ describe("a comment that cannot be anchored to a line", () => {
   } as Partial<FindingDto>;
 
   const render = async (overrides: Partial<FindingDto> = toFile) => {
-    const app = await load();
-    return renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7/f/f1" },
+    return await renderIssue(
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -824,8 +1070,7 @@ describe("a comment that cannot be anchored to a line", () => {
   });
 
   it("does not add context when the comment anchors to the lines", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     await slot.findByLabelText("Comment for Off by one");
     expect(slot.queryByText(/will be added above your text/)).toBeNull();
     slot.lifecycle.unmount();
@@ -839,8 +1084,7 @@ describe("the order of an issue view", () => {
 
   it("puts the code the comment attaches to above the comment itself", async () => {
     // The comment has to be read against the code, not from memory.
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     const code = await slot.findByText("const x = 1;");
     const box = await slot.findByLabelText("Comment for Off by one");
     expect(isBefore(code, box)).toBe(true);
@@ -848,8 +1092,7 @@ describe("the order of an issue view", () => {
   });
 
   it("puts the other referenced code below the comment", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     const box = await slot.findByLabelText("Comment for Off by one");
     const other = await slot.findByText("src/other.ts:20");
     expect(isBefore(box, other)).toBe(true);
@@ -857,18 +1100,14 @@ describe("the order of an issue view", () => {
   });
 
   it("separates the attached code from the supporting code", async () => {
-    const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "pr/acme/app/7/f/f1" }, { rpc: rpc() });
+    const slot = await renderIssue({ rpc: rpc() });
     await slot.findByText("Code the comment attaches to");
     await slot.findByText("Other code this issue points at (1)");
     slot.lifecycle.unmount();
   });
 
   it("says the code is what the issue is about when nothing can be attached", async () => {
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7/f/f1" },
+    const slot = await renderIssue(
       {
         rpc: rpc({
           getPullRequest: () => ({
@@ -891,10 +1130,7 @@ describe("the order of an issue view", () => {
   });
 
   it("omits the supporting section when the issue cites one place", async () => {
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7/f/f1" },
+    const slot = await renderIssue(
       { rpc: rpc({ getFindingCode: () => ({ ...CODE, locations: [CODE.locations[0]] }) }) },
     );
     await slot.findByText("const x = 1;");
@@ -904,10 +1140,7 @@ describe("the order of an issue view", () => {
 
   it("still shows the comment when the code cannot be loaded", async () => {
     // Losing the snippet must not cost the reviewer the comment.
-    const app = await load();
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "pr/acme/app/7/f/f1" },
+    const slot = await renderIssue(
       {
         rpc: rpc({
           getFindingCode: () => {
