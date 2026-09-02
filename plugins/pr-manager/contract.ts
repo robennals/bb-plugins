@@ -1,9 +1,10 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { PULL_REQUEST_STATUSES } from "./pr-status.js";
 
 const normalizedPullRequestSchema = z.object({
   repository: z.string(), number: z.number().int().positive(), title: z.string(), url: z.string().url(),
-  status: z.enum(["WAITING", "FAILING", "FEEDBACK", "APPROVED", "MERGED"]), summary: z.string(),
+  status: z.enum(PULL_REQUEST_STATUSES), summary: z.string(),
   isDraft: z.boolean(), headRefName: z.string(), baseRefName: z.string(), createdAt: z.string(), updatedAt: z.string(), mergedAt: z.string().nullable(),
 });
 export const hostContract = defineRpcContract({

@@ -1,8 +1,12 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { hostContract } from "./contract.js";
+import { PULL_REQUEST_STATUSES } from "./pr-status.js";
+import { SORT_ORDERS, sortPullRequests } from "./pr-list.js";
+import { buildThreadPrompt } from "./thread-prompt.js";
 
-const statusSchema = z.enum(["WAITING", "FAILING", "FEEDBACK", "APPROVED", "MERGED"]);
+const statusSchema = z.enum(PULL_REQUEST_STATUSES);
+const sortOrderSchema = z.enum(SORT_ORDERS);
 const pullRequestSchema = z.object({
   key: z.string(), repository: z.string(), number: z.number().int().positive(),
   title: z.string(), url: z.string().url(), status: statusSchema, summary: z.string(),
@@ -16,20 +20,29 @@ const repositoryFilterSchema = z.string().min(1).nullable();
 const pullRequestListSchema = z.object({
   prs: z.array(pullRequestSchema), refreshedAt: z.string().nullable(),
   repositoryFilter: repositoryFilterSchema.default(null),
+  sortOrder: sortOrderSchema.default("STATUS"),
 });
 type PullRequestList = z.infer<typeof pullRequestListSchema>;
 
 export const rpcContract = defineRpcContract({
   prs_list: { input: z.null(), output: pullRequestListSchema },
   prs_refresh: { input: z.null(), output: pullRequestListSchema },
-  prs_set_repository_filter: {
-    input: z.object({ repository: repositoryFilterSchema }),
-    output: z.object({ repositoryFilter: repositoryFilterSchema }),
+  // The whole persisted view is sent at once, so there is no partial-update merge.
+  prs_set_view: {
+    input: z.object({ repository: repositoryFilterSchema, sortOrder: sortOrderSchema }),
+    output: z.object({ repositoryFilter: repositoryFilterSchema, sortOrder: sortOrderSchema }),
+  },
+  // Returns null when the PR has no live thread, so the caller knows to ask for
+  // instructions and create one instead of navigating to a dead thread.
+  prs_resolve_thread: {
+    input: z.object({ repository: z.string(), number: z.number().int().positive() }),
+    output: z.object({ threadId: z.string().nullable() }),
   },
   prs_create_thread: {
     input: z.object({
       repository: z.string(), number: z.number().int().positive(), title: z.string(),
       url: z.string().url(), headRefName: z.string(), baseRefName: z.string(), projectId: z.string(),
+      instructions: z.string().trim().min(1),
     }),
     output: z.object({ threadId: z.string() }),
   },
@@ -68,7 +81,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function readCachedPullRequests(): Promise<PullRequestList> {
     const cached = await bb.storage.kv.get<unknown>(PR_LIST_CACHE_KEY);
     const parsed = pullRequestListSchema.safeParse(cached);
-    return parsed.success ? parsed.data : { prs: [], refreshedAt: null, repositoryFilter: null };
+    return parsed.success ? parsed.data : { prs: [], refreshedAt: null, repositoryFilter: null, sortOrder: "STATUS" };
   }
 
   async function refreshPullRequests(): Promise<PullRequestList> {
@@ -117,22 +130,36 @@ export default async function plugin(bb: BbPluginApi) {
     const repositoryFilter = cached.repositoryFilter !== null && prs.some((pr) => pr.repository === cached.repositoryFilter)
       ? cached.repositoryFilter
       : null;
-    const result = { prs, refreshedAt: new Date().toISOString(), repositoryFilter };
+    const result = { prs, refreshedAt: new Date().toISOString(), repositoryFilter, sortOrder: cached.sortOrder };
     await bb.storage.kv.set(PR_LIST_CACHE_KEY, result);
     return result;
+  }
+
+  async function resolveExistingThread(repository: string, number: number): Promise<string | null> {
+    const existing = (await readCachedPullRequests()).prs.find((candidate) =>
+      candidate.repository === repository && candidate.number === number);
+    if (existing?.threadId === null || existing?.threadId === undefined) return null;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId: existing.threadId });
+      return thread.status === "error" ? null : existing.threadId;
+    } catch {
+      // A missing thread is stale linkage. Report it as absent so a replacement is provisioned.
+      return null;
+    }
   }
 
   bb.rpc.register(rpcContract, {
     prs_list: () => readCachedPullRequests(),
     prs_refresh: () => refreshPullRequests(),
-    prs_set_repository_filter: async ({ repository }) => {
+    prs_set_view: async ({ repository, sortOrder }) => {
       const cached = await readCachedPullRequests();
       if (repository !== null && !cached.prs.some((pr) => pr.repository === repository)) {
         throw new Error("That repository is not in the saved pull request list.");
       }
-      await bb.storage.kv.set(PR_LIST_CACHE_KEY, { ...cached, repositoryFilter: repository });
-      return { repositoryFilter: repository };
+      await bb.storage.kv.set(PR_LIST_CACHE_KEY, { ...cached, repositoryFilter: repository, sortOrder });
+      return { repositoryFilter: repository, sortOrder };
     },
+    prs_resolve_thread: async ({ repository, number }) => ({ threadId: await resolveExistingThread(repository, number) }),
     prs_create_thread: async (input) => {
       const projects = await bb.sdk.projects.list();
       const project = projects.find((candidate) => candidate.id === input.projectId);
@@ -140,16 +167,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (normalizeGitHubRepository(project.gitRemoteUrl) !== input.repository.toLowerCase()) {
         throw new Error("The selected project does not match this pull request repository.");
       }
-      const existing = (await readCachedPullRequests()).prs.find((candidate) =>
-        candidate.repository === input.repository && candidate.number === input.number);
-      if (existing?.threadId !== null && existing?.threadId !== undefined) {
-        try {
-          const existingThread = await bb.sdk.threads.get({ threadId: existing.threadId });
-          if (existingThread.status !== "error") return { threadId: existing.threadId };
-        } catch {
-          // A missing or failed thread is stale linkage. Provision a replacement.
-        }
-      }
+      const alreadyLinked = await resolveExistingThread(input.repository, input.number);
+      if (alreadyLinked !== null) return { threadId: alreadyLinked };
 
       const source = project.sources.find((candidate) => candidate.isDefault) ?? project.sources[0];
       if (source === undefined) throw new Error("The matching BB project has no workspace source.");
@@ -162,11 +181,7 @@ export default async function plugin(bb: BbPluginApi) {
           type: "host", hostId: source.hostId,
           workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: prepared.ref } },
         },
-        prompt: [
-          `Work on pull request ${input.url}.`,
-          "Review its current CI and reviewer feedback, summarize what needs attention, and help address it.",
-          `The worktree starts from the PR head; target branch is ${input.baseRefName}.`,
-        ].join("\n\n"),
+        prompt: buildThreadPrompt(input),
         title: `PR #${input.number}: ${input.title}`,
         origin: "plugin",
       });
@@ -197,7 +212,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const result = argv[0] === "refresh" ? await refreshPullRequests() : await readCachedPullRequests();
       if (argv.includes("--json")) return { exitCode: 0, stdout: JSON.stringify(result) };
-      return { exitCode: 0, stdout: result.refreshedAt === null ? "No cached pull requests. Run `bb pr-manager refresh`." : result.prs.length === 0 ? "No current pull requests." : result.prs
+      return { exitCode: 0, stdout: result.refreshedAt === null ? "No cached pull requests. Run `bb pr-manager refresh`." : result.prs.length === 0 ? "No current pull requests." : sortPullRequests(result.prs, result.sortOrder)
         .map((pr) => `${pr.status.padEnd(8)} ${pr.repository}#${pr.number}  ${pr.title}\n         ${pr.summary}`).join("\n") };
     },
   });
