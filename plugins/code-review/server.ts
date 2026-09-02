@@ -660,6 +660,11 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        created_at TEXT NOT NULL,
        updated_at TEXT NOT NULL
      )`,
+    // This statement has already been applied to existing databases, and
+    // `bb.storage.migrate` matches statements by index by hashing their text --
+    // so much as reformatting one that has run makes the plugin refuse to load.
+    // Columns this plugin no longer uses are therefore still created here and
+    // dropped by an appended migration at the end of this list.
     `CREATE TABLE IF NOT EXISTS findings (
        id TEXT PRIMARY KEY,
        review_id TEXT NOT NULL,
@@ -671,11 +676,15 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        severity TEXT NOT NULL DEFAULT 'medium',
        category TEXT NOT NULL DEFAULT '',
        title TEXT NOT NULL DEFAULT '',
+       background TEXT NOT NULL DEFAULT '',
+       problem TEXT NOT NULL DEFAULT '',
+       suggested_fix TEXT NOT NULL DEFAULT '',
        suggested_comment TEXT NOT NULL DEFAULT '',
        draft_comment TEXT,
        state TEXT NOT NULL DEFAULT 'open',
        comment_url TEXT,
-       posted_at TEXT
+       posted_at TEXT,
+       discussion_thread_id TEXT
      )`,
     `CREATE INDEX IF NOT EXISTS findings_by_review ON findings (review_id)`,
     `CREATE INDEX IF NOT EXISTS reviews_by_thread ON reviews (thread_id)`,
@@ -722,6 +731,13 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        paths TEXT NOT NULL,
        fetched_at TEXT NOT NULL
      )`,
+    // A finding is a comment now, and questions go to the review's own thread,
+    // so nothing reads these four. None is indexed or part of a key, so SQLite
+    // can drop them outright.
+    `ALTER TABLE findings DROP COLUMN background`,
+    `ALTER TABLE findings DROP COLUMN problem`,
+    `ALTER TABLE findings DROP COLUMN suggested_fix`,
+    `ALTER TABLE findings DROP COLUMN discussion_thread_id`,
   ]);
 
   /**
