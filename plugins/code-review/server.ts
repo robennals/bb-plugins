@@ -7,9 +7,11 @@
 //   2. Open a PR, start a review: a BB thread runs the review skills you
 //      configured and writes structured findings to a JSON file, then submits
 //      that file with `bb code-review submit`.
-//   3. Each finding lands in the panel with its background, the problem, a
-//      suggested fix, and a ready-to-post comment you can edit, post to
-//      GitHub, or open a discussion thread about.
+//   3. Each finding lands in the Findings tab of that thread's side panel with
+//      its background, the problem, a suggested fix, and a ready-to-post
+//      comment you can edit, post to GitHub, or take up with the thread's
+//      agent — which has tools for the issue list while it is on a review
+//      thread.
 //
 // gh is the only GitHub transport, so whatever `gh auth` can see, this can.
 import { execFile } from "node:child_process";
@@ -19,7 +21,6 @@ import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
-  buildDiscussionPrompt,
   buildPostCommentArgs,
   buildReviewPrompt,
   CLI_OUTPUT_BUDGET,
@@ -61,6 +62,7 @@ import {
   type PrSnapshot,
   type PullRequest,
 } from "./review-core";
+import { formatLocation } from "./code-location";
 
 const CHANGED = "code-review-changed";
 const GH_HINT =
@@ -97,6 +99,8 @@ const pullRequestSchema = z.object({
   reviewRequests: z.array(reviewRequestSchema),
   /** Status of this plugin's review of the PR, if one has been started. */
   reviewStatus: z.enum(["none", "queued", "running", "reported", "failed"]),
+  /** The review thread, so a row can open it rather than re-deriving the id. */
+  reviewThreadId: z.string().nullable(),
   openFindings: z.number(),
   postedFindings: z.number(),
 });
@@ -138,7 +142,6 @@ const findingSchemaDto = z.object({
     /** The finding's range had to be narrowed to fit the diff. */
     adjusted: z.boolean(),
   }),
-  discussionThreadId: z.string().nullable(),
   references: z.array(
     z.object({
       file: z.string(),
@@ -269,9 +272,20 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ finding: findingSchemaDto }),
   },
-  discussFinding: {
-    input: z.object({ findingId: z.string() }),
-    output: z.object({ threadId: z.string() }),
+  /**
+   * The review a thread is running, for the Findings tab and the thread-header
+   * control. Null on any thread that is not a review — both of those surfaces
+   * are offered on every thread, so "not a review" is a normal answer.
+   */
+  reviewForThread: {
+    input: z.object({ threadId: z.string() }),
+    output: z.object({
+      review: reviewSchema.nullable(),
+      /** Open issues, for the thread-header control's count. */
+      openFindings: z.number(),
+      /** The configured skill list, for a review that recorded none. */
+      configuredSkills: z.array(z.string()),
+    }),
   },
   getFindingCode: {
     input: z.object({
@@ -417,8 +431,11 @@ interface FindingRow {
   comment_url: string | null;
   posted_at: string | null;
   posted_as: string;
-  discussion_thread_id: string | null;
   references_json: string;
+  // findings.discussion_thread_id is still on the table — bb.storage.migrate
+  // applies statements by index, so the CREATE TABLE above cannot be rewritten
+  // — but nothing reads or writes it: discussing an issue is now a message in
+  // the review thread rather than a thread of its own.
 }
 
 function toReviewDto(row: ReviewRow): ReviewDto {
@@ -463,7 +480,6 @@ function toFindingDto(row: FindingRow): FindingDto {
     commentUrl: row.comment_url,
     postedAt: row.posted_at,
     postedAs: row.posted_as === "pending-review" ? "pending-review" : "comment",
-    discussionThreadId: row.discussion_thread_id,
     references: parseJsonArray(row.references_json),
     // Replaced by listFindings, which has the diff to hand.
     postAnchor: { kind: "file" as const, line: null, startLine: null, adjusted: false },
@@ -929,6 +945,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     return {
       ...pr,
       reviewStatus: review === null ? "none" : toReviewDto(review).status,
+      reviewThreadId: review?.thread_id ?? null,
       openFindings: findings.filter((finding) => finding.state === "open").length,
       postedFindings: findings.filter((finding) => finding.state === "posted").length,
     };
@@ -1001,6 +1018,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   // -------------------------------------------------------------------------
   // Starting a review
   // -------------------------------------------------------------------------
+
   async function startReview(
     repo: string,
     number: number,
@@ -1376,51 +1394,68 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
   // -------------------------------------------------------------------------
-  // Discussing a finding
+  // Editing the issue list
+  //
+  // The panel's RPC methods and the review thread's agent tools both go
+  // through these, so an agent dismissing an issue reaches the panel over the
+  // same `code-review-changed` signal a click would.
   // -------------------------------------------------------------------------
-  async function discussFinding(findingId: string): Promise<string> {
+  function setFindingComment(findingId: string, comment: string): FindingDto {
     const row = requireFinding(findingId);
-    if (row.discussion_thread_id !== null) {
-      // Reuse the existing conversation so "Discuss" is idempotent — unless
-      // the thread has since been deleted.
-      try {
-        await bb.sdk.threads.get({ threadId: row.discussion_thread_id });
-        return row.discussion_thread_id;
-      } catch {
-        db.prepare(`UPDATE findings SET discussion_thread_id = NULL WHERE id = ?`).run(findingId);
-      }
-    }
-    const finding = toFindingDto(row);
-    const review = getReview(finding.reviewId);
-    if (review === null) throw new Error(`No review for finding ${findingId}.`);
-    const projectId = await resolveProjectId(review.repo);
-    const thread = await bb.sdk.threads.spawn({
-      projectId,
-      environment: { type: "project-default" },
-      title: `${review.repo}#${review.number}: ${finding.title}`.slice(0, 120),
-      parentThreadId: review.thread_id ?? undefined,
-      prompt: buildDiscussionPrompt({
-        repo: review.repo,
-        number: review.number,
-        prTitle: review.title,
-        finding: {
-          file: finding.file,
-          startLine: finding.startLine,
-          endLine: finding.endLine,
-          title: finding.title,
-          background: finding.background,
-          problem: finding.problem,
-          suggestedFix: finding.suggestedFix,
-          suggestedComment: effectiveComment(finding),
-        },
-      }),
-    });
-    db.prepare(`UPDATE findings SET discussion_thread_id = ? WHERE id = ?`).run(
-      thread.id,
-      findingId,
-    );
+    // Storing null when the edit matches the suggestion keeps "edited" an
+    // honest signal in the UI.
+    const draft = comment === row.suggested_comment ? null : comment;
+    db.prepare(`UPDATE findings SET draft_comment = ? WHERE id = ?`).run(draft, findingId);
     announce();
-    return thread.id;
+    return toFindingDto(requireFinding(findingId));
+  }
+
+  function setFindingState(findingId: string, state: "open" | "dismissed"): FindingDto {
+    const row = requireFinding(findingId);
+    if (row.state === "posted") throw new Error("That comment has already been posted.");
+    db.prepare(`UPDATE findings SET state = ? WHERE id = ?`).run(state, findingId);
+    announce();
+    return toFindingDto(requireFinding(findingId));
+  }
+
+  /**
+   * One more issue on an existing review — what a conversation about the diff
+   * turns up after the review pass has already submitted. Appended rather than
+   * sorted into the severity order the import uses, because it arrives later
+   * and the reviewer's place in the list should not move under them.
+   */
+  function addFinding(reviewId: string, finding: Finding): FindingDto {
+    const last = db
+      .prepare(`SELECT MAX(ord) AS n FROM findings WHERE review_id = ?`)
+      .get(reviewId) as { n: number | null };
+    const id = randomUUID();
+    db.prepare(
+      `INSERT INTO findings (id, review_id, ord, file, start_line, end_line, side, severity,
+                             category, title, summary, background, problem, suggested_fix,
+                             suggested_comment, references_json, draft_comment, state)
+       VALUES (@id, @review_id, @ord, @file, @start_line, @end_line, @side, @severity,
+               @category, @title, @summary, @background, @problem, @suggested_fix,
+               @suggested_comment, @references_json, NULL, 'open')`,
+    ).run({
+      id,
+      review_id: reviewId,
+      ord: (last.n ?? -1) + 1,
+      file: finding.file,
+      start_line: finding.startLine,
+      end_line: finding.endLine,
+      side: finding.side,
+      severity: finding.severity,
+      category: finding.category,
+      title: finding.title,
+      summary: finding.summary,
+      background: finding.background,
+      problem: finding.problem,
+      suggested_fix: finding.suggestedFix,
+      suggested_comment: finding.suggestedComment,
+      references_json: JSON.stringify(finding.references),
+    });
+    announce();
+    return toFindingDto(requireFinding(id));
   }
 
   // -------------------------------------------------------------------------
@@ -1755,21 +1790,11 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     },
 
     setFindingComment({ findingId, comment }) {
-      const row = requireFinding(findingId);
-      // Storing null when the edit matches the suggestion keeps "edited" an
-      // honest signal in the UI.
-      const draft = comment === row.suggested_comment ? null : comment;
-      db.prepare(`UPDATE findings SET draft_comment = ? WHERE id = ?`).run(draft, findingId);
-      announce();
-      return { finding: toFindingDto(requireFinding(findingId)) };
+      return { finding: setFindingComment(findingId, comment) };
     },
 
     setFindingState({ findingId, state }) {
-      const row = requireFinding(findingId);
-      if (row.state === "posted") throw new Error("That comment has already been posted.");
-      db.prepare(`UPDATE findings SET state = ? WHERE id = ?`).run(state, findingId);
-      announce();
-      return { finding: toFindingDto(requireFinding(findingId)) };
+      return { finding: setFindingState(findingId, state) };
     },
 
     async postFinding({ findingId, mode }) {
@@ -1777,8 +1802,17 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       return { finding: await postFinding(findingId, mode) };
     },
 
-    async discussFinding({ findingId }) {
-      return { threadId: await discussFinding(findingId) };
+    async reviewForThread({ threadId }) {
+      const review = getReviewByThread(threadId);
+      const config = await settings.get();
+      return {
+        review: review === null ? null : toReviewDto(review),
+        openFindings:
+          review === null
+            ? 0
+            : listFindings(review.id).filter((finding) => finding.state === "open").length,
+        configuredSkills: parseSkillList(config.reviewSkills ?? ""),
+      };
     },
 
     async getFindingCode({ findingId, context }) {
@@ -1801,6 +1835,219 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       });
       return readPanelState();
     },
+  });
+
+  // -------------------------------------------------------------------------
+  // Agent tools — the review thread's own handle on its issue list
+  //
+  // Scoped by the calling thread, never by a review id in the parameters: the
+  // thread already identifies the review, and an agent cannot then reach into
+  // another one. On a thread that is not a review, `bb.agents.configure`
+  // withholds these entirely, so `execute` reaching a non-review thread means
+  // something is wrong rather than being a case to handle politely.
+  // -------------------------------------------------------------------------
+
+  /** The review the calling thread is running, or a message saying it is not one. */
+  function reviewOfThread(threadId: string): ReviewRow {
+    const review = getReviewByThread(threadId);
+    if (review === null) {
+      throw new Error(
+        "This thread is not running a code review, so it has no issue list.",
+      );
+    }
+    return review;
+  }
+
+  /**
+   * A finding on the caller's own review. Looking it up by review rather than
+   * by id alone keeps a mistyped id an error instead of an edit to some other
+   * pull request's issue.
+   */
+  function findingOfThread(threadId: string, findingId: string): FindingDto {
+    const review = reviewOfThread(threadId);
+    const finding = listFindings(review.id).find((entry) => entry.id === findingId);
+    if (finding === undefined) {
+      throw new Error(
+        `No issue with id ${findingId} on ${review.id}. Call code_review_list_issues ` +
+          "for the current ids — a re-review replaces them.",
+      );
+    }
+    return finding;
+  }
+
+  function describeFinding(finding: FindingDto): string {
+    return JSON.stringify(
+      {
+        id: finding.id,
+        severity: finding.severity,
+        category: finding.category,
+        title: finding.title,
+        location: {
+          file: finding.file,
+          startLine: finding.startLine,
+          endLine: finding.endLine,
+          side: finding.side,
+        },
+        state: finding.state,
+        background: finding.background,
+        problem: finding.problem,
+        suggestedFix: finding.suggestedFix,
+        comment: effectiveComment(finding),
+        isCommentEdited: finding.draftComment !== null,
+        postedAt: finding.postedAt,
+        commentUrl: finding.commentUrl,
+        references: finding.references,
+      },
+      null,
+      2,
+    );
+  }
+
+  bb.agents.registerTool({
+    name: "code_review_list_issues",
+    description:
+      "List the issues this review recorded, with their ids, severities, locations, and states. " +
+      "Call this before acting on an issue: the ids change when a review is re-run.",
+    parameters: z.object({}),
+    presentation: {
+      label: { pending: "Reading the issue list", completed: "Read the issue list" },
+    },
+    execute(_params, ctx) {
+      const review = reviewOfThread(ctx.threadId);
+      const findings = listFindings(review.id);
+      if (findings.length === 0) return `No issues recorded for ${review.id} yet.`;
+      return JSON.stringify(
+        {
+          review: review.id,
+          summary: review.summary,
+          issues: findings.map((finding) => ({
+            id: finding.id,
+            severity: finding.severity,
+            title: finding.title,
+            location: formatLocation(finding),
+            state: finding.state,
+            gist: finding.gist,
+          })),
+        },
+        null,
+        2,
+      );
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "code_review_get_issue",
+    description:
+      "Read one issue in full: background, problem, suggested fix, the comment as it currently " +
+      "stands, and the other code it points at.",
+    parameters: z.object({ issueId: z.string().min(1) }),
+    presentation: {
+      label: { pending: "Reading an issue", completed: "Read an issue" },
+    },
+    execute({ issueId }, ctx) {
+      return describeFinding(findingOfThread(ctx.threadId, issueId));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "code_review_set_issue_comment",
+    description:
+      "Replace the comment an issue would post. Written verbatim to GitHub when the reviewer " +
+      "posts it, so write it as a review comment addressed to the pull request author.",
+    instructions:
+      "Re-word an issue's comment only when the reviewer asks for it, and say what you changed. " +
+      "The reviewer reads the comment in the Findings tab before posting it, and posting is " +
+      "always their action, never yours.",
+    parameters: z.object({ issueId: z.string().min(1), comment: z.string().min(1) }),
+    presentation: {
+      label: { pending: "Re-wording an issue", completed: "Re-worded an issue" },
+    },
+    execute({ issueId, comment }, ctx) {
+      const finding = findingOfThread(ctx.threadId, issueId);
+      if (finding.state === "posted") {
+        throw new Error("That comment has already been posted, so it can no longer be edited.");
+      }
+      return describeFinding(setFindingComment(finding.id, comment));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "code_review_set_issue_state",
+    description:
+      'Dismiss an issue that turned out to be wrong, or restore a dismissed one to "open". ' +
+      "A dismissed issue stays in the list, greyed out, and survives a re-review.",
+    parameters: z.object({
+      issueId: z.string().min(1),
+      state: z.enum(["open", "dismissed"]),
+    }),
+    presentation: {
+      label: { pending: "Changing an issue", completed: "Changed an issue" },
+    },
+    execute({ issueId, state }, ctx) {
+      const finding = findingOfThread(ctx.threadId, issueId);
+      return describeFinding(setFindingState(finding.id, state));
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "code_review_add_issue",
+    description:
+      "Add one issue to this review's list — for something a conversation about the diff turned " +
+      "up after the review pass submitted. For a whole fresh pass, write and submit a findings " +
+      "file instead.",
+    parameters: z.object({
+      file: z.string().min(1).describe("Full repo-relative path, as in the diff."),
+      startLine: z.number().int().positive().nullable(),
+      endLine: z.number().int().positive().nullable(),
+      side: z.enum(["LEFT", "RIGHT"]).default("RIGHT"),
+      severity: z.enum(SEVERITIES),
+      category: z.string().default(""),
+      title: z.string().min(1),
+      summary: z.string().default(""),
+      background: z.string().default(""),
+      problem: z.string().min(1),
+      suggestedFix: z.string().default(""),
+      suggestedComment: z
+        .string()
+        .min(1)
+        .describe("Posted verbatim, so address it to the pull request author."),
+    }),
+    presentation: {
+      label: { pending: "Adding an issue", completed: "Added an issue" },
+    },
+    execute(params, ctx) {
+      const review = reviewOfThread(ctx.threadId);
+      return describeFinding(addFinding(review.id, { ...params, references: [] }));
+    },
+  });
+
+  // Only a review thread gets any of this. Synchronous and local — it runs on
+  // the thread-start path, so it may not do IO.
+  bb.agents.configure((ctx) => {
+    const review = getReviewByThread(ctx.thread.id);
+    if (review === null) return { tools: [], skills: [] };
+    const open = listFindings(review.id).filter((finding) => finding.state === "open").length;
+    return {
+      tools: [
+        "code_review_list_issues",
+        "code_review_get_issue",
+        "code_review_set_issue_comment",
+        "code_review_set_issue_state",
+        "code_review_add_issue",
+      ],
+      skills: ["pr-review"],
+      instructions: [
+        `This thread is the code review of ${review.id} — ${review.title}.`,
+        "",
+        `Its issue list (${open} open) is what the reviewer is reading in the Findings tab of`,
+        "this thread's side panel. The `code_review_*` tools are that list: use them to answer",
+        "from what was actually recorded rather than from memory, and to act on what the",
+        "reviewer decides.",
+        "",
+        "You never post to GitHub, approve, or request changes. Every comment is posted by the",
+        "reviewer, by hand, from that tab.",
+      ].join("\n"),
+    };
   });
 
   // -------------------------------------------------------------------------

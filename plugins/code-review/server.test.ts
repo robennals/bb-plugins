@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { PluginAgentToolResult } from "@get-bb/plugin-sdk";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import plugin, { type FindingDto, type ReviewDto } from "./server";
@@ -124,6 +125,10 @@ async function makeHost(
   const { bb, harness } = createFakePluginHost({
     pluginId: "code-review",
     settings: { defaultProject: "proj_test", reviewSkills: "code-review", repos: REPO },
+    // The plugin's own skill directory, as the host discovers it. An unknown
+    // name here rejects the WHOLE selection, tools included, so this is load
+    // bearing rather than decoration.
+    agentSkillIds: ["pr-review"],
     sdk: {
       projects: { list: async () => [] },
       threads: {
@@ -912,33 +917,44 @@ it("starts a pending review when asked and there is none", async () => {
   });
 });
 
-describe("discussing a finding", () => {
-  it("spawns one thread, seeds it with the finding, and reuses it", async () => {
+describe("the review a thread is running", () => {
+  it("answers with the review, its open count, and the configured skills", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
-    const [finding] = await runReview(host);
-    const first = await host.call<{ threadId: string }>("discussFinding", {
-      findingId: finding?.id,
-    });
-    const second = await host.call<{ threadId: string }>("discussFinding", {
-      findingId: finding?.id,
-    });
-    expect(second.threadId).toBe(first.threadId);
-    // One review thread plus exactly one discussion thread.
-    expect(host.spawned).toHaveLength(2);
-
-    const prompt = host.spawned[1]?.prompt ?? "";
-    expect(prompt).toContain("src/a.ts:10-12");
-    expect(prompt).toContain(FINDING.problem);
-    expect(prompt).toContain("Do not post anything to GitHub.");
-    expect(host.spawned[1]?.parentThreadId).toBe("thr_1");
+    await runReview(host);
+    const bound = await host.call<{
+      review: ReviewDto | null;
+      openFindings: number;
+      configuredSkills: string[];
+    }>("reviewForThread", { threadId: "thr_1" });
+    expect(bound.review?.id).toBe(REVIEW_ID);
+    expect(bound.openFindings).toBe(1);
+    expect(bound.configuredSkills).toEqual(["code-review"]);
   });
 
-  it("seeds the discussion with the user's edit when there is one", async () => {
+  it("counts only open issues, so a dismissal shows up in the count", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     const [finding] = await runReview(host);
-    await host.call("setFindingComment", { findingId: finding?.id, comment: "My wording." });
-    await host.call("discussFinding", { findingId: finding?.id });
-    expect(host.spawned[1]?.prompt).toContain("My wording.");
+    await host.call("setFindingState", { findingId: finding?.id, state: "dismissed" });
+    const bound = await host.call<{ openFindings: number }>("reviewForThread", {
+      threadId: "thr_1",
+    });
+    expect(bound.openFindings).toBe(0);
+  });
+
+  it("answers null for a thread that is not a review, rather than failing", async () => {
+    // Both the Findings tab and the header control are offered on every thread.
+    const host = await makeHost();
+    const bound = await host.call<{ review: ReviewDto | null }>("reviewForThread", {
+      threadId: "thr_not_a_review",
+    });
+    expect(bound.review).toBeNull();
+  });
+
+  it("does not spawn a thread of its own for an issue", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    // Exactly the review thread: discussing an issue is a message in it.
+    expect(host.spawned).toHaveLength(1);
   });
 });
 
@@ -1434,6 +1450,180 @@ describe("the panel's remembered state", () => {
   });
 });
 
+describe("the review thread's tools for its issue list", () => {
+  /** The tool context a provider tool-call arrives with. */
+  const onThread = (threadId = "thr_1") => ({ threadId });
+
+  const tool = (host: Host, name: string, input: unknown = {}, threadId = "thr_1") =>
+    host.harness.behavior.callAgentTool(name, input, onThread(threadId));
+
+  /** Every tool here answers with a JSON string; narrow rather than cast. */
+  async function parseToolJson<T>(result: PluginAgentToolResult): Promise<T> {
+    if (typeof result !== "string") {
+      throw new Error(`expected a JSON string, got ${JSON.stringify(result)}`);
+    }
+    return JSON.parse(result);
+  }
+
+  it("lists the issues with the ids the other tools take", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const listed = await parseToolJson<{
+      review: string;
+      issues: Array<{ id: string; location: string; state: string }>;
+    }>(await tool(host, "code_review_list_issues"));
+    expect(listed.review).toBe(REVIEW_ID);
+    expect(listed.issues).toHaveLength(1);
+    expect(listed.issues[0]?.id).toBe(finding?.id);
+    expect(listed.issues[0]?.location).toBe("src/a.ts:10-12");
+    expect(listed.issues[0]?.state).toBe("open");
+  });
+
+  it("says the list is empty rather than answering with empty JSON", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(await tool(host, "code_review_list_issues")).toContain("No issues recorded");
+  });
+
+  it("reads one issue in full", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const issue = await parseToolJson<{ problem: string; comment: string; isCommentEdited: boolean }>(
+      await tool(host, "code_review_get_issue", { issueId: finding?.id }),
+    );
+    expect(issue.problem).toBe(FINDING.problem);
+    expect(issue.comment).toBe(FINDING.suggestedComment);
+    expect(issue.isCommentEdited).toBe(false);
+  });
+
+  it("re-words a comment, and the panel sees the same edit", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await tool(host, "code_review_set_issue_comment", {
+      issueId: finding?.id,
+      comment: "Could you tighten this bound?",
+    });
+    const [updated] = await host.findings();
+    expect(updated?.draftComment).toBe("Could you tighten this bound?");
+  });
+
+  it("refuses to re-word a comment that has already been posted", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("postFinding", { findingId: finding?.id, mode: "issue" });
+    await expect(
+      tool(host, "code_review_set_issue_comment", { issueId: finding?.id, comment: "no" }),
+    ).rejects.toThrow(/already been posted/);
+  });
+
+  it("dismisses and restores an issue", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await tool(host, "code_review_set_issue_state", {
+      issueId: finding?.id,
+      state: "dismissed",
+    });
+    expect((await host.findings())[0]?.state).toBe("dismissed");
+    await tool(host, "code_review_set_issue_state", { issueId: finding?.id, state: "open" });
+    expect((await host.findings())[0]?.state).toBe("open");
+  });
+
+  it("appends an issue the conversation turned up, after the ones already there", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    await tool(host, "code_review_add_issue", {
+      file: "src/other.ts",
+      startLine: 20,
+      endLine: null,
+      side: "RIGHT",
+      severity: "blocker",
+      category: "correctness",
+      title: "Unbounded retry",
+      summary: "",
+      background: "",
+      problem: "retry() never gives up.",
+      suggestedFix: "",
+      suggestedComment: "This retries forever — please cap it.",
+    });
+    const findings = await host.findings();
+    // Appended, not sorted in by severity: the reviewer's place must not move
+    // even though "blocker" outranks the issue already in the list.
+    expect(findings.map((entry) => entry.title)).toEqual(["Off by one", "Unbounded retry"]);
+  });
+
+  it("scopes every tool to the calling thread's own review", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await expect(tool(host, "code_review_list_issues", {}, "thr_other")).rejects.toThrow(
+      /not running a code review/,
+    );
+    // A real id, but not reachable from a thread that is not its review.
+    await expect(
+      tool(host, "code_review_get_issue", { issueId: finding?.id }, "thr_other"),
+    ).rejects.toThrow(/not running a code review/);
+  });
+
+  it("rejects an id that is not on this review", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    await expect(
+      tool(host, "code_review_get_issue", { issueId: "made-up" }),
+    ).rejects.toThrow(/No issue with id made-up/);
+  });
+});
+
+describe("what the thread's agent is given", () => {
+  const context = (threadId: string) => ({
+    thread: { id: threadId, title: null, parentThreadId: null, sourceThreadId: null },
+    project: {
+      id: "proj_test",
+      kind: "standard" as const,
+      name: "app",
+      gitRemoteUrl: null,
+    },
+    environment: {
+      id: "env_1",
+      name: null,
+      path: null,
+      workspaceProvisionType: "managed-worktree" as const,
+      branchName: null,
+    },
+    host: { id: "host_1", name: "local" },
+    origin: { kind: null, pluginId: null },
+    provider: {
+      id: "claude-code",
+      model: "opus",
+      capabilities: { supportsNativeUserQuestion: true },
+    },
+  });
+
+  it("gives a review thread the issue-list tools and names its review", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    const resolved = await host.harness.behavior.resolveAgentConfiguration(context("thr_1"));
+    expect(resolved.tools.map((entry) => entry.name)).toEqual([
+      "code_review_list_issues",
+      "code_review_get_issue",
+      "code_review_set_issue_comment",
+      "code_review_set_issue_state",
+      "code_review_add_issue",
+    ]);
+    expect(resolved.instructions).toContain(REVIEW_ID);
+    expect(resolved.instructions).toContain("(1 open)");
+    // The one invariant the whole plugin rests on.
+    expect(resolved.instructions).toContain("never post to GitHub");
+  });
+
+  it("gives an ordinary thread none of it", async () => {
+    const host = await makeHost();
+    const resolved = await host.harness.behavior.resolveAgentConfiguration(
+      context("thr_not_a_review"),
+    );
+    expect(resolved.tools).toEqual([]);
+    expect(resolved.skills).toEqual([]);
+  });
+});
+
 describe("registrations", () => {
   it("registers the panel's data plane, the CLI, and the idle handler", async () => {
     const { harness } = await makeHost();
@@ -1445,7 +1635,7 @@ describe("registrations", () => {
       "setFindingComment",
       "setFindingState",
       "postFinding",
-      "discussFinding",
+      "reviewForThread",
     ]) {
       expect(harness.registrations.rpcMethods).toContain(method);
     }
