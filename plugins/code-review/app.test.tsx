@@ -1165,3 +1165,100 @@ describe("opening a review from the home screen", () => {
     slot.lifecycle.unmount();
   });
 });
+
+describe("the review tab opening itself", () => {
+  /** The header slot BB mounts inside a thread. */
+  const header = (
+    app: Awaited<ReturnType<typeof load>>,
+    threadId: string,
+    overrides: RpcOverrides = {},
+  ) =>
+    renderSlot(
+      app.threadHeaderActions[0]!,
+      { threadId, projectId: "proj_1", isCompactViewport: false },
+      { rpc: rpc(overrides), openThreadPanel: () => true },
+    );
+
+  it("registers one thread header action", async () => {
+    const app = await load();
+    expect(app.threadHeaderActions).toHaveLength(1);
+    expect(app.threadHeaderActions[0]?.id).toBe("review");
+  });
+
+  it("opens the review tab for the thread the panel just sent you to", async () => {
+    const app = await load();
+    // Press Open review on the home screen, the way the user does.
+    const panel = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
+    fireEvent.click(await panel.findByText("Open review"));
+    await waitFor(() => {
+      expect(panel.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({ threadId: "thr_1" }),
+      );
+    });
+    panel.lifecycle.unmount();
+
+    // BB then mounts the thread, and this slot with it.
+    const slot = header(app, "thr_1");
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({
+          method: "openThreadPanel",
+          options: { actionId: "review", params: { repo: "acme/app", number: 7 } },
+        }),
+      );
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("opens it once, not again every time you come back to the thread", async () => {
+    const app = await load();
+    const panel = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
+    fireEvent.click(await panel.findByText("Open review"));
+    await waitFor(() => {
+      expect(panel.inspection.navigateCalls.length).toBeGreaterThan(0);
+    });
+    panel.lifecycle.unmount();
+
+    const first = header(app, "thr_1");
+    await waitFor(() => expect(first.inspection.navigateCalls).toHaveLength(1));
+    first.lifecycle.unmount();
+
+    // A later visit must respect a tab the user has since closed.
+    const second = header(app, "thr_1");
+    await second.findByText("Code review");
+    expect(second.inspection.navigateCalls).toEqual([]);
+    second.lifecycle.unmount();
+  });
+
+  it("does not open a tab in a thread the panel did not send you to", async () => {
+    const app = await load();
+    const slot = header(app, "thr_other");
+    await slot.findByText("Code review");
+    expect(slot.inspection.navigateCalls).toEqual([]);
+    slot.lifecycle.unmount();
+  });
+
+  it("offers a way back to the tab on a review thread", async () => {
+    const app = await load();
+    const slot = header(app, "thr_1");
+    fireEvent.click(await slot.findByText("Code review"));
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({ method: "openThreadPanel" }),
+      );
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("renders nothing on a thread that is not a review", async () => {
+    const app = await load();
+    const slot = header(app, "thr_plain", { getReviewForThread: () => null });
+    await waitFor(() => {
+      expect(slot.inspection.rpcCalls.some((entry) => entry.method === "getReviewForThread")).toBe(
+        true,
+      );
+    });
+    expect(slot.queryByText("Code review")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});

@@ -1263,6 +1263,87 @@ function FindingDetailView({
 }
 
 // ---------------------------------------------------------------------------
+// Opening the review tab in a thread
+// ---------------------------------------------------------------------------
+
+/**
+ * The thread the home screen last sent the user to, and the review it was
+ * for. Writing the tab onto the thread server-side makes it exist; it does
+ * not open it, because which tab is showing is client panel state that only
+ * `openThreadPanel` reaches — and that call only works from inside the thread
+ * surface, which the home screen is not. So the panel leaves this note and
+ * the thread header slot picks it up when BB mounts the thread.
+ *
+ * It is a one-shot keyed by thread id, not per-thread state: every mounted
+ * header instance reads it, and only the one whose thread matches acts.
+ */
+let pendingTabOpen: { threadId: string; repo: string; number: number } | null = null;
+
+function notePendingTabOpen(target: { threadId: string; repo: string; number: number }): void {
+  pendingTabOpen = target;
+}
+
+/** Read and clear the note, if it is for this thread. */
+function takePendingTabOpen(threadId: string): { repo: string; number: number } | null {
+  if (pendingTabOpen === null || pendingTabOpen.threadId !== threadId) return null;
+  const { repo, number } = pendingTabOpen;
+  // One shot: coming back to the thread later must respect a tab the user has
+  // since closed.
+  pendingTabOpen = null;
+  return { repo, number };
+}
+
+/**
+ * A control in a review thread's header, and the thing that opens the review
+ * tab when the home screen sends you here.
+ */
+function ReviewThreadHeaderAction({ threadId }: { threadId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  // The pending note names the review already, so a thread opened from the
+  // home screen needs no round trip before opening its tab.
+  const pending = useMemo(() => takePendingTabOpen(threadId), [threadId]);
+  const looked = useLiveQuery(
+    () =>
+      pending === null
+        ? rpc.call("getReviewForThread", { threadId })
+        : Promise.resolve(null),
+    [rpc, threadId, pending],
+  );
+  const subject = pending ?? looked.data;
+
+  const open = useCallback(
+    (target: { repo: string; number: number }) => {
+      // Params must match the tab written server-side, so this focuses that
+      // tab rather than opening a second one.
+      navigate.openThreadPanel({
+        actionId: "review",
+        params: { repo: target.repo, number: target.number },
+      });
+    },
+    [navigate],
+  );
+
+  useEffect(() => {
+    if (pending === null) return;
+    open(pending);
+  }, [pending, open]);
+
+  if (subject === null) return null;
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className="h-7 gap-1.5 px-2 text-xs"
+      onClick={() => open(subject)}
+    >
+      <Icon name="Bug" className="size-3.5" />
+      Code review
+    </Button>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The review tab — one review's issues, in its own thread's panel
 // ---------------------------------------------------------------------------
 
@@ -1431,14 +1512,22 @@ function CodeReviewPanel() {
 
   // Both actions end in the same place: standing in the review's thread, with
   // its review tab beside it. They differ in whether an agent run is spent.
+  const goToReview = useCallback(
+    (threadId: string, nextRepo: string, number: number) => {
+      notePendingTabOpen({ threadId, repo: nextRepo, number });
+      navigate.toThread(threadId);
+    },
+    [navigate],
+  );
+
   const openReview = useCallback(
     (nextRepo: string, number: number) => {
       rpc.call("openReview", { repo: nextRepo, number }).then(
-        (opened) => navigate.toThread(opened.threadId),
+        (opened) => goToReview(opened.threadId, nextRepo, number),
         reportError,
       );
     },
-    [rpc, navigate],
+    [rpc, goToReview],
   );
 
   const startReview = useCallback(
@@ -1448,10 +1537,10 @@ function CodeReviewPanel() {
           toast.error("The review started but has no thread yet.");
           return;
         }
-        navigate.toThread(started.review.threadId);
+        goToReview(started.review.threadId, nextRepo, number);
       }, reportError);
     },
-    [rpc, navigate],
+    [rpc, goToReview],
   );
 
   const ghState = status.data?.state ?? "checking";
@@ -1520,5 +1609,12 @@ export default definePluginApp((app) => {
     icon: "Search",
     component: ReviewTab,
     layout: "padded",
+  });
+  // Runs inside the thread, which is the only place `openThreadPanel` works —
+  // so this is what actually opens the tab the home screen wrote.
+  app.slots.experimental_threadHeaderAction({
+    id: "review",
+    title: "Code review",
+    component: ReviewThreadHeaderAction,
   });
 });

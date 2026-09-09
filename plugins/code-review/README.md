@@ -17,7 +17,8 @@ yourself — one comment at a time, edited how you want it.
    and submits them with `bb code-review submit`; **Open review** on one that
    has been reviewed goes straight to that thread and spends nothing. Either
    way a **Code review** tab opens beside the thread with the results, and
-   **Re-run review** inside it asks for a fresh pass.
+   **Re-run review** inside it asks for a fresh pass. Close that tab and the
+   thread header's **Code review** button brings it back.
 3. **Skim the issues.** The tab is a plain list: severity, title, and a
    three-line gist. Nothing else, plus one button through to the PR on GitHub.
 4. **Open an issue** for the detail — background, problem, suggested fix — and
@@ -163,7 +164,17 @@ Starting or opening a review writes the review tab onto its thread
 server-side, with `bb.sdk.threads.tabs.update` under a compare-and-swap, then
 the panel navigates to that thread. `openReview` deliberately refuses a PR with
 no review thread rather than starting one, so the only path to an agent run is
-the button that says so. `useBbNavigate().openThreadPanel` would be the natural call for
+the button that says so.
+
+Writing the tab makes it *exist*; it does not open it, because which tab is
+showing is client panel state that only `useBbNavigate().openThreadPanel`
+reaches — and that call works only from inside the thread surface, which the
+home screen is not. So the panel leaves a one-shot note naming the thread it
+is navigating to, and the thread header slot picks it up when BB mounts that
+thread and opens the tab with the same params the server wrote, which focuses
+that tab rather than opening a second one. The note is consumed on use, so
+coming back to the thread later respects a tab you have since closed; the
+header's **Code review** button is how you get it back. `useBbNavigate().openThreadPanel` would be the natural call for
 this, but it opens a tab in the thread the client is already looking at, and
 the home screen is a nav panel rather than a thread. Failing to write the tab
 never fails the open: the review is still reachable from the thread panel's own
