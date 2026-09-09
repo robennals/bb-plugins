@@ -5,24 +5,31 @@ yourself — one comment at a time, edited how you want it.
 
 ## The loop
 
-1. **Pick a PR.** The panel lists a repo's open pull requests, filtered by who
-   was asked to review: **Asked me**, **Asked my team** (any of them, or one you
-   pick), or **All open**.
-2. **Review it.** Press *Review this PR*. A BB thread runs the review skills you
-   configured against the change and writes structured findings to a JSON file,
-   then submits them with `bb code-review submit`.
-3. **Skim the issues.** The review screen is a plain list: severity, title, and
-   a three-line gist. Nothing else, plus one button through to the PR on GitHub.
+1. **Pick a PR.** The Code Review panel lists a repo's open pull requests,
+   filtered by who was asked to review: **Asked me**, **Asked my team** (any of
+   them, or one you pick), or **All open**. Each row carries the state of this
+   plugin's review of it — *reviewing*, the open and posted issue counts, or
+   *review failed*.
+2. **Open it.** Pressing a row opens that PR's review: a BB thread runs the
+   review skills you configured against the change and writes structured
+   findings to a JSON file, then submits them with `bb code-review submit`. A
+   **Code review** tab opens beside that thread with the results. A PR you have
+   reviewed before opens straight onto its findings without running the agent
+   again; **Re-run review** in the tab asks for a fresh pass.
+3. **Skim the issues.** The tab is a plain list: severity, title, and a
+   three-line gist. Nothing else, plus one button through to the PR on GitHub.
 4. **Open an issue** for the detail — background, problem, suggested fix — and
    below it, every file the issue points at, stacked, each showing just the
    cited lines with their real line numbers. That includes files the finding
    only mentioned in passing: `src/thing.ts:42` in its prose becomes a snippet.
    Any file header links to that file's place in the PR diff on GitHub.
 5. **Act on it**: **post the comment verbatim**, **edit it first**, **discuss it
-   with an agent** in a side tab, or **dismiss it**.
+   with the review agent** in the thread beside the tab, or **dismiss it**.
 
-The panel remembers the repo and filter you were on, so re-opening the tab
-resumes where you left off. Nothing reaches GitHub until you press *Post*.
+Reviews are threads, so two reviews are two threads with a tab each, and the
+PR and its diff open as ordinary browser tabs from any link in the tab. The
+panel remembers the repo and filter you were on, so re-opening it resumes where
+you left off. Nothing reaches GitHub until you press *Post*.
 
 ## Sharing a review with the GitHub UI
 
@@ -144,6 +151,15 @@ bb plugin dev     # rebuild + reload on save
 ```
 
 The pure logic — the findings contract, the prompt, PR filtering, patch
-splitting, and the `gh api` argv for posting a comment — lives in
-`review-core.ts` and is unit-tested without a server. `server.ts` is the
-registrations and the gh plumbing; `app.tsx` is the panel.
+splitting, the review tab's own JSON, and the `gh api` argv for posting a
+comment — lives in `review-core.ts` and is unit-tested without a server.
+`server.ts` is the registrations and the gh plumbing; `app.tsx` is the home
+screen and the review tab.
+
+Opening a review writes the review tab onto its thread server-side, with
+`bb.sdk.threads.tabs.update` under a compare-and-swap, then the panel navigates
+to that thread. `useBbNavigate().openThreadPanel` would be the natural call for
+this, but it opens a tab in the thread the client is already looking at, and
+the home screen is a nav panel rather than a thread. Failing to write the tab
+never fails the open: the review is still reachable from the thread panel's own
+**New tab → Actions** list, which resolves it from the thread id.
