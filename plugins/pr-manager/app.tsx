@@ -15,6 +15,7 @@ const statusStyle: Record<PullRequest["status"], string> = {
 function StatusBadge({ status, count }: { status: PullRequest["status"]; count?: number }) {
   return (
     <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide", statusStyle[status])}>
+      {status === "APPROVED" ? <Icon name="CircleCheck" className="size-3.5" /> : null}
       <span>{status}</span>
       {count === undefined ? null : <span className="tabular-nums opacity-80">{count}</span>}
     </span>
@@ -40,7 +41,8 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
     } finally { setCreating(false); }
   };
   return (
-    <article className="rounded-lg border border-border bg-card px-4 py-3 shadow-sm">
+    <article className={cn("rounded-lg border border-border bg-card px-4 py-3 shadow-sm",
+      pr.status === "APPROVED" && "border-emerald-500/40 bg-emerald-500/5 ring-1 ring-emerald-500/20")}>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
