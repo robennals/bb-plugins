@@ -1,10 +1,34 @@
 # Code Review: one home screen, one tab per review
 
-The Code Review plugin currently holds everything in its own sidebar panel: a
-pull request list, a per-PR issue list, an issue detail view, and a fixed
-"Discussion" tab that hosts an agent chat about one finding. Every review
-shares that single panel, so two reviews cannot be open at once and the
-discussion tab shows whichever finding you pressed last.
+> **Revised 2026-09-09, second pass.** The first pass was written against a
+> stale checkout: `origin/main` already carried PR #8, "Make the code review
+> panel self-contained", which rebuilt much of the same plugin. This design is
+> now stated against that base. What changed:
+>
+> - **`background` and `problem` are gone for good.** PR #8 removed them as a
+>   write-up nobody read, and that judgment stands. `suggestedFix` comes back:
+>   it was often useful, and it returns through `ensureColumn`, not by editing
+>   the migration that dropped it.
+> - **Review threads are ordinary visible threads.** PR #8 spawned them hidden
+>   and archived them once GitHub stopped asking for the review. Both go: the
+>   thread is now the surface you work in, so hiding it or archiving it
+>   underneath you is wrong.
+> - **PR #8's four-view GitHub side tab is removed**, along with
+>   `lib/desktop-browser.ts` and the `window.bbDesktop` workaround it needed.
+>   Viewing a PR or a diff is an ordinary browser tab, opened from a link.
+> - **PR #8's `askAboutFinding` is kept as-is** — it asks what you want to know
+>   and sends it to the review thread, which is a better version of what the
+>   first pass built.
+> - **Kept from PR #8:** the diff-coloured snippets, `references` as the way an
+>   issue carries context, the reworked findings prompt, and `ensureColumn`.
+
+The Code Review plugin holds everything in its own sidebar panel: a pull
+request list, a per-PR issue list, an issue detail view, and one fixed side tab
+carrying four views of the pull request — the PR, its diff, its files, and the
+review conversation. Every review shares that single panel, so two reviews
+cannot be open at once, and the side tab shows whichever review you opened
+last. Driving GitHub inside that tab also needs `window.bbDesktop`, a BB
+internal, because GitHub refuses to be iframed.
 
 This design splits it in two. The panel becomes a home screen and nothing
 else. Each review opens its own tab in its own review thread, so BB's existing
@@ -31,9 +55,11 @@ Three capabilities in the plugin SDK make it work, all of them already public:
   own browser preference, which is what the plugin's `GithubLink` uses today.
   Viewing the PR needs no new code.
 
-Reviews already spawn one visible thread per PR, into the project that owns
-the repo's checkout, so the thread this design hangs everything off exists
-today and needs no schema change.
+Reviews already spawn one thread per PR, into the project that owns the repo's
+checkout, so the thread this design hangs everything off exists today. Two
+things about it change: it is spawned **visible** rather than hidden, and the
+sweep that archived it once GitHub stopped asking for the review goes, because
+you cannot work in a thread that is archived underneath you.
 
 ## Surfaces
 
@@ -45,9 +71,9 @@ today and needs no schema change.
 - **Delete `Route`, `parseSubPath`, `routeToSubPath`, and the `go` callback.**
   The panel renders one view. A stale deep link (`.../code-review/pr/o/r/12`)
   lands on the list, because an unparsed `subPath` is simply ignored.
-- **Delete the `fixedTabs` registration** and with it `DiscussionTab`,
-  `discussionTabRef`, and the `ThreadChat`, `experimental_useAppPanel`, and
-  `experimental_useFixedTabTarget` imports.
+- **Delete the `fixedTabs` registration** and with it the whole four-view side
+  tab — `ReviewSideTab` and its panes, `reviewTabRef`, and the
+  `lib/desktop-browser` plumbing they needed.
 - **`PrRow` gains no new UI.** It already shows the review badge — `reviewing`
   while the agent runs, `N open · M posted` once findings land, `review failed`
   on error — because `listPullRequests` returns `reviewStatus`, `openFindings`,
@@ -99,12 +125,13 @@ const [openFindingId, setOpenFindingId] = useState<string | null>(null);
 - **`null`** renders `ReviewControls` plus `PrFindingsView`: the open, posted,
   and dismissed issue groups, each row a severity badge, a title, a three-line
   gist, and a location.
-- **A finding id** renders `FindingDetailView`: background, problem, suggested
-  fix, the editable comment, the post/dismiss/discuss actions, and every cited
-  file stacked below as a snippet with real line numbers.
+- **A finding id** renders `FindingDetailView`: the summary, the suggested fix,
+  the editable comment, the post/dismiss/ask actions, and every place the issue
+  cites stacked below as a snippet, carrying the change in BB's diff colours
+  with real line numbers.
 
-`PrFindingsView` and `FindingDetailView` move across unchanged except for
-their back affordances. `PrFindingsView` loses its `onBack` prop and its
+`PrFindingsView` and `FindingDetailView` keep PR #8's own bodies, changed only
+in their back affordances and in rendering `suggestedFix` again. `PrFindingsView` loses its `onBack` prop and its
 "All pull requests" `BackButton` — the tab is the top of its own stack, and
 home is a sidebar click away. `FindingDetailView` keeps its "All issues"
 `BackButton`, now wired to `setOpenFindingId(null)`.
@@ -117,10 +144,9 @@ mount.
 ### Review controls live in the tab
 
 `ReviewControls` moves into the review tab, above the issue list, and keeps
-its three states — **Review this PR** when there is no review, **Reviewing…**
-(disabled, spinner) while queued or running, **Re-run review** once findings
-are reported — plus the skills line and the error line. It loses its **Review
-thread** button: the thread is on the other side of the split.
+its states — **Reviewing…** while queued or running, **Re-run review** once
+findings are reported — plus the skills line and the error line. It loses any
+way back to the thread: the thread is on the other side of the split.
 
 Re-running keeps today's merge rule. `startReview` deletes only `state =
 'open'` findings, so posted comments stay as history and dismissals stay
@@ -207,76 +233,66 @@ than a broken panel.
 
 ## Discussing an issue
 
-Today `discussFinding` spawns a child thread per finding, stores its id in
-`findings.discussion_thread_id`, and the panel shows it in the fixed
-Discussion tab. With the review thread's own chat now beside the findings,
-that second thread is redundant — and the review thread is the better
-interlocutor, because it already has the PR snapshot, the diff, and its own
-reasoning in context.
+PR #8 already settled this the better way: `askAboutFinding(findingId,
+question)` asks what you want to know, then sends it to the review thread,
+which already holds the PR snapshot, the diff, and its own reasoning. It stays
+exactly as it is. The first pass's bare-prompt `discussFinding` is dropped, and
+so is the fixed Discussion pane it fed.
 
-`discussFinding` becomes a send:
-
-```ts
-await bb.sdk.threads.send({
-  threadId: review.thread_id,
-  mode: "auto",
-  input: [{ type: "text", text: buildDiscussionPrompt({ ... }) }],
-});
-```
-
-- **`buildDiscussionPrompt` is unchanged** — same finding framing, same
-  instruction not to touch GitHub.
-- **`mode: "auto"`** starts a turn on an idle thread and queues or steers a
-  running one, so pressing Discuss during a review does the right thing
-  instead of failing.
-- **The output stays `{ threadId }`** — now the review thread. The frontend
-  stops opening a tab with it and just toasts "Sent to the review thread";
-  the reply arrives in the chat the user is already looking at.
-- **A review with no thread** (deleted, or a row from before this change)
-  returns a handler error the panel toasts: "This review has no thread —
-  re-run the review first."
-
-`discussion_thread_id` stops being read or written. The column stays: migrations
-are append-only by statement index, and dropping it would buy nothing.
-`buildDiscussionPrompt`'s tests stay as they are.
+One guard is added. The `thread.idle` handler marks a *running* review failed
+when its thread goes idle without submitting findings, so a question asked
+mid-run would be read as the review giving up. `askAboutFinding` refuses while
+the review is queued or running and says why.
 
 ## What changes, file by file
 
-**`server.ts`**
-
-- Add `openReview` to the RPC contract and a handler implementing the three
-  steps above.
-- Add `getReviewForThread({ threadId }) → { repo, number } | null` over the
-  existing `getReviewByThread` row lookup, for a launcher-opened tab.
-- Add a `ensureReviewTab(threadId, repo, number)` helper: `tabs.get`, membership
-  check, append, `tabs.update`, one retry on conflict.
-- Rewrite `discussFinding` as a send to the review thread; drop the spawn, the
-  `parentThreadId`, and both `discussion_thread_id` statements.
-
 **`review-core.ts`**
 
-- No change. The findings contract, the prompts, PR filtering, patch splitting,
-  and the `gh api` argv are all independent of the tab model. `reviewTabFor(repo,
-  number)` — the pure function that builds the tab object and the derived id —
-  goes here so it is unit-testable without a server.
+- Add `reviewTabFor(pluginId, repo, number)` and `REVIEW_TAB_ACTION_ID` — the
+  tab object as pure data, unit-tested without a server.
+- Put `suggestedFix` back in the findings contract: parsed from the agent's
+  report, carried on the DTO, and asked for in the review prompt.
+
+**`server.ts`**
+
+- `ensureColumn("findings", "suggested_fix", ...)` re-adds the column. The
+  migration that dropped it has already run on real databases and
+  `bb.storage.migrate` hashes statements by index, so editing that statement
+  would refuse to load the plugin. `ensureColumn` checks the table instead.
+- Add `openReview`, which refuses a PR with no live review thread rather than
+  starting one, and `getReviewForThread` for a launcher-opened tab.
+- Add `ensureReviewTab`, and call it from both `openReview` and `startReview`.
+- Spawn review threads **visible**: drop `visibility: "hidden"`.
+- Delete `archiveFinishedReviewThreads` and its call from the PR-list refresh.
+  The `thread_archived_at` column stays; nothing reads it.
+- Delete `getReviewThread`, `getPullRequestView` and `getPullRequestPatch`,
+  which only the four-view side tab used, plus any helper they alone reach.
+  Everything the `bb code-review` CLI and `getFindingCode` need stays.
 
 **`app.tsx`**
 
-- Delete `Route`, `parseSubPath`, `routeToSubPath`, `DiscussionTab`,
-  `discussionTabRef`, and the `fixedTabs` registration.
-- `CodeReviewPanel` drops its `subPath` routing and calls `openReview` +
-  `navigate.toThread` from `PrListView`'s `onOpenPr`.
-- Add `ReviewTab`, registered as a `threadPanelAction`, wrapping
-  `ReviewControls`, `PrFindingsView`, and `FindingDetailView` with local
-  open-finding state.
-- `PrFindingsView` loses `onBack` and its top `BackButton`; `FindingDetailView`
-  keeps its own, wired to local state. `FindingActions`' Discuss handler toasts
-  instead of opening a tab.
+- Delete the four-view side tab and everything only it used: `DiscussionPane`,
+  `GithubPane`, `PrComment`, `PrFile`, `ChangedFiles`, `DiffPane`,
+  `FilesPane`, `DiffSnapshotView`, `PullRequestPane`,
+  `PullRequestSnapshotView`, `ReviewSideTab`, `reviewTabRef`,
+  `withoutFragment`, `isSidePane`, `useOpenSidePane`, and the
+  `lib/desktop-browser` imports. Delete the panel's `fixedTabs`.
+- Delete `Route`, `parseSubPath` and `routeToSubPath`; the panel has one view.
+- `PrRow` carries one explicit button — **Start review** or **Open review** —
+  and its body is no longer a button, because a review costs an agent run.
+- Add `ReviewTab`, a `threadPanelAction` wrapping PR #8's `ReviewControls`,
+  `PrFindingsView` and `FindingDetailView` with local open-finding state.
+- Add `ReviewThreadHeaderAction`, an `experimental_threadHeaderAction` that
+  opens the review tab when the panel sends the user to that thread, and is
+  the way back to a tab they closed.
+- `LocationCard`'s "show diff" opened the side tab's diff pane; it becomes a
+  link to that file's place in the PR diff on GitHub.
+- `FindingDetailView` renders `suggestedFix` again, above the comment box.
 
-**`README.md`**
+**`lib/desktop-browser.ts`** — deleted.
 
-- Rewrite "The loop" for the new shape, and drop the "discuss it with an agent
-  in a side tab" phrasing.
+**`README.md`** — rewrite the loop, and drop the side tab and the
+`window.bbDesktop` section.
 
 ## Testing
 
@@ -293,9 +309,11 @@ are append-only by statement index, and dropping it would buy nothing.
 - A stubbed `tabs.update` that rejects on the first revision and accepts on the
   second leaves exactly one tab, and one that always rejects resolves anyway
   with a warning logged.
-- `discussFinding` calls `threads.send` on the review thread and never
-  `threads.spawn`.
-- `discussFinding` on a review with no thread throws the actionable message.
+- `askAboutFinding` refuses while the review is queued or running, and sends
+  nothing.
+- `suggestedFix` survives a report round trip: parsed from the agent's JSON,
+  stored, and returned on the DTO.
+- A review thread is spawned visible, and no PR-list refresh archives it.
 
 **Frontend** (`app.test.tsx`, `renderSlot`):
 
@@ -308,7 +326,8 @@ are append-only by statement index, and dropping it would buy nothing.
 - The review tab with `params: null` resolves the review through
   `getReviewForThread`, and shows the "not a code review" empty state when that
   returns null.
-- Discuss calls `discussFinding` and opens no tab.
+- Ask calls `askAboutFinding` and opens no tab.
+- The issue detail renders the suggested fix.
 - `reviewTabFor` is unit-tested in `review-core.test.ts` for id stability and
   params shape.
 
