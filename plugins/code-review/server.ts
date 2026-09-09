@@ -7,9 +7,9 @@
 //   2. Open a PR, start a review: a BB thread runs the review skills you
 //      configured and writes structured findings to a JSON file, then submits
 //      that file with `bb code-review submit`.
-//   3. Each finding lands in the panel with its background, the problem, a
-//      suggested fix, and a ready-to-post comment you can edit, post to
-//      GitHub, or open a discussion thread about.
+//   3. Each finding lands in the panel as a ready-to-post comment you can edit,
+//      post to GitHub, or ask the review thread about, with the code it points
+//      at shown beside it.
 //
 // gh is the only GitHub transport, so whatever `gh auth` can see, this can.
 import { execFile } from "node:child_process";
@@ -19,7 +19,8 @@ import type Database from "better-sqlite3";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
-  buildDiscussionPrompt,
+  awaitsReviewFrom,
+  buildFindingQuestion,
   buildPostCommentArgs,
   buildReviewPrompt,
   CLI_OUTPUT_BUDGET,
@@ -50,12 +51,15 @@ import {
   parseReviewComments,
   parseSkillList,
   PR_JSON_FIELDS,
+  PR_LIST_LIMIT,
   PR_VIEW_JSON_FIELDS,
   severityRank,
   SEVERITIES,
+  patchLineChanges,
   splitUnifiedDiff,
   type Finding,
   type FilePatch,
+  type FilterContext,
   type FindingLocation,
   type PostAnchor,
   type PrSnapshot,
@@ -63,6 +67,8 @@ import {
 } from "./review-core";
 
 const CHANGED = "code-review-changed";
+/** Panel position only, so choosing a side pane does not refetch everything. */
+const PANEL_STATE_CHANGED = "code-review-panel-state-changed";
 const GH_HINT =
   "Install the GitHub CLI and run `gh auth login`, then reload the plugin.";
 const GH_HOST = "github.com";
@@ -115,9 +121,6 @@ const findingSchemaDto = z.object({
   /** The gist for the list view; derived when the agent wrote none. */
   gist: z.string(),
   summary: z.string(),
-  background: z.string(),
-  problem: z.string(),
-  suggestedFix: z.string(),
   suggestedComment: z.string(),
   /** The user's edit, or null when the suggested comment is unedited. */
   draftComment: z.string().nullable(),
@@ -138,7 +141,6 @@ const findingSchemaDto = z.object({
     /** The finding's range had to be narrowed to fit the diff. */
     adjusted: z.boolean(),
   }),
-  discussionThreadId: z.string().nullable(),
   references: z.array(
     z.object({
       file: z.string(),
@@ -165,6 +167,31 @@ const reviewSchema = z.object({
   updatedAt: z.string(),
 });
 export type ReviewDto = z.infer<typeof reviewSchema>;
+
+const prCommentSchema = z.object({
+  author: z.string(),
+  body: z.string(),
+  createdAt: z.string(),
+  /** Set for inline review comments. */
+  file: z.string().nullable(),
+  line: z.number().nullable(),
+});
+
+const prSnapshotSchema = z.object({
+  title: z.string(),
+  body: z.string(),
+  author: z.string(),
+  state: z.string(),
+  isDraft: z.boolean(),
+  baseRefName: z.string(),
+  headRefName: z.string(),
+  headSha: z.string(),
+  comments: z.array(prCommentSchema),
+  reviewComments: z.array(prCommentSchema),
+  files: z.array(
+    z.object({ path: z.string(), additions: z.number(), deletions: z.number() }),
+  ),
+});
 
 const statusSchema = z.object({
   state: z.enum(["ready", "needs_configuration", "unavailable", "checking"]),
@@ -201,6 +228,15 @@ const codeLocationSchema = z.object({
   /** First line number in `lines`; 1-based. */
   firstLine: z.number(),
   lines: z.array(z.string()),
+  /**
+   * Whether this file is in the pull request at all. False means the code
+   * below is untouched context, not part of the change under review.
+   */
+  inDiff: z.boolean(),
+  /** Which of the returned lines the pull request added. */
+  addedLines: z.array(z.number()),
+  /** Lines the pull request deleted, keyed to the line they followed. */
+  removals: z.array(z.object({ afterLine: z.number(), lines: z.array(z.string()) })),
   /** Lines exist above/below what was returned. */
   hasMoreAbove: z.boolean(),
   hasMoreBelow: z.boolean(),
@@ -208,9 +244,17 @@ const codeLocationSchema = z.object({
   error: z.string().nullable(),
 });
 
+/** Which view of the side pane the reviewer last had open. */
+const sidePaneSchema = z.enum(["github", "diff", "files", "discussion"]);
+
 const panelStateSchema = z.object({
   repo: z.string().nullable(),
   filter: filterSchema.nullable(),
+  sidePane: sidePaneSchema.nullable(),
+  /** The file the diff view should open on, when one was asked for. */
+  diffFile: z.string().nullable(),
+  /** That file's anchored place in GitHub's diff, for the in-app browser. */
+  diffUrl: z.string().nullable(),
 });
 
 export const rpcContract = defineRpcContract({
@@ -269,9 +313,47 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ finding: findingSchemaDto }),
   },
-  discussFinding: {
-    input: z.object({ findingId: z.string() }),
+  askAboutFinding: {
+    input: z.object({ findingId: z.string(), question: z.string().min(1) }),
     output: z.object({ threadId: z.string() }),
+  },
+  /** The review thread for a PR, for the panel's discussion tab. A cheap read:
+   *  it never touches GitHub, so the tab can follow the route as it changes. */
+  getReviewThread: {
+    input: z.object({ repo: z.string(), number: z.number().int().positive() }),
+    output: z.object({ threadId: z.string().nullable() }),
+  },
+  /**
+   * The pull request itself — description, conversation, and changed files —
+   * for the panel's own PR tab. Patches are fetched per file rather than
+   * inlined, so opening a PR does not ship its whole diff to the panel.
+   */
+  getPullRequestView: {
+    input: z.object({
+      repo: z.string(),
+      number: z.number().int().positive(),
+      /** Re-fetch from GitHub. Ignored for a reviewed pull request, whose
+       *  snapshot is pinned to the commit its findings were written against. */
+      refresh: z.boolean().optional(),
+    }),
+    output: z.object({
+      url: z.string(),
+      fetchedAt: z.string(),
+      /** False when the snapshot is newer than the review the findings came
+       *  from, so what is shown may not be what was reviewed. */
+      isReviewedCommit: z.boolean(),
+      snapshot: prSnapshotSchema,
+      /** Changed files that the stored diff actually carries a patch for. */
+      filesWithPatch: z.array(z.string()),
+    }),
+  },
+  getPullRequestPatch: {
+    input: z.object({
+      repo: z.string(),
+      number: z.number().int().positive(),
+      file: z.string(),
+    }),
+    output: z.object({ patch: z.string() }),
   },
   getFindingCode: {
     input: z.object({
@@ -288,7 +370,22 @@ export const rpcContract = defineRpcContract({
     }),
   },
   getPanelState: { input: z.null(), output: panelStateSchema },
-  setPanelState: { input: panelStateSchema, output: panelStateSchema },
+  /**
+   * A patch, not a replacement: the PR list owns the repo and filter while the
+   * side pane owns its own selection, and neither should flatten the other's
+   * field by writing a whole row. An absent key keeps what is stored; an
+   * explicit null clears it.
+   */
+  setPanelState: {
+    input: z.object({
+      repo: z.string().nullable().optional(),
+      filter: filterSchema.nullable().optional(),
+      sidePane: sidePaneSchema.nullable().optional(),
+      diffFile: z.string().nullable().optional(),
+      diffUrl: z.string().nullable().optional(),
+    }),
+    output: panelStateSchema,
+  },
 });
 
 // ---------------------------------------------------------------------------
@@ -390,6 +487,10 @@ interface ReviewRow {
   summary: string;
   error: string | null;
   thread_id: string | null;
+  /** 1 when GitHub was asking the viewer for this review when it started. */
+  awaited_me_at_start: number;
+  /** Set once the thread has been archived, so it is archived only once. */
+  thread_archived_at: string | null;
   findings_path: string | null;
   skills: string;
   created_at: string;
@@ -408,16 +509,12 @@ interface FindingRow {
   category: string;
   title: string;
   summary: string;
-  background: string;
-  problem: string;
-  suggested_fix: string;
   suggested_comment: string;
   draft_comment: string | null;
   state: string;
   comment_url: string | null;
   posted_at: string | null;
   posted_as: string;
-  discussion_thread_id: string | null;
   references_json: string;
 }
 
@@ -452,10 +549,7 @@ function toFindingDto(row: FindingRow): FindingDto {
     category: row.category,
     title: row.title,
     summary: row.summary ?? "",
-    gist: findingGist({ summary: row.summary ?? "", problem: row.problem }),
-    background: row.background,
-    problem: row.problem,
-    suggestedFix: row.suggested_fix,
+    gist: findingGist({ summary: row.summary ?? "", suggestedComment: row.suggested_comment }),
     suggestedComment: row.suggested_comment,
     draftComment: row.draft_comment,
     state:
@@ -463,7 +557,6 @@ function toFindingDto(row: FindingRow): FindingDto {
     commentUrl: row.comment_url,
     postedAt: row.posted_at,
     postedAs: row.posted_as === "pending-review" ? "pending-review" : "comment",
-    discussionThreadId: row.discussion_thread_id,
     references: parseJsonArray(row.references_json),
     // Replaced by listFindings, which has the diff to hand.
     postAnchor: { kind: "file" as const, line: null, startLine: null, adjusted: false },
@@ -567,6 +660,11 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        created_at TEXT NOT NULL,
        updated_at TEXT NOT NULL
      )`,
+    // This statement has already been applied to existing databases, and
+    // `bb.storage.migrate` matches statements by index by hashing their text --
+    // so much as reformatting one that has run makes the plugin refuse to load.
+    // Columns this plugin no longer uses are therefore still created here and
+    // dropped by an appended migration at the end of this list.
     `CREATE TABLE IF NOT EXISTS findings (
        id TEXT PRIMARY KEY,
        review_id TEXT NOT NULL,
@@ -633,6 +731,13 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        paths TEXT NOT NULL,
        fetched_at TEXT NOT NULL
      )`,
+    // A finding is a comment now, and questions go to the review's own thread,
+    // so nothing reads these four. None is indexed or part of a key, so SQLite
+    // can drop them outright.
+    `ALTER TABLE findings DROP COLUMN background`,
+    `ALTER TABLE findings DROP COLUMN problem`,
+    `ALTER TABLE findings DROP COLUMN suggested_fix`,
+    `ALTER TABLE findings DROP COLUMN discussion_thread_id`,
   ]);
 
   /**
@@ -652,6 +757,11 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
   ensureColumn("findings", "posted_as", `TEXT NOT NULL DEFAULT 'comment'`);
+  ensureColumn("reviews", "awaited_me_at_start", `INTEGER NOT NULL DEFAULT 0`);
+  ensureColumn("reviews", "thread_archived_at", `TEXT`);
+  ensureColumn("panel_state", "side_pane", `TEXT`);
+  ensureColumn("panel_state", "diff_file", `TEXT`);
+  ensureColumn("panel_state", "diff_url", `TEXT`);
 
   function getReview(reviewId: string): ReviewRow | null {
     return (db.prepare(`SELECT * FROM reviews WHERE id = ?`).get(reviewId) as
@@ -711,6 +821,10 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
 
   function announce(): void {
     bb.realtime.publish(CHANGED, { at: nowIso() });
+  }
+
+  function announcePanelState(): void {
+    bb.realtime.publish(PANEL_STATE_CHANGED, { at: nowIso() });
   }
 
   // -------------------------------------------------------------------------
@@ -910,7 +1024,8 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       if (stored !== null) return stored;
     }
     const raw = await gh(
-      ["pr", "list", "-R", repo, "--state", "open", "--limit", "100", "--json", PR_JSON_FIELDS],
+      ["pr", "list", "-R", repo, "--state", "open",
+       "--limit", `${PR_LIST_LIMIT}`, "--json", PR_JSON_FIELDS],
       45_000,
     );
     const prs = parsePullRequests(raw, repo);
@@ -920,6 +1035,98 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        ON CONFLICT(repo) DO UPDATE SET prs = excluded.prs, fetched_at = excluded.fetched_at`,
     ).run(repo, JSON.stringify(prs), fetchedAt);
     return { prs, fetchedAt };
+  }
+
+  async function filterContext(): Promise<FilterContext> {
+    return { viewer: await getViewer(), myTeams: await getMyTeams() };
+  }
+
+  /** Whether GitHub is currently asking the viewer to review this PR. */
+  async function awaitsReview(repo: string, number: number): Promise<boolean> {
+    const { prs } = await fetchPullRequests(repo);
+    const pr = prs.find((candidate) => candidate.number === number);
+    return pr !== undefined && awaitsReviewFrom(pr, await filterContext());
+  }
+
+  /**
+   * Archive the threads of this repo's finished reviews.
+   *
+   * A review is finished when GitHub has stopped asking the viewer for it —
+   * which is what submitting a review does — or when the pull request is no
+   * longer open at all. Both are only observable when a repo's list is
+   * fetched, so the sweep runs then, and only over `repo`: switching the
+   * panel to another repo says nothing about the reviews in this one.
+   */
+  async function archiveFinishedReviewThreads(repo: string, prs: PullRequest[]): Promise<void> {
+    const rows = db
+      .prepare(`SELECT * FROM reviews WHERE repo = ? AND thread_archived_at IS NULL`)
+      .all(repo) as ReviewRow[];
+    if (rows.length === 0) return;
+    // A full page means there may be open pull requests past its end, so an
+    // absent one cannot be read as closed.
+    const listIsComplete = prs.length < PR_LIST_LIMIT;
+    const context = await filterContext();
+
+    for (const row of rows) {
+      // A review re-run between pressing the button and the new thread
+      // starting has no thread to archive.
+      const threadId = row.thread_id;
+      if (threadId === null) continue;
+      const pr = prs.find((candidate) => candidate.number === row.number);
+      const isFinished =
+        pr === undefined
+          ? listIsComplete
+          : row.awaited_me_at_start === 1 && !awaitsReviewFrom(pr, context);
+      if (!isFinished) continue;
+      try {
+        await bb.sdk.threads.archive({ threadId });
+      } catch (error) {
+        // A thread the user already deleted is just as archived as one this
+        // call archives, and neither is worth retrying on every refresh.
+        bb.log.warn(`could not archive ${threadId} for ${row.id}: ${String(error)}`);
+      }
+      db.prepare(`UPDATE reviews SET thread_archived_at = ? WHERE id = ?`).run(nowIso(), row.id);
+      bb.log.info(`archived the review thread for ${row.id}`);
+    }
+  }
+
+  /**
+   * The pull request as the panel's own PR tab shows it.
+   *
+   * A reviewed PR is served from the stored snapshot, so what you read is the
+   * commit the findings were written against. One you have not reviewed has no
+   * snapshot, so it is fetched — and marked as not being a reviewed commit,
+   * because nothing pins it.
+   */
+  async function pullRequestView(
+    repo: string,
+    number: number,
+    refresh: boolean,
+  ): Promise<{
+    url: string;
+    fetchedAt: string;
+    isReviewedCommit: boolean;
+    snapshot: PrSnapshot;
+    filesWithPatch: string[];
+  }> {
+    requireRepo(repo);
+    const context = await loadContext(repo, number, refresh);
+    return {
+      url: `https://github.com/${repo}/pull/${number}`,
+      fetchedAt: storedContextFetchedAt(reviewIdFor(repo, number)),
+      isReviewedCommit: context.atReviewStart,
+      snapshot: context.snapshot,
+      filesWithPatch: splitUnifiedDiff(context.diff).map((file) => file.path),
+    };
+  }
+
+  /** One file's patch, so opening a PR does not ship its whole diff. */
+  async function pullRequestPatch(repo: string, number: number, file: string): Promise<string> {
+    requireRepo(repo);
+    const context = await loadContext(repo, number);
+    const match = splitUnifiedDiff(context.diff).find((entry) => entry.path === file);
+    if (match === undefined) throw new Error(`${file} is not in this pull request's diff.`);
+    return match.patch;
   }
 
   /** Attach this plugin's review state to the wire DTO. */
@@ -937,16 +1144,28 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   // -------------------------------------------------------------------------
   // The PR snapshot the review agent reads
   // -------------------------------------------------------------------------
-  interface ContextRow {
+  /** A stored pull request: the snapshot, its diff, and whether it is pinned. */
+interface StoredContext {
+  snapshot: PrSnapshot;
+  diff: string;
+  atReviewStart: boolean;
+}
+
+interface ContextRow {
     snapshot: string;
     diff: string;
     fetched_at: string;
     at_review_start: number;
   }
 
-  function getContext(
-    reviewId: string,
-  ): { snapshot: PrSnapshot; diff: string; atReviewStart: boolean } | null {
+  function storedContextFetchedAt(reviewId: string): string {
+    const row = db
+      .prepare(`SELECT fetched_at FROM review_context WHERE review_id = ?`)
+      .get(reviewId) as { fetched_at: string } | undefined;
+    return row?.fetched_at ?? "";
+  }
+
+  function getContext(reviewId: string): StoredContext | null {
     const row = db.prepare(`SELECT * FROM review_context WHERE review_id = ?`).get(reviewId) as
       | ContextRow
       | undefined;
@@ -962,12 +1181,15 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
    * Fetch the PR once, on the server, and store it. Everything the review
    * agent needs comes from here, so the agent never runs gh: gh is configured
    * and unsandboxed here, and may be neither in the agent's environment.
+   *
+   * Returns what it stored, so a caller never has to read back what it just
+   * wrote and prove to the compiler that it is there.
    */
   async function fetchContext(
     repo: string,
     number: number,
     atReviewStart = true,
-  ): Promise<PrSnapshot> {
+  ): Promise<StoredContext> {
     const [viewRaw, diffRaw] = await Promise.all([
       gh(["pr", "view", String(number), "-R", repo, "--json", PR_VIEW_JSON_FIELDS], 45_000),
       gh(["pr", "diff", String(number), "-R", repo], 120_000),
@@ -995,7 +1217,25 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       fetched_at: nowIso(),
       at_review_start: atReviewStart ? 1 : 0,
     });
-    return snapshot;
+    return { snapshot, diff: diffRaw, atReviewStart };
+  }
+
+  /**
+   * The stored pull request, fetching it if there is none.
+   *
+   * `refresh` is honoured only for a pull request that has not been reviewed.
+   * A reviewed one is pinned to the commit its findings were written against,
+   * and replacing that would move the code out from under comments already
+   * written about it.
+   */
+  async function loadContext(
+    repo: string,
+    number: number,
+    refresh = false,
+  ): Promise<StoredContext> {
+    const stored = getContext(reviewIdFor(repo, number));
+    if (stored !== null && !(refresh && !stored.atReviewStart)) return stored;
+    return fetchContext(repo, number, false);
   }
 
   // -------------------------------------------------------------------------
@@ -1012,7 +1252,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     const reviewId = reviewIdFor(repo, number);
     // Fetch the PR up front, on the server. If GitHub is unreachable there is
     // no point spawning an agent that would have nothing to read.
-    const snapshot = await fetchContext(repo, number);
+    const { snapshot } = await fetchContext(repo, number);
     const title = snapshot.title === "" ? `PR #${number}` : snapshot.title;
     const findingsPath = path.posix.join(
       config.findingsDir === "" ? ".bb/code-review" : config.findingsDir,
@@ -1027,15 +1267,24 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     // be on a newer one.
     db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
 
+    // Whether GitHub is asking *you* for this review decides how the thread is
+    // cleaned up later: a request that was there at the start and is gone on a
+    // later refresh means the review was submitted. Recorded now, because a
+    // review run from "All open" never had one and must not look finished the
+    // moment it is done.
+    const awaitedMe = await awaitsReview(repo, number);
+
     const timestamp = nowIso();
     db.prepare(
       `INSERT INTO reviews (id, repo, number, title, status, summary, error, thread_id,
-                            findings_path, skills, created_at, updated_at)
+                            findings_path, skills, created_at, updated_at,
+                            awaited_me_at_start, thread_archived_at)
        VALUES (@id, @repo, @number, @title, 'queued', '', NULL, NULL, @findings_path,
-               @skills, @created_at, @updated_at)
+               @skills, @created_at, @updated_at, @awaited_me, NULL)
        ON CONFLICT(id) DO UPDATE SET
          title = @title, status = 'queued', summary = '', error = NULL, thread_id = NULL,
-         findings_path = @findings_path, skills = @skills, updated_at = @updated_at`,
+         findings_path = @findings_path, skills = @skills, updated_at = @updated_at,
+         awaited_me_at_start = @awaited_me, thread_archived_at = NULL`,
     ).run({
       id: reviewId,
       repo,
@@ -1045,6 +1294,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       skills: JSON.stringify(skills),
       created_at: timestamp,
       updated_at: timestamp,
+      awaited_me: awaitedMe ? 1 : 0,
     });
     announce();
 
@@ -1065,6 +1315,10 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         environment: { type: "project-default" },
         title: `Review ${repo}#${number}: ${title}`.slice(0, 120),
         prompt,
+        // The panel's discussion pane is the only way in, so the thread stays
+        // out of the sidebar's list rather than sitting among the ones the
+        // user started themselves.
+        visibility: "hidden",
       });
       touchReview(reviewId, { thread_id: thread.id, status: "running" });
       bb.log.info(`started review thread ${thread.id} for ${reviewId}`);
@@ -1109,10 +1363,10 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       .get(reviewId) as { n: number };
     const insert = db.prepare(
       `INSERT INTO findings (id, review_id, ord, file, start_line, end_line, side, severity,
-                             category, title, summary, background, problem, suggested_fix,
+                             category, title, summary,
                              suggested_comment, references_json, draft_comment, state)
        VALUES (@id, @review_id, @ord, @file, @start_line, @end_line, @side, @severity,
-               @category, @title, @summary, @background, @problem, @suggested_fix,
+               @category, @title, @summary,
                @suggested_comment, @references_json, NULL, 'open')`,
     );
     const write = db.transaction((rows: Finding[]) => {
@@ -1133,9 +1387,6 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           category: finding.category,
           title: finding.title,
           summary: finding.summary,
-          background: finding.background,
-          problem: finding.problem,
-          suggested_fix: finding.suggestedFix,
           suggested_comment: finding.suggestedComment,
           references_json: JSON.stringify(finding.references),
         });
@@ -1376,51 +1627,51 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
   // -------------------------------------------------------------------------
-  // Discussing a finding
+  // Asking the review thread about a finding
   // -------------------------------------------------------------------------
-  async function discussFinding(findingId: string): Promise<string> {
+
+  /**
+   * Questions go to the thread that produced the review, not to a fresh thread
+   * per finding: it already holds the PR, the diff, and the reasoning behind
+   * every finding, and one conversation per review is one place to look.
+   * Re-running a review starts a new thread, so the conversation always
+   * belongs to the run whose findings are on screen.
+   */
+  async function askAboutFinding(findingId: string, question: string): Promise<string> {
     const row = requireFinding(findingId);
-    if (row.discussion_thread_id !== null) {
-      // Reuse the existing conversation so "Discuss" is idempotent — unless
-      // the thread has since been deleted.
-      try {
-        await bb.sdk.threads.get({ threadId: row.discussion_thread_id });
-        return row.discussion_thread_id;
-      } catch {
-        db.prepare(`UPDATE findings SET discussion_thread_id = NULL WHERE id = ?`).run(findingId);
-      }
-    }
     const finding = toFindingDto(row);
     const review = getReview(finding.reviewId);
     if (review === null) throw new Error(`No review for finding ${findingId}.`);
-    const projectId = await resolveProjectId(review.repo);
-    const thread = await bb.sdk.threads.spawn({
-      projectId,
-      environment: { type: "project-default" },
-      title: `${review.repo}#${review.number}: ${finding.title}`.slice(0, 120),
-      parentThreadId: review.thread_id ?? undefined,
-      prompt: buildDiscussionPrompt({
-        repo: review.repo,
-        number: review.number,
-        prTitle: review.title,
-        finding: {
-          file: finding.file,
-          startLine: finding.startLine,
-          endLine: finding.endLine,
-          title: finding.title,
-          background: finding.background,
-          problem: finding.problem,
-          suggestedFix: finding.suggestedFix,
-          suggestedComment: effectiveComment(finding),
+    const threadId = review.thread_id;
+    if (threadId === null) {
+      throw new Error("This review has no thread yet — start the review first.");
+    }
+    try {
+      await bb.sdk.threads.get({ threadId });
+    } catch {
+      throw new Error("The review thread is gone. Re-run the review to start a new one.");
+    }
+    await bb.sdk.threads.send({
+      threadId,
+      mode: "auto",
+      input: [
+        {
+          type: "text",
+          mentions: [],
+          text: buildFindingQuestion({
+            finding: {
+              file: finding.file,
+              startLine: finding.startLine,
+              endLine: finding.endLine,
+              title: finding.title,
+              suggestedComment: effectiveComment(finding),
+            },
+            question,
+          }),
         },
-      }),
+      ],
     });
-    db.prepare(`UPDATE findings SET discussion_thread_id = ? WHERE id = ?`).run(
-      thread.id,
-      findingId,
-    );
-    announce();
-    return thread.id;
+    return threadId;
   }
 
   // -------------------------------------------------------------------------
@@ -1554,6 +1805,9 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     }
     const snapshot = stored?.snapshot ?? null;
     const sha = snapshot?.headSha ?? "";
+    // Parsed once for the whole finding: several locations often sit in the
+    // same file, and every one of them needs the same answer.
+    const patches = stored === null ? [] : splitUnifiedDiff(stored.diff);
 
     const prPaths = (snapshot?.files ?? []).map((entry) => entry.path);
     // Resolve against the PR's files first; only if something still looks
@@ -1564,9 +1818,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         startLine: finding.startLine,
         endLine: finding.endLine,
         summary: finding.summary,
-        background: finding.background,
-        problem: finding.problem,
-        suggestedFix: finding.suggestedFix,
+        suggestedComment: finding.suggestedComment,
         references: finding.references,
       },
       (file) => resolveCitedPath(file, prPaths, [], finding.file),
@@ -1580,9 +1832,7 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       startLine: finding.startLine,
       endLine: finding.endLine,
       summary: finding.summary,
-      background: finding.background,
-      problem: finding.problem,
-      suggestedFix: finding.suggestedFix,
+      suggestedComment: finding.suggestedComment,
       references: finding.references,
     }, (file) => resolveCitedPath(file, prPaths, treePaths, finding.file));
 
@@ -1609,6 +1859,9 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
           contextBlock: "",
           firstLine: 1,
           lines: [] as string[],
+          inDiff: patches.some((entry) => entry.path === location.file),
+          addedLines: [] as number[],
+          removals: [] as Array<{ afterLine: number; lines: string[] }>,
         };
         if (sha === "") {
           return {
@@ -1642,10 +1895,22 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         const from = Math.max(1, start - contextLines);
         const to = Math.min(all.length, end + contextLines);
         const lines = all.slice(from - 1, to);
+        // What the pull request did to this window, so the snippet can say
+        // whether the reader is looking at new code or code that was already
+        // there — the file alone cannot tell them apart.
+        const patch = patches.find((entry) => entry.path === location.file);
+        const changes =
+          patch === undefined ? { added: [], removals: [] } : patchLineChanges(patch.patch);
         return {
           ...base,
           firstLine: from,
           lines,
+          addedLines: changes.added.filter((line) => line >= from && line <= to),
+          removals: changes.removals.filter(
+            // `afterLine` 0 means "before the first line of the file", which is
+            // only in this window when the window starts at the top.
+            (removal) => removal.afterLine >= from - 1 && removal.afterLine <= to,
+          ),
           contextBlock: buildFileContextBlock({
             file: location.file,
             startLine: location.startLine,
@@ -1674,10 +1939,20 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   // Panel state, so re-opening the tab resumes where it left off
   // -------------------------------------------------------------------------
   function readPanelState() {
-    const row = db.prepare(`SELECT repo, filter FROM panel_state WHERE id = 1`).get() as
-      | { repo: string | null; filter: string | null }
+    const row = db
+      .prepare(`SELECT repo, filter, side_pane, diff_file, diff_url FROM panel_state WHERE id = 1`)
+      .get() as
+      | {
+          repo: string | null;
+          filter: string | null;
+          side_pane: string | null;
+          diff_file: string | null;
+          diff_url: string | null;
+        }
       | undefined;
-    if (row === undefined) return { repo: null, filter: null };
+    if (row === undefined) {
+      return { repo: null, filter: null, sidePane: null, diffFile: null, diffUrl: null };
+    }
     let filter: unknown = null;
     try {
       filter = row.filter === null ? null : JSON.parse(row.filter);
@@ -1685,7 +1960,14 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       filter = null;
     }
     const parsed = filterSchema.safeParse(filter);
-    return { repo: row.repo, filter: parsed.success ? parsed.data : null };
+    const sidePane = sidePaneSchema.safeParse(row.side_pane);
+    return {
+      repo: row.repo,
+      filter: parsed.success ? parsed.data : null,
+      sidePane: sidePane.success ? sidePane.data : null,
+      diffFile: row.diff_file,
+      diffUrl: row.diff_url,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1719,11 +2001,8 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       requireRepo(repo);
       await checkAuth();
       const { prs, fetchedAt } = await fetchPullRequests(repo, refresh === true);
-      const context = {
-        viewer: await getViewer(),
-        myTeams: await getMyTeams(),
-      };
-      const filtered = filterPullRequests(prs, filter, context);
+      await archiveFinishedReviewThreads(repo, prs);
+      const filtered = filterPullRequests(prs, filter, await filterContext());
       return {
         fetchedAt,
         pullRequests: filtered
@@ -1777,8 +2056,22 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       return { finding: await postFinding(findingId, mode) };
     },
 
-    async discussFinding({ findingId }) {
-      return { threadId: await discussFinding(findingId) };
+    async askAboutFinding({ findingId, question }) {
+      return { threadId: await askAboutFinding(findingId, question) };
+    },
+
+    getReviewThread({ repo, number }) {
+      return { threadId: getReview(reviewIdFor(repo, number))?.thread_id ?? null };
+    },
+
+    async getPullRequestView({ repo, number, refresh }) {
+      await checkAuth();
+      return pullRequestView(repo, number, refresh === true);
+    },
+
+    async getPullRequestPatch({ repo, number, file }) {
+      await checkAuth();
+      return { patch: await pullRequestPatch(repo, number, file) };
     },
 
     async getFindingCode({ findingId, context }) {
@@ -1790,15 +2083,30 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       return readPanelState();
     },
 
-    setPanelState({ repo, filter }) {
+    setPanelState(patch) {
+      const current = readPanelState();
+      const repo = patch.repo === undefined ? current.repo : patch.repo;
+      const filter = patch.filter === undefined ? current.filter : patch.filter;
+      const sidePane = patch.sidePane === undefined ? current.sidePane : patch.sidePane;
+      const diffFile = patch.diffFile === undefined ? current.diffFile : patch.diffFile;
+      const diffUrl = patch.diffUrl === undefined ? current.diffUrl : patch.diffUrl;
       db.prepare(
-        `INSERT INTO panel_state (id, repo, filter, updated_at) VALUES (1, @repo, @filter, @updated_at)
-         ON CONFLICT(id) DO UPDATE SET repo = @repo, filter = @filter, updated_at = @updated_at`,
+        `INSERT INTO panel_state (id, repo, filter, side_pane, diff_file, diff_url, updated_at)
+         VALUES (1, @repo, @filter, @side_pane, @diff_file, @diff_url, @updated_at)
+         ON CONFLICT(id) DO UPDATE SET repo = @repo, filter = @filter,
+           side_pane = @side_pane, diff_file = @diff_file, diff_url = @diff_url,
+           updated_at = @updated_at`,
       ).run({
         repo,
         filter: filter === null ? null : JSON.stringify(filter),
+        side_pane: sidePane,
+        diff_file: diffFile,
+        diff_url: diffUrl,
         updated_at: nowIso(),
       });
+      // So a side pane already on screen follows a choice made elsewhere —
+      // pressing "Discuss" on an issue, or another window.
+      announcePanelState();
       return readPanelState();
     },
   });

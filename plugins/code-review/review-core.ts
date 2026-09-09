@@ -39,12 +39,7 @@ export const findingSchema = z.object({
   title: z.string().trim().min(1),
   /** The gist, for the list view: at most a few sentences. */
   summary: z.string().trim(),
-  /** What the code is doing — the context needed to understand the issue. */
-  background: z.string().trim(),
-  /** What is actually wrong. */
-  problem: z.string().trim().min(1),
-  suggestedFix: z.string().trim(),
-  /** Ready-to-post review comment text. */
+  /** Ready-to-post review comment text. The only field the PR author sees. */
   suggestedComment: z.string().trim().min(1),
   /** Other places in the repo this finding depends on or points at. */
   references: z.array(referenceSchema),
@@ -114,9 +109,6 @@ export function normalizeFinding(input: unknown): unknown {
     category: firstString(row, ["category", "kind", "type"]),
     title: firstString(row, ["title", "headline"]),
     summary: firstString(row, ["summary", "gist", "shortDescription"]),
-    background: firstString(row, ["background", "context"]),
-    problem: firstString(row, ["problem", "issue", "description", "detail"]),
-    suggestedFix: firstString(row, ["suggestedFix", "suggested_fix", "fix"]),
     suggestedComment: firstString(row, [
       "suggestedComment",
       "suggested_comment",
@@ -217,11 +209,8 @@ export const FINDINGS_SCHEMA_TEXT = `{
       "category": "correctness",           // free-form, e.g. correctness, security, tests, naming
       "title": "Session token is compared non-constant-time",
       "summary": "The gist, for the list view. Two sentences at most.",
-      "background": "What this code does and the context a reader needs.",
-      "problem": "What is actually wrong, and why it matters.",
-      "suggestedFix": "How you would fix it.",
       "suggestedComment": "The exact review comment text to post on the PR.",
-      "references": [                      // other code that supports the finding
+      "references": [                      // code the reader should look at
         { "file": "src/server/session.ts",  // full repo-relative path here too
           "startLine": 88, "endLine": 92,
           "note": "the comparison this one should match" }
@@ -294,7 +283,66 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "```",
     "",
     "`suggestedComment` is posted verbatim to GitHub, so write it as a review comment",
-    "addressed to the PR author — not as a note to yourself. Keep it specific and short.",
+    "addressed to the PR author — not as a note to yourself.",
+    "",
+    "## How to write the comment",
+    "",
+    "It has to stand on its own: the reader has the diff and nothing else. There is",
+    "no other prose field — do not write a separate write-up of the finding anywhere.",
+    "",
+    "**Default to two or three sentences.** What is wrong, and the question you want",
+    "answered. Nothing else:",
+    "",
+    "> This waits on `isLoading` but not on failure, so a 5xx renders the instance with",
+    "> every admin-enabled feature silently off. Could we treat an errored read the same",
+    "> as an unloaded one?",
+    "",
+    "**Only when the reader could not get there from the diff alone**, lay the path out",
+    "in steps. Earn the extra length — if the chain is one hop, keep it to prose:",
+    "",
+    "> Should this wait on the error case too, not just `isLoading`?",
+    ">",
+    "> I think this can happen:",
+    "> 1. `instanceFeatures.get` fails — offline, or a 5xx",
+    "> 2. The query settles anyway: `isLoading` false, `features` null",
+    "> 3. `activeFeatures` falls back to `EMPTY_FEATURES`",
+    "> 4. The instance renders with every admin-enabled feature off, and nothing says so",
+    ">",
+    "> Could the query return `isError`, and this treat an errored read like an unloaded one?",
+    "",
+    "Rules that hold either way:",
+    "",
+    "- **Name real symbols and paths.** `EMPTY_FEATURES`, `useSetSpaceFeature`,",
+    "  `client/data/spaces.ts:258` — precise and greppable. What to avoid is the",
+    "  *unnamed* abstraction: \"the instance snapshot\", \"a non-space read\". If a",
+    "  concept has no name in the code, describe it in plain words instead.",
+    "- **One idea per paragraph**, and a blank line between them. A ten-line block of",
+    "  prose does not get read.",
+    "- **Ask, do not pronounce.** \"Could this…?\", \"Should this…?\" — you may have",
+    "  missed something the author knows.",
+    "- **Offer the alternative last**, in one sentence, when there is an obvious one.",
+    "- **No preamble.** Not \"Great work, but…\", not \"Minor nit:\", not restating the",
+    "  diff back to the author.",
+    "",
+    "## Point at the code that backs it up",
+    "",
+    "`references` is where context goes, not prose. Each entry names a real place in",
+    "the repository and says in **one line** what the reader should look at there:",
+    "",
+    "```json",
+    '  \"references\": [',
+    '    { \"file\": \"client/data/spaces.ts\", \"startLine\": 258, \"endLine\": 297,',
+    '      \"note\": \"useSetSpaceFeature — the same write, with rollback\" },',
+    '    { \"file\": \"client/component/reaction-types.tsx\", \"startLine\": 161, \"endLine\": 161,',
+    '      \"note\": \"a useSpaceFeatures reader that goes stale\" }',
+    "  ]",
+    "```",
+    "",
+    "The panel puts that code on screen beside the issue, so a reference saves the",
+    "reviewer the lookup that would otherwise be a paragraph of explanation. Include",
+    "the ones that decide whether the finding is right — the function it contradicts,",
+    "the existing pattern it diverges from, the caller that reaches it, the test that",
+    "should have caught it. Leave out anything the reader would not open.",
     "",
     "**Every path must be the full repo-relative path** — `e2e-tests/tests/login.spec.ts`,",
     "never `login.spec.ts`. That applies to `file`, to every `references` entry, and to any",
@@ -320,20 +368,22 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     .join("\n");
 }
 
-export function buildDiscussionPrompt(args: {
-  repo: string;
-  number: number;
-  prTitle: string;
+/**
+ * A question about one finding, addressed to the thread that ran the review.
+ *
+ * That thread already has the PR, the diff, and its own reasoning in context,
+ * so this only re-states which finding is meant — enough to be unambiguous
+ * when several were reported — and then asks the user's question.
+ */
+export function buildFindingQuestion(args: {
   finding: {
     file: string;
     startLine: number | null;
     endLine: number | null;
     title: string;
-    background: string;
-    problem: string;
-    suggestedFix: string;
     suggestedComment: string;
   };
+  question: string;
 }): string {
   const { finding } = args;
   const location =
@@ -343,26 +393,17 @@ export function buildDiscussionPrompt(args: {
         ? `${finding.file}:${finding.startLine}-${finding.endLine}`
         : `${finding.file}:${finding.startLine}`;
   return [
-    `I am reviewing GitHub pull request ${args.repo}#${args.number} — ${args.prTitle}.`,
-    "",
-    `A review pass raised this finding on \`${location}\`:`,
-    "",
-    `**${finding.title}**`,
-    "",
-    finding.background === "" ? null : `Background: ${finding.background}`,
-    `Problem: ${finding.problem}`,
-    finding.suggestedFix === "" ? null : `Suggested fix: ${finding.suggestedFix}`,
+    `About the finding on \`${location}\` — **${finding.title}**:`,
     "",
     "Draft comment:",
     "",
     "> " + finding.suggestedComment.split("\n").join("\n> "),
     "",
-    "Read the relevant code and the PR diff, then tell me whether this finding is",
-    "correct, overstated, or wrong, and what the comment should actually say.",
-    "Do not post anything to GitHub.",
-  ]
-    .filter((line): line is string => line !== null)
-    .join("\n");
+    `My question: ${args.question}`,
+    "",
+    "Answer it against the code and the PR diff. Do not post anything to GitHub,",
+    "and do not edit the checkout.",
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +451,12 @@ interface GhPullRequest {
   labels?: Array<{ name?: unknown }> | null;
   reviewRequests?: Array<Record<string, unknown>> | null;
 }
+
+/**
+ * `gh pr list` page size. Named because a caller has to be able to tell a
+ * pull request that closed from one that is past the end of the page.
+ */
+export const PR_LIST_LIMIT = 100;
 
 /** The `--json` field list `parsePullRequests` expects. */
 export const PR_JSON_FIELDS = [
@@ -493,6 +540,19 @@ function requestedFromTeam(pr: PullRequest, teamSlug: string): boolean {
   return pr.reviewRequests.some(
     (request) =>
       request.teamSlug !== null && request.teamSlug.toLowerCase() === teamSlug.toLowerCase(),
+  );
+}
+
+/**
+ * True when the pull request carries a review request the viewer is expected
+ * to answer — named personally, or through one of their teams. GitHub clears
+ * that request when the review is submitted, so this going false is the
+ * plugin's signal that a review is finished with.
+ */
+export function awaitsReviewFrom(pr: PullRequest, context: FilterContext): boolean {
+  return (
+    requestedFromUser(pr, context.viewer) ||
+    context.myTeams.some((team) => requestedFromTeam(pr, team))
   );
 }
 
@@ -917,9 +977,7 @@ export function findingLocations(
     startLine: number | null;
     endLine: number | null;
     summary?: string;
-    background: string;
-    problem: string;
-    suggestedFix: string;
+    suggestedComment: string;
     references?: Reference[];
   },
   /**
@@ -941,12 +999,10 @@ export function findingLocations(
   for (const reference of finding.references ?? []) {
     locations.push({ ...reference, isPrimary: false });
   }
-  const prose = [
-    finding.summary ?? "",
-    finding.background,
-    finding.problem,
-    finding.suggestedFix,
-  ].join("\n");
+  // A comment regularly names another file in passing — `client/data/spaces.ts:258`
+  // — and that is worth showing beside the issue even without a `references`
+  // entry for it.
+  const prose = [finding.summary ?? "", finding.suggestedComment].join("\n");
   for (const citation of extractCitations(prose)) {
     locations.push({ ...citation, note: "", isPrimary: false });
   }
@@ -972,12 +1028,12 @@ function clampSentences(text: string, limit: number): string {
 
 /**
  * The gist for the list view. Prefers what the agent wrote, and falls back to
- * the problem statement so findings recorded before `summary` existed still
+ * the comment so findings recorded before `summary` existed still
  * read well.
  */
-export function findingGist(finding: { summary?: string; problem: string }): string {
+export function findingGist(finding: { summary?: string; suggestedComment: string }): string {
   const summary = (finding.summary ?? "").trim();
-  return clampSentences(summary === "" ? finding.problem : summary, 240);
+  return clampSentences(summary === "" ? finding.suggestedComment : summary, 240);
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,6 +1293,71 @@ export function diffHunkRanges(patch: string, side: "LEFT" | "RIGHT"): LineRange
     ranges.push({ start, end: start + count - 1 });
   }
   return ranges;
+}
+
+/** Lines a pull request deleted, sitting after `afterLine` in the new file. */
+export interface RemovedLines {
+  /** The new-file line these followed; 0 when they came before the first. */
+  afterLine: number;
+  lines: string[];
+}
+
+export interface PatchLineChanges {
+  /** New-file line numbers this patch added. */
+  added: number[];
+  removals: RemovedLines[];
+}
+
+/**
+ * What a patch did, in new-file coordinates.
+ *
+ * The panel shows a finding's code as the file at the reviewed commit rather
+ * than as a diff, which is what makes the line numbers match the finding and
+ * lets the reader ask for more context. That view cannot say whether a line is
+ * new, and deleted lines are not in it at all — so this maps the patch onto it:
+ * which of those lines the pull request added, and what it removed around them.
+ */
+export function patchLineChanges(patch: string): PatchLineChanges {
+  const added: number[] = [];
+  const removals: RemovedLines[] = [];
+  const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+  // The new-file line most recently emitted; removals hang off it.
+  let newLine = 0;
+  let pending: string[] = [];
+  // Everything before the first hunk header is the `diff --git`/`+++` preamble,
+  // whose `+++ b/file` must not be read as an added line.
+  let inHunk = false;
+
+  const flush = () => {
+    if (pending.length === 0) return;
+    removals.push({ afterLine: newLine, lines: pending });
+    pending = [];
+  };
+
+  for (const line of patch.split("\n")) {
+    const match = line.match(header);
+    if (match !== null) {
+      flush();
+      const start = Number(match[3]);
+      newLine = Number.isFinite(start) ? start - 1 : newLine;
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (line.startsWith("+")) {
+      flush();
+      newLine += 1;
+      added.push(newLine);
+    } else if (line.startsWith("-")) {
+      pending.push(line.slice(1));
+    } else if (line.startsWith(" ")) {
+      flush();
+      newLine += 1;
+    }
+    // "\ No newline at end of file" and anything else carries no position.
+  }
+  flush();
+  return { added, removals };
 }
 
 function inAnyRange(line: number, ranges: readonly LineRange[]): boolean {

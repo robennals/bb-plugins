@@ -11,14 +11,14 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { ReactNode } from "react";
 import {
   definePluginApp,
+  experimental_Diff as BbDiff,
   experimental_useAppPanel,
-  experimental_useFixedTabTarget,
+  Markdown,
   ThreadChat,
   useBbNavigate,
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { JsonValue } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { FindingDto, PullRequestDto, ReviewDto, rpcContract } from "./server";
 import { Badge } from "@/components/ui/badge";
@@ -34,9 +34,23 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  BOUNDS_SYNC_EVENT,
+  getDesktopBrowser,
+  hideView,
+  measureBounds,
+  navigateView,
+  sameBounds,
+  showView,
+  type DesktopBrowser,
+  type DesktopBrowserBounds,
+  type DesktopBrowserState,
+} from "@/lib/desktop-browser";
 import { cn } from "@/lib/utils";
 
 const PANEL_ID = "code-review";
+/** Panel position only; the broad "changed" signal is for review data. */
+const PANEL_STATE_CHANGED = "code-review-panel-state-changed";
 const PANEL_PATH = "code-review";
 const ANY_TEAM = "__any__";
 /** Context ladder for the snippet "more context" control. */
@@ -64,6 +78,9 @@ interface LocationDto {
   contextBlock: string;
   firstLine: number;
   lines: string[];
+  inDiff: boolean;
+  addedLines: number[];
+  removals: Array<{ afterLine: number; lines: string[] }>;
   hasMoreAbove: boolean;
   hasMoreBelow: boolean;
   error: string | null;
@@ -274,6 +291,16 @@ function useAutoSizedTextarea(value: string) {
   return ref;
 }
 
+/**
+ * The panel's stored position, following a change made anywhere — the selector
+ * here, "Discuss" or "diff" on an issue, or another window.
+ */
+function usePanelState(rpc: Rpc) {
+  const query = useLiveQuery(() => rpc.call("getPanelState"), [rpc]);
+  useRealtime(PANEL_STATE_CHANGED, query.refetch);
+  return query;
+}
+
 /** Refetches on mount and on every server "code-review-changed" signal. */
 function useLiveQuery<T>(load: () => Promise<T>, deps: readonly unknown[]) {
   const [data, setData] = useState<T | null>(null);
@@ -310,36 +337,40 @@ function useLiveQuery<T>(load: () => Promise<T>, deps: readonly unknown[]) {
 // The discussion tab
 // ---------------------------------------------------------------------------
 
-interface DiscussionTarget extends Record<string, JsonValue> {
-  threadId: string;
-  title: string;
-}
+/**
+ * The pane follows the route rather than remembering the last thread it was
+ * handed. There is one conversation per review, and moving to another pull
+ * request moves the pane with it — so a question is never read against, or
+ * asked of, the wrong review.
+ */
+function DiscussionPane({ subPath }: { subPath: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const route = useMemo(() => parseSubPath(subPath), [subPath]);
+  const pr = route.kind === "list" ? null : { repo: route.repo, number: route.number };
+  const thread = useLiveQuery(
+    () => (pr === null ? Promise.resolve(null) : rpc.call("getReviewThread", pr)),
+    [rpc, pr?.repo, pr?.number],
+  );
 
-const discussionTabRef = {
-  panelId: PANEL_ID,
-  id: "discussion",
-  experimental_target: {
-    validate(value: JsonValue): value is DiscussionTarget {
-      return (
-        typeof value === "object" &&
-        value !== null &&
-        !Array.isArray(value) &&
-        typeof (value as Record<string, unknown>).threadId === "string" &&
-        typeof (value as Record<string, unknown>).title === "string"
-      );
-    },
-  },
-} as const;
-
-function DiscussionTab() {
-  const state = experimental_useFixedTabTarget(discussionTabRef);
-  if (state === null) {
+  if (pr === null) {
     return (
       <div className="flex h-full items-center justify-center p-6">
         <EmptyState
           icon="SideChat"
-          title="No discussion open"
-          detail={'Press "Discuss" on an issue to talk it over with an agent here.'}
+          title="No pull request open"
+          detail="Open a pull request to see the thread that reviewed it."
+        />
+      </div>
+    );
+  }
+  const threadId = thread.data?.threadId ?? null;
+  if (threadId === null) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState
+          icon="SideChat"
+          title="No review thread yet"
+          detail={`Review ${pr.repo}#${pr.number} and its thread appears here, ready for questions.`}
         />
       </div>
     );
@@ -347,13 +378,750 @@ function DiscussionTab() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <ThreadChat
-        key={state.target.threadId}
-        threadId={state.target.threadId}
+        key={threadId}
+        threadId={threadId}
         variant="compact"
         layout="contained"
         className="min-h-0 flex-1"
       />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The pull request tab
+// ---------------------------------------------------------------------------
+
+/**
+ * One tab, not two.
+ *
+ * BB draws a plugin's fixed tabs icon-only, and uses the plugin's own branding
+ * icon for every one of them, so two tabs from this plugin are identical
+ * chips telling you nothing apart from their order. Until BB can be asked for
+ * a per-tab icon (see the README), the plugin contributes a single tab and
+ * labels the halves itself.
+ */
+const reviewTabRef = { panelId: PANEL_ID, id: "review" } as const;
+
+type SidePane = "github" | "diff" | "files" | "discussion";
+
+/**
+ * GitHub itself, in a view keyed to one pull request.
+ *
+ * The view is a native overlay BB's main process owns, so this component
+ * renders an empty box and spends its life telling the shell where that box
+ * is. Its `tabId` is the pull request, and the caller remounts on a different
+ * one, so moving to another review reclaims this one's view instead of leaving
+ * a GitHub page behind for the next review to trip over.
+ *
+ * The view itself is not tied to this component — see `showView`. Deselecting
+ * the tab only hides it, so re-selecting comes back to the same page.
+ */
+function GithubPane({
+  browser,
+  tabId,
+  group,
+  url,
+}: {
+  browser: DesktopBrowser;
+  tabId: string;
+  /** What this view belongs to; views in one group outlive each other. */
+  group: string;
+  url: string;
+}) {
+  const navigate = useBbNavigate();
+  const slot = useRef<HTMLDivElement | null>(null);
+  const lastBounds = useRef<DesktopBrowserBounds | null>(null);
+  // The last page this pane asked for, so browsing away from it is not undone
+  // on the next render — only a new request from the panel moves the view.
+  const requested = useRef(url);
+  // Whether that page's anchor still needs applying. See `applyAnchor`.
+  const anchorPending = useRef(url !== withoutFragment(url));
+  const [state, setState] = useState<DesktopBrowserState | null>(null);
+
+  const syncBounds = useCallback(() => {
+    const element = slot.current;
+    if (element === null) return;
+    const bounds = measureBounds(element);
+    // An unchanged rectangle is not worth an IPC round trip, and the sync
+    // event fires for every layout change, most of which do not move this box.
+    if (lastBounds.current !== null && sameBounds(lastBounds.current, bounds)) return;
+    lastBounds.current = bounds;
+    browser.setBounds({ tabId, bounds });
+  }, [browser, tabId]);
+
+  useEffect(() => {
+    const element = slot.current;
+    if (element === null) return;
+    const bounds = measureBounds(element);
+    lastBounds.current = bounds;
+    // Loaded without its anchor on purpose: a fragment applied during load
+    // scrolls to where the target is *then*, and GitHub's page keeps growing
+    // afterwards — deferred diffs, highlighting — which leaves the view parked
+    // somewhere else. The anchor goes on once the page has settled, below.
+    showView(browser, { tabId, url: withoutFragment(url), bounds, group });
+    const stopListening = browser.onState((next) => {
+      if (next.tabId !== tabId) return;
+      setState(next);
+      if (!next.isLoading && anchorPending.current && next.url !== requested.current) {
+        // Once only: the reader is free to scroll away afterwards, and every
+        // page they load from here is theirs, not ours to re-aim.
+        anchorPending.current = false;
+        navigateView(browser, tabId, requested.current);
+      }
+    });
+    return () => {
+      stopListening();
+      // Hidden, not destroyed: this unmounts on every deselect, and tearing
+      // the view down here would reload the page each time the tab came back.
+      // `showView` reclaims it once another pull request needs a view.
+      hideView(browser, tabId);
+      lastBounds.current = null;
+    };
+    // `url` is only this view's *starting* page; a later change navigates it,
+    // below, rather than tearing the view down and loading it again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [browser, tabId, group]);
+
+  useEffect(() => {
+    // Skipped on the first run, where `showView` has just loaded this page.
+    if (requested.current === url) return;
+    requested.current = url;
+    // The document is already up, so its anchor lands on settled layout.
+    anchorPending.current = false;
+    navigateView(browser, tabId, url);
+  }, [browser, tabId, url]);
+
+  useEffect(() => {
+    const element = slot.current;
+    if (element === null) return;
+    const observer = new ResizeObserver(syncBounds);
+    observer.observe(element);
+    window.addEventListener("resize", syncBounds);
+    window.addEventListener(BOUNDS_SYNC_EVENT, syncBounds);
+    // The overlay is positioned in window coordinates, so anything that moves
+    // the box under it — including a scroll in an ancestor — has to re-measure.
+    window.addEventListener("scroll", syncBounds, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", syncBounds);
+      window.removeEventListener(BOUNDS_SYNC_EVENT, syncBounds);
+      window.removeEventListener("scroll", syncBounds, true);
+    };
+  }, [browser, syncBounds]);
+
+  const error = state?.errorText ?? "";
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-center gap-1 border-b border-border px-1 py-1">
+        <IconButton
+          icon="ChevronLeft"
+          label="Go back"
+          disabled={!(state?.canGoBack ?? false)}
+          onClick={() => browser.goBack(tabId)}
+        />
+        <IconButton
+          icon="ChevronRight"
+          label="Go forward"
+          disabled={!(state?.canGoForward ?? false)}
+          onClick={() => browser.goForward(tabId)}
+        />
+        <IconButton icon="RotateCcw" label="Reload" onClick={() => browser.reload(tabId)} />
+        <span className="min-w-0 flex-1 truncate px-1 text-xs text-muted-foreground">
+          {state?.title ?? url}
+        </span>
+        <IconButton
+          icon="ExternalLink"
+          label="Open in an external browser"
+          onClick={() => navigate.openUrl(state?.url === undefined || state.url === "" ? url : state.url)}
+        />
+      </div>
+      {error === "" ? null : <p className="px-2 py-1 text-xs text-destructive">{error}</p>}
+      {/* The native view is placed over this box; it is deliberately empty. */}
+      <div ref={slot} data-testid="github-view" className="min-h-0 flex-1" />
+    </div>
+  );
+}
+
+function IconButton({
+  icon,
+  label,
+  disabled,
+  onClick,
+}: {
+  icon: IconName;
+  label: string;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant="ghost"
+      className="size-7 shrink-0 p-0"
+      aria-label={label}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <Icon name={icon} className="size-3.5" />
+    </Button>
+  );
+}
+
+/** One conversation or inline review comment. Mirrors the RPC output. */
+interface PrCommentDto {
+  author: string;
+  body: string;
+  createdAt: string;
+  file: string | null;
+  line: number | null;
+}
+
+function PrComment({ comment }: { comment: PrCommentDto }) {
+  const anchor =
+    comment.file === null
+      ? null
+      : comment.line === null
+        ? comment.file
+        : `${comment.file}:${comment.line}`;
+  return (
+    <div className="rounded-md border border-border p-2">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span className="text-xs font-medium">{comment.author}</span>
+        {anchor === null ? null : (
+          <span className="font-mono text-[11px] text-muted-foreground/80">{anchor}</span>
+        )}
+        <span className="text-[11px] text-muted-foreground">{relativeTime(comment.createdAt)}</span>
+      </div>
+      <Markdown content={comment.body} className="mt-1 text-sm" />
+    </div>
+  );
+}
+
+/**
+ * One changed file, its patch loaded only when opened.
+ *
+ * A pull request's whole diff is far more than a reader needs at once, and
+ * BB's diff viewer is not cheap to mount, so the list stays closed until a
+ * file is asked for.
+ */
+function PrFile({
+  rpc,
+  repo,
+  number,
+  file,
+  hasPatch,
+  isTarget = false,
+}: {
+  rpc: Rpc;
+  repo: string;
+  number: number;
+  file: { path: string; additions: number; deletions: number };
+  hasPatch: boolean;
+  /** The file the reader asked for: opens itself and scrolls into view. */
+  isTarget?: boolean;
+}) {
+  const [isOpen, setIsOpen] = useState(isTarget && hasPatch);
+  const row = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!isTarget) return;
+    // Optional call: not every environment this renders in implements it, and
+    // failing to scroll must not take the diff down with it.
+    row.current?.scrollIntoView?.({ block: "start" });
+  }, [isTarget]);
+  const [patch, setPatch] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isOpen || patch !== null) return;
+    let cancelled = false;
+    rpc.call("getPullRequestPatch", { repo, number, file: file.path }).then(
+      (result) => {
+        if (!cancelled) setPatch(result.patch);
+      },
+      (cause: unknown) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, patch, rpc, repo, number, file.path]);
+
+  return (
+    <div
+      ref={row}
+      className={cn("rounded-md border", isTarget ? "border-foreground/30" : "border-border")}
+    >
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-muted/40"
+        onClick={() => setIsOpen((open) => !open)}
+        disabled={!hasPatch}
+      >
+        <Icon name={isOpen ? "ChevronDown" : "ChevronRight"} className="size-3.5 shrink-0" />
+        <span className="min-w-0 flex-1 truncate font-mono text-xs">{file.path}</span>
+        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+          +{file.additions} −{file.deletions}
+        </span>
+      </button>
+      {!isOpen ? null : error !== null ? (
+        <p className="px-2 pb-2 text-xs text-destructive">{error}</p>
+      ) : patch === null ? (
+        <Skeleton className="mx-2 mb-2 h-24" />
+      ) : (
+        <BbDiff patch={patch} path={file.path} className="border-t border-border" />
+      )}
+    </div>
+  );
+}
+
+/** The pull request's changed files, each expanding to its diff. */
+function ChangedFiles({
+  rpc,
+  pr,
+  files,
+  filesWithPatch,
+  targetFile = null,
+}: {
+  rpc: Rpc;
+  pr: { repo: string; number: number };
+  files: Array<{ path: string; additions: number; deletions: number }>;
+  filesWithPatch: string[];
+  targetFile?: string | null;
+}) {
+  return (
+    <section className="flex flex-col gap-2">
+      <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {files.length === 1 ? "1 file changed" : `${files.length} files changed`}
+      </h3>
+      {files.map((file) => (
+        <PrFile
+          key={file.path}
+          rpc={rpc}
+          repo={pr.repo}
+          number={pr.number}
+          file={file}
+          hasPatch={filesWithPatch.includes(file.path)}
+          isTarget={file.path === targetFile}
+        />
+      ))}
+    </section>
+  );
+}
+
+/**
+ * GitHub's own diff, opened on the file the reader asked for.
+ *
+ * Pressing "diff" on a cited location lands here rather than in a browser tab,
+ * anchored at that file — the same page GitHub would have shown, in a view
+ * that belongs to this review. Where there is no in-app browser to drive, the
+ * pull request's files are rendered from the stored patch instead.
+ */
+function DiffPane({ subPath }: { subPath: string }) {
+  const route = useMemo(() => parseSubPath(subPath), [subPath]);
+  const browser = useMemo(() => getDesktopBrowser(), []);
+  const rpc = useRpc<typeof rpcContract>();
+  const state = usePanelState(rpc);
+
+  if (route.kind === "list") {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState
+          icon="Code"
+          title="No pull request open"
+          detail="Open a pull request to read its diff here."
+        />
+      </div>
+    );
+  }
+  if (browser !== null) {
+    // Waiting for the stored request: attaching first and navigating after
+    // would load the whole files page only to replace it a tick later.
+    if (state.data === null) return <Skeleton className="m-3 h-40" />;
+    const files = `https://github.com/${route.repo}/pull/${route.number}/files`;
+    return (
+      <GithubPane
+        key={`${route.repo}#${route.number}`}
+        browser={browser}
+        tabId={`code-review:diff:${route.repo}#${route.number}`}
+        group={`${route.repo}#${route.number}`}
+        // The anchored URL when a location asked for one, the whole diff
+        // otherwise. Changing it moves this view rather than reloading it.
+        url={state.data?.diffUrl ?? files}
+      />
+    );
+  }
+  return <DiffSnapshotView repo={route.repo} number={route.number} />;
+}
+
+/**
+ * The repository as the pull request sees it, at the commit under review.
+ *
+ * The diff only has the files the change touches, and a reviewer regularly
+ * needs the ones it does not — the caller of a function being changed, the
+ * test that is meant to cover it. This browses those at the reviewed commit,
+ * so what is read is what the findings were written against.
+ */
+function FilesPane({ subPath }: { subPath: string }) {
+  const route = useMemo(() => parseSubPath(subPath), [subPath]);
+  const browser = useMemo(() => getDesktopBrowser(), []);
+  const rpc = useRpc<typeof rpcContract>();
+  const pr = route.kind === "list" ? null : { repo: route.repo, number: route.number };
+  const view = useLiveQuery(
+    () => (pr === null ? Promise.resolve(null) : rpc.call("getPullRequestView", pr)),
+    [rpc, pr?.repo, pr?.number],
+  );
+
+  if (pr === null) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState
+          icon="FolderOpen"
+          title="No pull request open"
+          detail="Open a pull request to browse the repository at its commit."
+        />
+      </div>
+    );
+  }
+  if (view.error !== null) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState icon="FolderOpen" title="Could not read this pull request" detail={view.error} />
+      </div>
+    );
+  }
+  if (view.data === null) return <Skeleton className="m-3 h-40" />;
+
+  const sha = view.data.snapshot.headSha;
+  if (sha === "") {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState
+          icon="FolderOpen"
+          title="No commit to browse"
+          detail="This review has no recorded commit; re-run it to browse the code it read."
+        />
+      </div>
+    );
+  }
+  // The commit rather than the branch: a fork's branch does not exist under
+  // this repository, but GitHub serves the pull request's commits from it.
+  const tree = `https://github.com/${pr.repo}/tree/${sha}`;
+  if (browser === null) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState
+          icon="FolderOpen"
+          title="No in-app browser here"
+          detail={
+            <GithubLink href={tree} className="underline underline-offset-4">
+              Browse this commit on GitHub
+            </GithubLink>
+          }
+        />
+      </div>
+    );
+  }
+  return (
+    <GithubPane
+      key={`${pr.repo}#${pr.number}`}
+      browser={browser}
+      tabId={`code-review:files:${pr.repo}#${pr.number}`}
+      group={`${pr.repo}#${pr.number}`}
+      url={tree}
+    />
+  );
+}
+
+/** The pull request's files from the stored patch, for a client with no browser. */
+function DiffSnapshotView({ repo, number }: { repo: string; number: number }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const pr = useMemo(() => ({ repo, number }), [repo, number]);
+  const view = useLiveQuery(() => rpc.call("getPullRequestView", pr), [rpc, pr]);
+  const state = usePanelState(rpc);
+
+  if (view.error !== null) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState icon="Code" title="Could not read this diff" detail={view.error} />
+      </div>
+    );
+  }
+  if (view.data === null) return <Skeleton className="m-3 h-40" />;
+
+  const files = view.data.snapshot.files;
+  // A file from another review's request is not in this pull request, so it
+  // would silently open nothing; ignoring it opens the list instead.
+  const requested = state.data?.diffFile ?? null;
+  const targetFile = files.some((file) => file.path === requested) ? requested : null;
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto p-3">
+      {files.length === 0 ? (
+        <EmptyState icon="Code" title="No files changed" detail="This pull request is empty." />
+      ) : (
+        <ChangedFiles
+          rpc={rpc}
+          pr={pr}
+          files={files}
+          filesWithPatch={view.data.filesWithPatch}
+          targetFile={targetFile}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The pull request, in a tab this plugin owns.
+ *
+ * BB's own Browser tabs are shared across the whole panel, so a GitHub page
+ * opened for one review stays open while you read another. This follows the
+ * route instead, the way the discussion pane does, so what it shows is always
+ * the pull request in front of you.
+ *
+ * On the desktop it is GitHub itself. Where BB has no in-app browser to drive
+ * — the web build — it falls back to rendering the pull request from the
+ * snapshot the plugin already stores.
+ */
+function PullRequestPane({ subPath }: { subPath: string }) {
+  const route = useMemo(() => parseSubPath(subPath), [subPath]);
+  const browser = useMemo(() => getDesktopBrowser(), []);
+
+  if (route.kind === "list") {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState
+          icon="Github"
+          title="No pull request open"
+          detail="Open a pull request to read it here."
+        />
+      </div>
+    );
+  }
+  if (browser !== null) {
+    return (
+      <GithubPane
+        key={`${route.repo}#${route.number}`}
+        browser={browser}
+        tabId={`code-review:${route.repo}#${route.number}`}
+        group={`${route.repo}#${route.number}`}
+        url={`https://github.com/${route.repo}/pull/${route.number}`}
+      />
+    );
+  }
+  return <PullRequestSnapshotView repo={route.repo} number={route.number} />;
+}
+
+/**
+ * The stored pull request, for a client with no in-app browser to drive.
+ *
+ * Takes the pull request rather than the route: the tab has already decided
+ * there is one, so this never has to answer for the case where there is not.
+ */
+function PullRequestSnapshotView({ repo, number }: { repo: string; number: number }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const pr = useMemo(() => ({ repo, number }), [repo, number]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const view = useLiveQuery(() => rpc.call("getPullRequestView", pr), [rpc, pr]);
+
+  if (view.error !== null) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState
+          icon="GitPullRequest"
+          title="Could not read this pull request"
+          detail={view.error}
+        />
+      </div>
+    );
+  }
+  if (view.data === null) {
+    return <Skeleton className="m-3 h-40" />;
+  }
+
+  const { snapshot, filesWithPatch, url, isReviewedCommit } = view.data;
+  const refresh = () => {
+    setIsRefreshing(true);
+    rpc
+      .call("getPullRequestView", { ...pr, refresh: true })
+      .then(() => view.refetch(), reportError)
+      .finally(() => setIsRefreshing(false));
+  };
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-y-auto p-3">
+      <div className="flex flex-col gap-1">
+        <div className="flex items-start gap-2">
+          <h2 className="min-w-0 flex-1 text-sm font-medium">{snapshot.title}</h2>
+          <GithubLink
+            href={url}
+            className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline-offset-4 hover:underline"
+          >
+            <Icon name="ExternalLink" className="size-3.5" />#{pr.number}
+          </GithubLink>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {snapshot.author} wants to merge{" "}
+          <span className="font-mono">{snapshot.headRefName}</span> into{" "}
+          <span className="font-mono">{snapshot.baseRefName}</span>
+          {snapshot.isDraft ? " · draft" : ""}
+        </p>
+        {/* A reviewed PR is pinned to the commit its findings were written
+            against, so refreshing it would move the code out from under them. */}
+        {isReviewedCommit ? (
+          <p className="text-[11px] text-muted-foreground/80">
+            As reviewed, at <span className="font-mono">{snapshot.headSha.slice(0, 7)}</span>. Re-run
+            the review to see a newer commit.
+          </p>
+        ) : (
+          <button
+            type="button"
+            className="self-start text-[11px] text-muted-foreground underline-offset-4 hover:underline"
+            disabled={isRefreshing}
+            onClick={refresh}
+          >
+            {isRefreshing ? "Refreshing…" : "Refresh from GitHub"}
+          </button>
+        )}
+      </div>
+
+      {snapshot.body.trim() === "" ? null : (
+        <Markdown content={snapshot.body} className="text-sm" />
+      )}
+
+      {snapshot.comments.length + snapshot.reviewComments.length === 0 ? null : (
+        <section className="flex flex-col gap-2">
+          <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Conversation
+          </h3>
+          {[...snapshot.comments, ...snapshot.reviewComments].map((comment, index) => (
+            <PrComment key={index} comment={comment} />
+          ))}
+        </section>
+      )}
+
+      <ChangedFiles rpc={rpc} pr={pr} files={snapshot.files} filesWithPatch={filesWithPatch} />
+    </div>
+  );
+}
+
+/**
+ * The plugin's side tab: GitHub or the review's conversation, chosen here
+ * because BB's own tab chips cannot tell two of this plugin's tabs apart.
+ *
+ * The choice is stored with the rest of the panel's position, so it survives
+ * the tab being deselected — which unmounts this component every time.
+ */
+function ReviewSideTab({ subPath }: { subPath: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const state = usePanelState(rpc);
+  // Shown immediately on a click, so the pane does not wait for the round trip.
+  const [chosen, setChosen] = useState<SidePane | null>(null);
+  const isLoaded = state.data !== null || state.error !== null;
+  // Null until the stored choice lands. Guessing "github" in the meantime
+  // would flash the wrong view — and attach a browser view only to tear it
+  // straight back down — every time the tab is opened on another one.
+  const pane = chosen ?? state.data?.sidePane ?? (isLoaded ? "github" : null);
+
+  // A stored choice that has caught up with the click is no longer an override.
+  useEffect(() => {
+    if (chosen !== null && state.data?.sidePane === chosen) setChosen(null);
+  }, [chosen, state.data?.sidePane]);
+
+  const choose = useCallback(
+    (next: SidePane) => {
+      setChosen(next);
+      rpc.call("setPanelState", { sidePane: next }).catch(ignore);
+    },
+    [rpc],
+  );
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <Tabs
+        value={pane ?? "github"}
+        onValueChange={(value) => choose(isSidePane(value) ? value : "github")}
+        className="shrink-0 border-b border-border px-2 py-1.5"
+      >
+        <TabsList className="h-7">
+          <TabsTrigger value="github" className="h-6 gap-1.5 px-2 text-xs">
+            <Icon name="Github" className="size-3.5" />
+            Pull request
+          </TabsTrigger>
+          <TabsTrigger value="diff" className="h-6 gap-1.5 px-2 text-xs">
+            <Icon name="Code" className="size-3.5" />
+            Diff
+          </TabsTrigger>
+          <TabsTrigger value="files" className="h-6 gap-1.5 px-2 text-xs">
+            <Icon name="FolderOpen" className="size-3.5" />
+            Files
+          </TabsTrigger>
+          <TabsTrigger value="discussion" className="h-6 gap-1.5 px-2 text-xs">
+            <Icon name="SideChat" className="size-3.5" />
+            Discussion
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+      <div className="flex min-h-0 flex-1 flex-col">
+        {pane === null ? null : pane === "github" ? (
+          <PullRequestPane subPath={subPath} />
+        ) : pane === "diff" ? (
+          <DiffPane subPath={subPath} />
+        ) : pane === "files" ? (
+          <FilesPane subPath={subPath} />
+        ) : (
+          <DiscussionPane subPath={subPath} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** A URL with any `#fragment` removed. */
+function withoutFragment(url: string): string {
+  const hash = url.indexOf("#");
+  return hash === -1 ? url : url.slice(0, hash);
+}
+
+function isSidePane(value: string): value is SidePane {
+  return value === "github" || value === "diff" || value === "files" || value === "discussion";
+}
+
+function ignore(): void {}
+
+/**
+ * Bring one half of the review's side pane forward.
+ *
+ * The half is written to the panel's stored position rather than passed to the
+ * tab, so it lands whether the tab is closed, showing the other half, or open
+ * in another window.
+ */
+function useOpenSidePane(
+  rpc: Rpc,
+): (pane: SidePane, target?: { file: string; url: string }) => void {
+  const panel = experimental_useAppPanel();
+  return useCallback(
+    (pane: SidePane, target?: { file: string; url: string }) => {
+      rpc
+        .call("setPanelState", {
+          sidePane: pane,
+          // Cleared when no location was asked for, so the diff does not
+          // reopen on whatever the last finding happened to point at. The file
+          // drives the fallback view; the URL drives GitHub's own.
+          diffFile: target?.file ?? null,
+          diffUrl: target?.url ?? null,
+        })
+        .catch(ignore);
+      if (!panel.openFixedTab({ surface: { kind: "current" }, tab: reviewTabRef })) {
+        toast.error("Could not open the review tab.");
+      }
+    },
+    [panel, rpc],
   );
 }
 
@@ -669,8 +1437,8 @@ function ReviewControls({
   review: ReviewDto | null;
   skills: string[];
 }) {
-  const navigate = useBbNavigate();
   const [isStarting, setIsStarting] = useState(false);
+  const openSidePane = useOpenSidePane(rpc);
   const isRunning = review !== null && (review.status === "running" || review.status === "queued");
 
   return (
@@ -694,17 +1462,19 @@ function ReviewControls({
           />
           {isRunning ? "Reviewing…" : review === null ? "Review this PR" : "Re-run review"}
         </Button>
-        {review?.threadId != null ? (
+        {/* Opens the side pane rather than navigating to the thread: the
+            review stays on screen beside the conversation about it. */}
+        {review?.threadId == null ? null : (
           <Button
             variant="ghost"
             size="sm"
             className="h-8 gap-1.5 text-xs"
-            onClick={() => navigate.toThread(review.threadId as string)}
+            onClick={() => openSidePane("discussion")}
           >
-            <Icon name="MessageSquare" className="size-3.5" />
+            <Icon name="SideChat" className="size-3.5" />
             Review thread
           </Button>
-        ) : null}
+        )}
         <span className="text-xs text-muted-foreground">
           {skills.length === 0 ? "Generic review" : `Skills: ${skills.join(", ")}`}
         </span>
@@ -729,6 +1499,7 @@ function PrFindingsView({
   onBack: () => void;
   onOpenFinding: (findingId: string) => void;
 }) {
+  const openSidePane = useOpenSidePane(rpc);
   const { data, error, isLoading } = useLiveQuery(
     () => rpc.call("getPullRequest", { repo, number }),
     [rpc, repo, number],
@@ -789,15 +1560,17 @@ function PrFindingsView({
           <h2 className="min-w-0 flex-1 text-base font-semibold leading-snug">
             {pr?.title ?? `Pull request #${number}`}
           </h2>
-          {pr === null ? null : (
-            <GithubLink
-              href={pr.url}
-              className="mt-0.5 inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs transition-colors hover:bg-accent"
-            >
-              <Icon name="Github" className="size-3.5" />
-              Open on GitHub
-            </GithubLink>
-          )}
+          {/* Our own tab, not a BB browser tab: those are shared across the
+              whole panel and outlive the review they were opened for. */}
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-0.5 h-7 shrink-0 gap-1.5 text-xs"
+            onClick={() => openSidePane("github")}
+          >
+            <Icon name="Github" className="size-3.5" />
+            Show pull request
+          </Button>
         </div>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-xs text-muted-foreground">
           <span>
@@ -868,22 +1641,110 @@ function PrFindingsView({
  * excerpt from 1, which would misreport every line — and these line numbers
  * are exactly what the reviewer is checking against the finding.
  */
+/** One rendered row: a line of the file, or a line the pull request deleted. */
+interface SnippetRow {
+  key: string;
+  /** Null for a deleted line, which has no place in the file being shown. */
+  lineNumber: number | null;
+  text: string;
+  change: "added" | "removed" | "unchanged";
+}
+
+/**
+ * The file at the reviewed commit, with the pull request's own changes marked.
+ *
+ * This is deliberately the file rather than a patch — that is what makes the
+ * line numbers match the finding and lets the reader ask for more context —
+ * but a plain file cannot say whether a line is new, and the lines the change
+ * deleted are not in it at all. Both are folded back in here, in BB's own diff
+ * colours, so it is obvious which code the pull request is responsible for.
+ */
+function snippetRows(location: LocationDto): SnippetRow[] {
+  const added = new Set(location.addedLines);
+  const removedAfter = new Map(location.removals.map((entry) => [entry.afterLine, entry.lines]));
+  const rows: SnippetRow[] = [];
+
+  const pushRemovals = (afterLine: number) => {
+    (removedAfter.get(afterLine) ?? []).forEach((text, index) => {
+      rows.push({ key: `-${afterLine}.${index}`, lineNumber: null, text, change: "removed" });
+    });
+  };
+
+  // Deletions above the first line shown belong at the top of the window.
+  pushRemovals(location.firstLine - 1);
+  location.lines.forEach((text, index) => {
+    const lineNumber = location.firstLine + index;
+    rows.push({
+      key: `${lineNumber}`,
+      lineNumber,
+      text,
+      change: added.has(lineNumber) ? "added" : "unchanged",
+    });
+    pushRemovals(lineNumber);
+  });
+  return rows;
+}
+
+const CHANGE_MARKS: Record<SnippetRow["change"], string> = {
+  added: "+",
+  removed: "−",
+  unchanged: " ",
+};
+
+/**
+ * One background per row: the diff colour where the pull request touched the
+ * line, the citation tint where it did not.
+ *
+ * A cited line that is also a changed line keeps the diff colour — losing it
+ * there would hide the change on exactly the lines the finding is about — and
+ * is marked as cited by the rule down its left edge instead.
+ */
+function rowBackground(change: SnippetRow["change"], isCited: boolean): string {
+  if (change === "added") return isCited ? "bg-diff-added/30" : "bg-diff-added/15";
+  if (change === "removed") {
+    return cn("text-muted-foreground", isCited ? "bg-diff-removed/30" : "bg-diff-removed/15");
+  }
+  return isCited ? "bg-accent/60" : "";
+}
+
 function CodeSnippet({ location }: { location: LocationDto }) {
   const from = location.startLine;
   const to = location.endLine ?? location.startLine;
+  const rows = useMemo(() => snippetRows(location), [location]);
   return (
     <div className="overflow-x-auto">
       <table className="w-full border-collapse font-mono text-xs">
         <tbody>
-          {location.lines.map((line, index) => {
-            const lineNumber = location.firstLine + index;
-            const isCited = from !== null && lineNumber >= from && lineNumber <= (to ?? from);
+          {rows.map((row) => {
+            const isCited =
+              row.lineNumber !== null &&
+              from !== null &&
+              row.lineNumber >= from &&
+              row.lineNumber <= (to ?? from);
             return (
-              <tr key={lineNumber} className={cn(isCited && "bg-accent/60")}>
-                <td className="w-[1%] select-none whitespace-nowrap border-r border-border px-2 py-px text-right align-top text-muted-foreground/70">
-                  {lineNumber}
+              <tr key={row.key} className={rowBackground(row.change, isCited)}>
+                <td
+                  className={cn(
+                    "w-[1%] select-none whitespace-nowrap border-r border-l-2 border-border px-2 py-px text-right align-top text-muted-foreground/70",
+                    // Transparent when not cited, so every row stays aligned.
+                    isCited ? "border-l-foreground/40" : "border-l-transparent",
+                  )}
+                >
+                  {row.lineNumber ?? ""}
                 </td>
-                <td className="whitespace-pre px-3 py-px">{line === "" ? " " : line}</td>
+                <td
+                  className={cn(
+                    "w-[1%] select-none px-1 py-px text-center align-top",
+                    row.change === "added" && "text-diff-added",
+                    row.change === "removed" && "text-diff-removed",
+                  )}
+                  aria-label={
+                    row.change === "unchanged" ? undefined : `Line ${row.change} by this pull request`
+                  }
+                >
+                  {CHANGE_MARKS[row.change]}
+                </td>
+                <td className="whitespace-pre px-2 py-px">{row.text === "" ? " " : row.text}</td>
               </tr>
             );
           })}
@@ -893,7 +1754,19 @@ function CodeSnippet({ location }: { location: LocationDto }) {
   );
 }
 
-function LocationCard({ location }: { location: LocationDto }) {
+/** What this pull request did to the lines on show, in a few words. */
+function locationChangeLabel(location: LocationDto): string {
+  if (!location.inDiff) return "Not changed by this PR";
+  const added = location.addedLines.length;
+  const removed = location.removals.reduce((total, entry) => total + entry.lines.length, 0);
+  if (added === 0 && removed === 0) return "Changed elsewhere in this file";
+  const parts: string[] = [];
+  if (added > 0) parts.push(`+${added}`);
+  if (removed > 0) parts.push(`−${removed}`);
+  return `${parts.join(" ")} here`;
+}
+
+function LocationCard({ location, onShowDiff }: { location: LocationDto; onShowDiff: () => void }) {
   return (
     <div className="overflow-hidden rounded-lg border border-border">
       <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/30 px-3 py-1.5">
@@ -904,13 +1777,28 @@ function LocationCard({ location }: { location: LocationDto }) {
         >
           {locationLabel(location)}
         </GithubLink>
-        <GithubLink
-          href={location.diffUrl}
+        {/* Every card says where it stands, so an uncoloured snippet is never
+            left ambiguous between "the PR did not touch this" and "the PR
+            touched this file, but not the lines you are looking at". */}
+        <Badge variant="outline" className="shrink-0 text-[11px] font-normal">
+          {locationChangeLabel(location)}
+        </Badge>
+        {/* Our own diff view, not GitHub's: a browser tab opened from here
+            would outlive the review it was opened for. */}
+        <button
+          type="button"
           className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground underline-offset-4 hover:underline"
+          onClick={onShowDiff}
+          disabled={!location.inDiff}
+          title={
+            location.inDiff
+              ? `Show ${location.file} in the diff`
+              : "This pull request does not change this file"
+          }
         >
-          <Icon name="Github" className="size-3.5" />
+          <Icon name="Code" className="size-3.5" />
           diff
-        </GithubLink>
+        </button>
       </div>
       {location.note === "" ? null : (
         <p className="border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
@@ -934,7 +1822,7 @@ function FindingActions({
   diffUrl,
   primaryLocation,
   hasPendingReview,
-  onDiscuss,
+  onAsk,
 }: {
   rpc: Rpc;
   finding: FindingDto;
@@ -944,12 +1832,18 @@ function FindingActions({
   primaryLocation?: LocationDto;
   /** The reviewer already has an unsubmitted review open on this PR. */
   hasPendingReview: boolean;
-  onDiscuss: (finding: FindingDto) => void;
+  /** Puts a question about this finding to the thread that ran the review. */
+  onAsk: (question: string) => Promise<void>;
 }) {
   const stored = finding.draftComment ?? finding.suggestedComment;
   const [comment, setComment] = useState(stored);
   const [isBusy, setIsBusy] = useState(false);
   const [inlineFailed, setInlineFailed] = useState(false);
+  // null while the question box is closed, so "Discuss" opens it rather than
+  // sending anything: the thread is shared with every other finding, and an
+  // unprompted message in it is noise the reviewer did not ask for.
+  const [question, setQuestion] = useState<string | null>(null);
+  const [isAsking, setIsAsking] = useState(false);
   // Adopt server-side changes (a re-run, another window) without clobbering an
   // edit in progress: the stored value is the identity of the draft.
   const lastStored = useRef(stored);
@@ -989,6 +1883,22 @@ function FindingActions({
         .then(() => undefined, reportError),
     [rpc, finding.id, comment],
   );
+
+  const ask = useCallback(async () => {
+    const text = question?.trim() ?? "";
+    if (text === "") return;
+    setIsAsking(true);
+    try {
+      await onAsk(text);
+      // Closing on success keeps the box a one-question affair; the
+      // conversation itself continues in the discussion pane.
+      setQuestion(null);
+    } catch (cause) {
+      reportError(cause);
+    } finally {
+      setIsAsking(false);
+    }
+  }, [question, onAsk]);
 
   const post = useCallback(
     async (mode: "inline" | "issue" | "review") => {
@@ -1136,7 +2046,7 @@ function FindingActions({
               variant="ghost"
               className="h-8 gap-1.5 text-xs"
               disabled={isBusy}
-              onClick={() => onDiscuss(finding)}
+              onClick={() => setQuestion((open) => (open === null ? "" : null))}
             >
               <Icon name="SideChat" className="size-3.5" />
               Discuss
@@ -1160,15 +2070,49 @@ function FindingActions({
           </>
         )}
       </div>
-    </div>
-  );
-}
 
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
-      <p className="mt-0.5 whitespace-pre-wrap text-sm">{value}</p>
+      {question === null ? null : (
+        <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/30 p-2">
+          <Textarea
+            autoFocus
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                void ask();
+              }
+            }}
+            rows={2}
+            className="resize-none text-sm"
+            placeholder="What do you want to ask about this issue?"
+            aria-label={`Question about ${finding.title}`}
+          />
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              className="h-8 gap-1.5 text-xs"
+              disabled={isAsking || question.trim() === ""}
+              onClick={() => void ask()}
+            >
+              <Icon
+                name={isAsking ? "Spinner" : "SideChat"}
+                className={cn("size-3.5", isAsking && "animate-spin")}
+              />
+              Ask the review thread
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-8 text-xs text-muted-foreground"
+              disabled={isAsking}
+              onClick={() => setQuestion(null)}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1186,7 +2130,7 @@ function FindingDetailView({
   findingId: string;
   onBack: () => void;
 }) {
-  const panel = experimental_useAppPanel();
+  const openSidePane = useOpenSidePane(rpc);
   const [contextStep, setContextStep] = useState(0);
   const context = CONTEXT_STEPS[contextStep] ?? CONTEXT_STEPS[0];
 
@@ -1201,18 +2145,14 @@ function FindingDetailView({
     [pr.data, findingId],
   );
 
-  const discuss = useCallback(
-    (target: FindingDto) => {
-      rpc.call("discussFinding", { findingId: target.id }).then((result) => {
-        const opened = panel.openFixedTab({
-          surface: { kind: "current" },
-          tab: discussionTabRef,
-          target: { threadId: result.threadId, title: target.title },
-        });
-        if (!opened) toast.error("Could not open the discussion tab.");
-      }, reportError);
+  const ask = useCallback(
+    async (target: FindingDto, question: string) => {
+      await rpc.call("askAboutFinding", { findingId: target.id, question });
+      // The answer arrives in the review's own thread, so bring that pane
+      // forward rather than leaving the reviewer to go looking for it.
+      openSidePane("discussion");
     },
-    [rpc, panel],
+    [rpc, openSidePane],
   );
 
   if (pr.isLoading && pr.data === null) {
@@ -1279,15 +2219,6 @@ function FindingDetailView({
           ) : null}
         </div>
 
-        <div className="flex flex-col gap-2">
-          {finding.background === "" ? null : (
-            <Field label="Background" value={finding.background} />
-          )}
-          <Field label="Problem" value={finding.problem} />
-          {finding.suggestedFix === "" ? null : (
-            <Field label="Suggested fix" value={finding.suggestedFix} />
-          )}
-        </div>
 
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
@@ -1312,7 +2243,10 @@ function FindingDetailView({
           ) : primary === undefined ? (
             <EmptyState icon="Code" title="No code to show" detail="This issue cites no file." />
           ) : (
-            <LocationCard location={primary} />
+            <LocationCard
+              location={primary}
+              onShowDiff={() => openSidePane("diff", { file: primary.file, url: primary.diffUrl })}
+            />
           )}
         </div>
 
@@ -1322,7 +2256,7 @@ function FindingDetailView({
           diffUrl={primary?.diffUrl}
           primaryLocation={primary}
           hasPendingReview={pr.data?.hasPendingReview ?? false}
-          onDiscuss={discuss}
+          onAsk={(question) => ask(finding, question)}
         />
       </div>
 
@@ -1333,6 +2267,9 @@ function FindingDetailView({
               <LocationCard
                 key={`${location.file}:${location.startLine ?? ""}`}
                 location={location}
+                onShowDiff={() =>
+                  openSidePane("diff", { file: location.file, url: location.diffUrl })
+                }
               />
             ))}
           </div>
@@ -1516,11 +2453,11 @@ export default definePluginApp((app) => {
     component: CodeReviewPanel,
     fixedTabs: [
       {
-        ...discussionTabRef,
-        title: "Discussion",
-        icon: "SideChat",
+        ...reviewTabRef,
+        title: "Code review",
+        icon: "Github",
         layout: "flush",
-        component: DiscussionTab,
+        component: ReviewSideTab,
       },
     ],
   });
