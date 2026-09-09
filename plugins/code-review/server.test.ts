@@ -65,6 +65,10 @@ async function makeHost(
     /** argv prefix -> the message that gh call should fail with. */
     ghFailures?: Record<string, string>;
     spawnError?: string;
+    /** Thread ids `threads.get` should throw for, as a deleted thread does. */
+    deletedThreads?: string[];
+    /** How many leading `tabs.update` calls reject with a revision conflict. */
+    tabUpdateConflicts?: number;
   } = {},
 ) {
   const calls: ShellCall[] = [];
@@ -72,6 +76,13 @@ async function makeHost(
   const files = options.files ?? {};
   /** Mutable, so a test can break a gh call after the review has already run. */
   const failures: Record<string, string> = { ...options.ghFailures };
+  /** The tab list of each thread, as BB would hold it. */
+  const tabs = new Map<string, { revision: number; tabs: Record<string, unknown>[] }>();
+  const sent: { threadId: string; text: string; mode: string }[] = [];
+  /** Thread ids `threads.get` should report as deleted. */
+  const deletedThreads = new Set<string>(options.deletedThreads ?? []);
+  /** Counts down: how many more `tabs.update` calls reject on revision. */
+  let tabUpdateConflicts = options.tabUpdateConflicts ?? 0;
 
   const gh: Record<string, string> = {
     "--version": "gh version 2.83.1",
@@ -135,10 +146,43 @@ async function makeHost(
             title: args.title ?? "",
             parentThreadId: args.parentThreadId ?? null,
           });
-          return makeThreadResponse({ id: `thr_${spawned.length}` });
+          const id = `thr_${spawned.length}`;
+          tabs.set(id, { revision: 1, tabs: [] });
+          return makeThreadResponse({ id });
         },
-        get: async ({ threadId }: { threadId: string }) =>
-          makeThreadResponse({ id: threadId, environmentId: null }),
+        get: async ({ threadId }: { threadId: string }) => {
+          if (deletedThreads.has(threadId)) throw new Error(`thread ${threadId} not found`);
+          return makeThreadResponse({ id: threadId, environmentId: null });
+        },
+        send: async (args: { threadId: string; mode: string; input?: unknown }) => {
+          const input = (args.input ?? []) as { type: string; text?: string }[];
+          sent.push({
+            threadId: args.threadId,
+            mode: args.mode,
+            text: input.map((item) => item.text ?? "").join(""),
+          });
+          return { ok: true as const, delivery: "sent" as const };
+        },
+        tabs: {
+          get: async ({ threadId }: { threadId: string }) =>
+            tabs.get(threadId) ?? { revision: 1, tabs: [] },
+          update: async (args: {
+            threadId: string;
+            expectedRevision: number;
+            tabs: Record<string, unknown>[];
+          }) => {
+            const current = tabs.get(args.threadId) ?? { revision: 1, tabs: [] };
+            if (tabUpdateConflicts > 0) {
+              tabUpdateConflicts -= 1;
+              // Someone else wrote in between: bump the revision and reject.
+              tabs.set(args.threadId, { ...current, revision: current.revision + 1 });
+              throw new Error("revision mismatch");
+            }
+            if (args.expectedRevision !== current.revision) throw new Error("revision mismatch");
+            tabs.set(args.threadId, { revision: current.revision + 1, tabs: args.tabs });
+            return { revision: current.revision + 1, tabs: args.tabs };
+          },
+        },
       },
       files: {
         read: async ({ path }: { path: string }) => {
@@ -179,7 +223,28 @@ async function makeHost(
   const review = async () =>
     (await call<{ review: ReviewDto }>("getPullRequest", { repo: REPO, number: 7 })).review;
 
-  return { bb, harness, calls, spawned, failures, call, submit, findings, review };
+  const tabsOf = (threadId: string) => tabs.get(threadId)?.tabs ?? [];
+
+  /** Put tabs the user opened themselves in front of the plugin's own. */
+  const seedTabs = (threadId: string, extra: Record<string, unknown>[]) => {
+    const current = tabs.get(threadId) ?? { revision: 1, tabs: [] };
+    tabs.set(threadId, { revision: current.revision, tabs: [...extra, ...current.tabs] });
+  };
+
+  return {
+    bb,
+    harness,
+    calls,
+    spawned,
+    failures,
+    call,
+    submit,
+    findings,
+    review,
+    tabsOf,
+    seedTabs,
+    sent,
+  };
 }
 
 type Host = Awaited<ReturnType<typeof makeHost>>;
@@ -1457,9 +1522,115 @@ describe("registrations", () => {
       "schema",
       "submit",
     ]);
-    for (const method of ["getFindingCode", "getPanelState", "setPanelState"]) {
+    for (const method of [
+      "getFindingCode",
+      "getPanelState",
+      "setPanelState",
+      "openReview",
+      "getReviewForThread",
+    ]) {
       expect(harness.registrations.rpcMethods).toContain(method);
     }
     expect(harness.registrations.threadEventHandlers["thread.idle"]).toBe(1);
+  });
+});
+
+describe("opening a review", () => {
+  it("starts a review and spawns its thread when the PR has never been reviewed", async () => {
+    const host = await makeHost();
+    const opened = await host.call<{ threadId: string; review: ReviewDto }>("openReview", {
+      repo: REPO,
+      number: 7,
+    });
+    expect(opened.threadId).toBe("thr_1");
+    expect(opened.review.status).toBe("running");
+    expect(host.spawned).toHaveLength(1);
+    expect(host.spawned[0]?.prompt).toContain(REVIEW_ID);
+  });
+
+  it("reuses a finished review's thread instead of running the agent again", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    const opened = await host.call<{ threadId: string }>("openReview", {
+      repo: REPO,
+      number: 7,
+    });
+    expect(opened.threadId).toBe("thr_1");
+    // Still exactly the one thread the review itself spawned.
+    expect(host.spawned).toHaveLength(1);
+  });
+
+  it("re-runs the review when its thread has been deleted", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() }, deletedThreads: ["thr_1"] });
+    await runReview(host);
+    const opened = await host.call<{ threadId: string }>("openReview", {
+      repo: REPO,
+      number: 7,
+    });
+    expect(opened.threadId).toBe("thr_2");
+    expect(host.spawned).toHaveLength(2);
+  });
+
+  it("writes the review tab onto the review thread", async () => {
+    const host = await makeHost();
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1")).toEqual([
+      {
+        id: "code-review-review-acme-app-7",
+        kind: "plugin-panel",
+        pluginId: "code-review",
+        actionId: "review",
+        title: "Code review",
+        paramsJson: JSON.stringify({ repo: REPO, number: 7 }),
+      },
+    ]);
+  });
+
+  it("keeps the tabs already on the thread, appending its own after them", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    // A terminal the user opened themselves must survive the open.
+    host.seedTabs("thr_1", [{ id: "t1", kind: "terminal", terminalId: "term_1" }]);
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1").map((tab) => tab.kind)).toEqual(["terminal", "plugin-panel"]);
+  });
+
+  it("writes the tab once, however many times the review is opened", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    await host.call("openReview", { repo: REPO, number: 7 });
+    await host.call("openReview", { repo: REPO, number: 7 });
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1")).toHaveLength(1);
+  });
+
+  it("retries once when someone else changed the tabs in between", async () => {
+    const host = await makeHost({ tabUpdateConflicts: 1 });
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1")).toHaveLength(1);
+  });
+
+  it("still opens the review when the tab cannot be written at all", async () => {
+    const host = await makeHost({ tabUpdateConflicts: 5 });
+    const opened = await host.call<{ threadId: string }>("openReview", {
+      repo: REPO,
+      number: 7,
+    });
+    // A missing tab is cosmetic; losing the review would not be.
+    expect(opened.threadId).toBe("thr_1");
+    expect(host.tabsOf("thr_1")).toHaveLength(0);
+  });
+
+  it("tells the tab which review a thread belongs to", async () => {
+    const host = await makeHost();
+    await host.call("openReview", { repo: REPO, number: 7 });
+    const found = await host.call("getReviewForThread", { threadId: "thr_1" });
+    expect(found).toEqual({ repo: REPO, number: 7 });
+  });
+
+  it("reports no review for a thread that is not one", async () => {
+    const host = await makeHost();
+    const found = await host.call("getReviewForThread", { threadId: "thr_other" });
+    expect(found).toBeNull();
   });
 });

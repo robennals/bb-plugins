@@ -52,6 +52,7 @@ import {
   PR_JSON_FIELDS,
   PR_VIEW_JSON_FIELDS,
   severityRank,
+  reviewTabFor,
   SEVERITIES,
   splitUnifiedDiff,
   type Finding,
@@ -245,6 +246,24 @@ export const rpcContract = defineRpcContract({
       skills: z.array(z.string()).optional(),
     }),
     output: z.object({ review: reviewSchema }),
+  },
+  /**
+   * Open a review: make sure it exists, has a live thread, and that the thread
+   * carries this review's tab. The panel then navigates to the thread.
+   */
+  openReview: {
+    input: z.object({
+      repo: z.string(),
+      number: z.number().int().positive(),
+      /** Overrides the configured skill list, if a review has to be started. */
+      skills: z.array(z.string()).optional(),
+    }),
+    output: z.object({ threadId: z.string(), review: reviewSchema }),
+  },
+  /** Which review a thread belongs to, for a tab opened from the launcher. */
+  getReviewForThread: {
+    input: z.object({ threadId: z.string() }),
+    output: z.object({ repo: z.string(), number: z.number() }).nullable(),
   },
   setFindingComment: {
     input: z.object({ findingId: z.string(), comment: z.string() }),
@@ -1080,6 +1099,69 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     return toReviewDto(row);
   }
 
+  /**
+   * Make sure this review's tab is on its thread. The tab list is BB's, and
+   * another client may be writing it at the same time, so this is a
+   * compare-and-swap with one retry. Failing to write the tab must not fail
+   * the open: the review is reachable from the thread panel's own
+   * New tab -> Actions list either way.
+   */
+  async function ensureReviewTab(threadId: string, repo: string, number: number): Promise<void> {
+    const tab = reviewTabFor({ pluginId: bb.pluginId, repo, number });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const current = await bb.sdk.threads.tabs.get({ threadId });
+        if (current.tabs.some((entry) => entry.id === tab.id)) return;
+        await bb.sdk.threads.tabs.update({
+          threadId,
+          expectedRevision: current.revision,
+          tabs: [...current.tabs, tab],
+        });
+        return;
+      } catch (error) {
+        if (attempt === 1) {
+          bb.log.warn(`could not add the review tab to ${threadId}: ${String(error)}`);
+          return;
+        }
+      }
+    }
+  }
+
+  /** Is this thread still there? A deleted one has to be replaced. */
+  async function threadExists(threadId: string): Promise<boolean> {
+    try {
+      await bb.sdk.threads.get({ threadId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Open a PR's review. Reuses a review whose thread is still alive, so
+   * re-reading yesterday's findings costs nothing; starts one otherwise.
+   */
+  async function openReview(
+    repo: string,
+    number: number,
+    skillOverride?: string[],
+  ): Promise<{ threadId: string; review: ReviewDto }> {
+    requireRepo(repo);
+    const existing = getReview(reviewIdFor(repo, number));
+    if (
+      existing !== null &&
+      existing.thread_id !== null &&
+      (await threadExists(existing.thread_id))
+    ) {
+      await ensureReviewTab(existing.thread_id, repo, number);
+      return { threadId: existing.thread_id, review: toReviewDto(existing) };
+    }
+    const review = await startReview(repo, number, skillOverride);
+    if (review.threadId === null) throw new Error(`Review ${review.id} has no thread.`);
+    await ensureReviewTab(review.threadId, repo, number);
+    return { threadId: review.threadId, review };
+  }
+
   // -------------------------------------------------------------------------
   // Importing the findings file
   // -------------------------------------------------------------------------
@@ -1752,6 +1834,16 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     async startReview({ repo, number, skills }) {
       await checkAuth();
       return { review: await startReview(repo, number, skills) };
+    },
+
+    async openReview({ repo, number, skills }) {
+      await checkAuth();
+      return openReview(repo, number, skills);
+    },
+
+    getReviewForThread({ threadId }) {
+      const row = getReviewByThread(threadId);
+      return row === null ? null : { repo: row.repo, number: row.number };
     },
 
     setFindingComment({ findingId, comment }) {
