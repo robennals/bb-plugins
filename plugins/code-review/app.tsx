@@ -311,17 +311,27 @@ function reviewBadge(pr: PullRequestDto): ReactNode {
   }
 }
 
-function PrRow({ pr, onOpen }: { pr: PullRequestDto; onOpen: () => void }) {
+/**
+ * One pull request, with the single deliberate action it offers. The row body
+ * is deliberately not a button: starting a review spends an agent run, so it
+ * takes a press on something that says so.
+ */
+function PrRow({
+  pr,
+  onStart,
+  onOpen,
+}: {
+  pr: PullRequestDto;
+  onStart: () => void;
+  onOpen: () => void;
+}) {
   const requestedTeams = pr.reviewRequests
     .map((request) => request.teamSlug)
     .filter((slug): slug is string => slug !== null)
     .map((slug) => slug.split("/").pop() ?? slug);
+  const hasReview = pr.reviewStatus !== "none";
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="flex w-full flex-col gap-1.5 rounded-lg border border-border bg-card px-3 py-2.5 text-left transition-colors hover:bg-accent/50"
-    >
+    <div className="flex w-full flex-col gap-1.5 rounded-lg border border-border bg-card px-3 py-2.5 text-left">
       <div className="flex items-start gap-2">
         <Icon
           name={pr.isDraft ? "GitPullRequestDraft" : "GitPullRequest"}
@@ -350,7 +360,25 @@ function PrRow({ pr, onOpen }: { pr: PullRequestDto; onOpen: () => void }) {
           </>
         ) : null}
       </div>
-    </button>
+      <div className="flex flex-wrap items-center gap-2 pl-6 pt-0.5">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 gap-1.5 text-xs"
+          onClick={hasReview ? onOpen : onStart}
+        >
+          <Icon name={hasReview ? "Bug" : "Bot"} className="size-3.5" />
+          {hasReview ? "Open review" : "Start review"}
+        </Button>
+        <GithubLink
+          href={pr.url}
+          className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs transition-colors hover:bg-accent"
+        >
+          <Icon name="Github" className="size-3.5" />
+          Open on GitHub
+        </GithubLink>
+      </div>
+    </div>
   );
 }
 
@@ -362,7 +390,8 @@ function PrListView({
   onRepoChange,
   onFilterChange,
   myTeams,
-  onOpenPr,
+  onStartReview,
+  onOpenReview,
 }: {
   rpc: Rpc;
   repo: string | null;
@@ -371,7 +400,8 @@ function PrListView({
   onRepoChange: (repo: string) => void;
   onFilterChange: (filter: PrFilter) => void;
   myTeams: string[];
-  onOpenPr: (repo: string, number: number) => void;
+  onStartReview: (repo: string, number: number) => void;
+  onOpenReview: (repo: string, number: number) => void;
 }) {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const { tab, team } = tabAndTeamFor(filter);
@@ -521,7 +551,12 @@ function PrListView({
       ) : (
         <div className="flex flex-col gap-2">
           {data.pullRequests.map((pr) => (
-            <PrRow key={pr.number} pr={pr} onOpen={() => onOpenPr(pr.repo, pr.number)} />
+            <PrRow
+              key={pr.number}
+              pr={pr}
+              onStart={() => onStartReview(pr.repo, pr.number)}
+              onOpen={() => onOpenReview(pr.repo, pr.number)}
+            />
           ))}
         </div>
       )}
@@ -1394,14 +1429,27 @@ function CodeReviewPanel() {
     [rpc, repo, filter],
   );
 
-  // Opening a review means: make sure it and its thread exist, make sure the
-  // thread carries its review tab, then go and stand in that thread.
-  const openPr = useCallback(
+  // Both actions end in the same place: standing in the review's thread, with
+  // its review tab beside it. They differ in whether an agent run is spent.
+  const openReview = useCallback(
     (nextRepo: string, number: number) => {
       rpc.call("openReview", { repo: nextRepo, number }).then(
         (opened) => navigate.toThread(opened.threadId),
         reportError,
       );
+    },
+    [rpc, navigate],
+  );
+
+  const startReview = useCallback(
+    (nextRepo: string, number: number) => {
+      rpc.call("startReview", { repo: nextRepo, number }).then((started) => {
+        if (started.review.threadId === null) {
+          toast.error("The review started but has no thread yet.");
+          return;
+        }
+        navigate.toThread(started.review.threadId);
+      }, reportError);
     },
     [rpc, navigate],
   );
@@ -1445,7 +1493,8 @@ function CodeReviewPanel() {
               persist({ filter: next });
             }}
             myTeams={status.data?.myTeams ?? []}
-            onOpenPr={openPr}
+            onStartReview={startReview}
+            onOpenReview={openReview}
           />
         )}
       </div>

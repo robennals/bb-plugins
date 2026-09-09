@@ -132,6 +132,7 @@ function rpc(overrides: Record<string, unknown> = {}) {
     getFindingCode: () => CODE,
     getPanelState: () => ({ repo: null, filter: null }),
     setPanelState: () => ({ repo: null, filter: null }),
+    startReview: () => ({ review: REVIEW }),
     openReview: () => ({ threadId: "thr_1", review: REVIEW }),
     getReviewForThread: () => ({ repo: "acme/app", number: 7 }),
     discussFinding: () => ({ threadId: "thr_1" }),
@@ -1044,10 +1045,83 @@ describe("the review tab", () => {
 });
 
 describe("opening a review from the home screen", () => {
-  it("opens the review and goes to its thread", async () => {
+  it("never starts a review just because the row was clicked", async () => {
+    // Starting a review spends an agent run, so it takes a deliberate press.
     const app = await load();
     const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
     fireEvent.click(await slot.findByText("Add a thing"));
+    await waitFor(() => {
+      expect(slot.inspection.rpcCalls.some((entry) => entry.method === "listPullRequests")).toBe(
+        true,
+      );
+    });
+    expect(
+      slot.inspection.rpcCalls.some(
+        (entry) => entry.method === "startReview" || entry.method === "openReview",
+      ),
+    ).toBe(false);
+    expect(slot.inspection.navigateCalls).toEqual([]);
+    slot.lifecycle.unmount();
+  });
+
+  it("offers Start review for a PR nothing has reviewed yet", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: rpc({
+          listPullRequests: () => ({
+            pullRequests: [{ ...PR, reviewStatus: "none", openFindings: 0 }],
+          }),
+        }),
+      },
+    );
+    fireEvent.click(await slot.findByText("Start review"));
+    await waitFor(() => {
+      expect(slot.inspection.rpcCalls.find((entry) => entry.method === "startReview")?.input).toEqual(
+        { repo: "acme/app", number: 7 },
+      );
+    });
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({ threadId: "thr_1" }),
+      );
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("offers Open review for a PR that has one, and starts nothing", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
+    fireEvent.click(await slot.findByText("Open review"));
+    await waitFor(() => {
+      expect(slot.inspection.rpcCalls.find((entry) => entry.method === "openReview")?.input).toEqual(
+        { repo: "acme/app", number: 7 },
+      );
+    });
+    expect(slot.inspection.rpcCalls.some((entry) => entry.method === "startReview")).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("says Reviewing while the agent is running, and still opens the thread", async () => {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      { rpc: rpc({ listPullRequests: () => ({ pullRequests: [{ ...PR, reviewStatus: "running" }] }) }) },
+    );
+    fireEvent.click(await slot.findByText("Open review"));
+    await waitFor(() => {
+      expect(slot.inspection.rpcCalls.some((entry) => entry.method === "openReview")).toBe(true);
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the review and goes to its thread", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
+    fireEvent.click(await slot.findByText("Open review"));
     await waitFor(() => {
       expect(slot.inspection.rpcCalls.find((entry) => entry.method === "openReview")?.input).toEqual(
         { repo: "acme/app", number: 7 },
@@ -1074,7 +1148,7 @@ describe("opening a review from the home screen", () => {
         }),
       },
     );
-    fireEvent.click(await slot.findByText("Add a thing"));
+    fireEvent.click(await slot.findByText("Open review"));
     await waitFor(() => {
       expect(slot.inspection.rpcCalls.some((entry) => entry.method === "openReview")).toBe(true);
     });

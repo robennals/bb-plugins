@@ -10,12 +10,14 @@ yourself — one comment at a time, edited how you want it.
    them, or one you pick), or **All open**. Each row carries the state of this
    plugin's review of it — *reviewing*, the open and posted issue counts, or
    *review failed*.
-2. **Open it.** Pressing a row opens that PR's review: a BB thread runs the
-   review skills you configured against the change and writes structured
-   findings to a JSON file, then submits them with `bb code-review submit`. A
-   **Code review** tab opens beside that thread with the results. A PR you have
-   reviewed before opens straight onto its findings without running the agent
-   again; **Re-run review** in the tab asks for a fresh pass.
+2. **Review it, or open the review.** Each row carries one button, because a
+   review costs an agent run and should never happen by accident:
+   **Start review** on a PR nothing has reviewed spawns a BB thread that runs
+   the review skills you configured, writes structured findings to a JSON file,
+   and submits them with `bb code-review submit`; **Open review** on one that
+   has been reviewed goes straight to that thread and spends nothing. Either
+   way a **Code review** tab opens beside the thread with the results, and
+   **Re-run review** inside it asks for a fresh pass.
 3. **Skim the issues.** The tab is a plain list: severity, title, and a
    three-line gist. Nothing else, plus one button through to the PR on GitHub.
 4. **Open an issue** for the detail — background, problem, suggested fix — and
@@ -27,7 +29,8 @@ yourself — one comment at a time, edited how you want it.
    with the review agent** in the thread beside the tab, or **dismiss it**.
 
 Reviews are threads, so two reviews are two threads with a tab each, and the
-PR and its diff open as ordinary browser tabs from any link in the tab. The
+PR and its diff open as ordinary browser tabs from any link — on a row, or in
+the tab. The
 panel remembers the repo and filter you were on, so re-opening it resumes where
 you left off. Nothing reaches GitHub until you press *Post*.
 
@@ -156,9 +159,11 @@ comment — lives in `review-core.ts` and is unit-tested without a server.
 `server.ts` is the registrations and the gh plumbing; `app.tsx` is the home
 screen and the review tab.
 
-Opening a review writes the review tab onto its thread server-side, with
-`bb.sdk.threads.tabs.update` under a compare-and-swap, then the panel navigates
-to that thread. `useBbNavigate().openThreadPanel` would be the natural call for
+Starting or opening a review writes the review tab onto its thread
+server-side, with `bb.sdk.threads.tabs.update` under a compare-and-swap, then
+the panel navigates to that thread. `openReview` deliberately refuses a PR with
+no review thread rather than starting one, so the only path to an agent run is
+the button that says so. `useBbNavigate().openThreadPanel` would be the natural call for
 this, but it opens a tab in the thread the client is already looking at, and
 the home screen is a nav panel rather than a thread. Failing to write the tab
 never fails the open: the review is still reachable from the thread panel's own

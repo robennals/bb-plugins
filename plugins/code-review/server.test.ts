@@ -1564,16 +1564,16 @@ describe("registrations", () => {
 });
 
 describe("opening a review", () => {
-  it("starts a review and spawns its thread when the PR has never been reviewed", async () => {
+  it("puts the review tab on the thread it starts, so Start review lands on it", async () => {
     const host = await makeHost();
-    const opened = await host.call<{ threadId: string; review: ReviewDto }>("openReview", {
+    const { review } = await host.call<{ review: ReviewDto }>("startReview", {
       repo: REPO,
       number: 7,
     });
-    expect(opened.threadId).toBe("thr_1");
-    expect(opened.review.status).toBe("running");
-    expect(host.spawned).toHaveLength(1);
-    expect(host.spawned[0]?.prompt).toContain(REVIEW_ID);
+    expect(review.threadId).toBe("thr_1");
+    expect(host.tabsOf("thr_1").map((tab) => tab.id)).toEqual([
+      "code-review-review-acme-app-7",
+    ]);
   });
 
   it("reuses a finished review's thread instead of running the agent again", async () => {
@@ -1588,19 +1588,27 @@ describe("opening a review", () => {
     expect(host.spawned).toHaveLength(1);
   });
 
-  it("re-runs the review when its thread has been deleted", async () => {
+  it("refuses to open a review whose thread has been deleted", async () => {
+    // Opening must never start an agent run: that is what Start review is for.
     const host = await makeHost({ files: { "/w/f.json": report() }, deletedThreads: ["thr_1"] });
     await runReview(host);
-    const opened = await host.call<{ threadId: string }>("openReview", {
-      repo: REPO,
-      number: 7,
-    });
-    expect(opened.threadId).toBe("thr_2");
-    expect(host.spawned).toHaveLength(2);
+    await expect(host.call("openReview", { repo: REPO, number: 7 })).rejects.toThrow(
+      /start a new review/i,
+    );
+    expect(host.spawned).toHaveLength(1);
+  });
+
+  it("refuses to open a PR that has never been reviewed", async () => {
+    const host = await makeHost();
+    await expect(host.call("openReview", { repo: REPO, number: 7 })).rejects.toThrow(
+      /start a new review/i,
+    );
+    expect(host.spawned).toHaveLength(0);
   });
 
   it("writes the review tab onto the review thread", async () => {
     const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
     await host.call("openReview", { repo: REPO, number: 7 });
     expect(host.tabsOf("thr_1")).toEqual([
       {
@@ -1634,24 +1642,24 @@ describe("opening a review", () => {
 
   it("retries once when someone else changed the tabs in between", async () => {
     const host = await makeHost({ tabUpdateConflicts: 1 });
-    await host.call("openReview", { repo: REPO, number: 7 });
+    await host.call("startReview", { repo: REPO, number: 7 });
     expect(host.tabsOf("thr_1")).toHaveLength(1);
   });
 
-  it("still opens the review when the tab cannot be written at all", async () => {
+  it("still starts the review when the tab cannot be written at all", async () => {
     const host = await makeHost({ tabUpdateConflicts: 5 });
-    const opened = await host.call<{ threadId: string }>("openReview", {
+    const { review } = await host.call<{ review: ReviewDto }>("startReview", {
       repo: REPO,
       number: 7,
     });
     // A missing tab is cosmetic; losing the review would not be.
-    expect(opened.threadId).toBe("thr_1");
+    expect(review.threadId).toBe("thr_1");
     expect(host.tabsOf("thr_1")).toHaveLength(0);
   });
 
   it("tells the tab which review a thread belongs to", async () => {
     const host = await makeHost();
-    await host.call("openReview", { repo: REPO, number: 7 });
+    await host.call("startReview", { repo: REPO, number: 7 });
     const found = await host.call("getReviewForThread", { threadId: "thr_1" });
     expect(found).toEqual({ repo: REPO, number: 7 });
   });

@@ -248,16 +248,12 @@ export const rpcContract = defineRpcContract({
     output: z.object({ review: reviewSchema }),
   },
   /**
-   * Open a review: make sure it exists, has a live thread, and that the thread
-   * carries this review's tab. The panel then navigates to the thread.
+   * Open a review that has already run: check its thread is alive, make sure
+   * that thread carries this review's tab, and hand it back for the panel to
+   * navigate to. Never starts a review.
    */
   openReview: {
-    input: z.object({
-      repo: z.string(),
-      number: z.number().int().positive(),
-      /** Overrides the configured skill list, if a review has to be started. */
-      skills: z.array(z.string()).optional(),
-    }),
+    input: z.object({ repo: z.string(), number: z.number().int().positive() }),
     output: z.object({ threadId: z.string(), review: reviewSchema }),
   },
   /** Which review a thread belongs to, for a tab opened from the launcher. */
@@ -1138,28 +1134,27 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
   /**
-   * Open a PR's review. Reuses a review whose thread is still alive, so
-   * re-reading yesterday's findings costs nothing; starts one otherwise.
+   * Open a review that has already run. This never starts an agent: pressing
+   * "Open review" must not cost a review run, and a PR with no review offers
+   * "Start review" instead.
    */
   async function openReview(
     repo: string,
     number: number,
-    skillOverride?: string[],
   ): Promise<{ threadId: string; review: ReviewDto }> {
     requireRepo(repo);
     const existing = getReview(reviewIdFor(repo, number));
     if (
-      existing !== null &&
-      existing.thread_id !== null &&
-      (await threadExists(existing.thread_id))
+      existing === null ||
+      existing.thread_id === null ||
+      !(await threadExists(existing.thread_id))
     ) {
-      await ensureReviewTab(existing.thread_id, repo, number);
-      return { threadId: existing.thread_id, review: toReviewDto(existing) };
+      throw new Error(
+        "This pull request has no review thread to open \u2014 start a new review instead.",
+      );
     }
-    const review = await startReview(repo, number, skillOverride);
-    if (review.threadId === null) throw new Error(`Review ${review.id} has no thread.`);
-    await ensureReviewTab(review.threadId, repo, number);
-    return { threadId: review.threadId, review };
+    await ensureReviewTab(existing.thread_id, repo, number);
+    return { threadId: existing.thread_id, review: toReviewDto(existing) };
   }
 
   // -------------------------------------------------------------------------
@@ -1834,12 +1829,15 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
 
     async startReview({ repo, number, skills }) {
       await checkAuth();
-      return { review: await startReview(repo, number, skills) };
+      const review = await startReview(repo, number, skills);
+      // The caller navigates to this thread next, so its tab has to be there.
+      if (review.threadId !== null) await ensureReviewTab(review.threadId, repo, number);
+      return { review };
     },
 
-    async openReview({ repo, number, skills }) {
+    async openReview({ repo, number }) {
       await checkAuth();
-      return openReview(repo, number, skills);
+      return openReview(repo, number);
     },
 
     getReviewForThread({ threadId }) {
