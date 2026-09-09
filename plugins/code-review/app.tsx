@@ -1,24 +1,16 @@
 // bb-plugin-code-review — frontend.
 //
-// Three views, one nav panel:
-//   - the PR list, filtered by who was asked to review;
-//   - a PR's issue list: one compact row per finding, plus a way into GitHub;
-//   - an issue, with its detail on top and the code it points at below.
+// Two surfaces:
+//   - the nav panel: a home screen listing a repo's pull requests, each row
+//     carrying the state of this plugin's review of it;
+//   - the review tab: one review's issues, in that review's own thread's
+//     right-hand panel, with an issue's detail and its code below it.
 //
 // The panel remembers the repo and filter server-side, so re-opening the tab
 // resumes where it left off instead of asking again.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import {
-  definePluginApp,
-  experimental_useAppPanel,
-  experimental_useFixedTabTarget,
-  ThreadChat,
-  useBbNavigate,
-  useRealtime,
-  useRpc,
-} from "@get-bb/plugin-sdk/app";
-import type { JsonValue } from "@get-bb/plugin-sdk/app";
+import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { FindingDto, PullRequestDto, ReviewDto, rpcContract } from "./server";
 import { Badge } from "@/components/ui/badge";
@@ -67,41 +59,6 @@ interface LocationDto {
   hasMoreAbove: boolean;
   hasMoreBelow: boolean;
   error: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// Routing — the nav panel owns /plugins/code-review/code-review/*
-// ---------------------------------------------------------------------------
-
-type Route =
-  | { kind: "list" }
-  | { kind: "pr"; repo: string; number: number }
-  | { kind: "finding"; repo: string; number: number; findingId: string };
-
-function parseSubPath(subPath: string): Route {
-  const segments = subPath.split("/").filter((segment) => segment !== "");
-  if (segments[0] === "pr" && segments.length >= 4) {
-    const number = Number(segments[3]);
-    const repo = `${segments[1]}/${segments[2]}`;
-    if (Number.isInteger(number) && number > 0) {
-      if (segments[4] === "f" && segments[5] !== undefined) {
-        return { kind: "finding", repo, number, findingId: segments[5] };
-      }
-      return { kind: "pr", repo, number };
-    }
-  }
-  return { kind: "list" };
-}
-
-function routeToSubPath(route: Route): string {
-  switch (route.kind) {
-    case "list":
-      return "";
-    case "pr":
-      return `pr/${route.repo}/${route.number}`;
-    case "finding":
-      return `pr/${route.repo}/${route.number}/f/${route.findingId}`;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,59 +263,6 @@ function useLiveQuery<T>(load: () => Promise<T>, deps: readonly unknown[]) {
   return { data, error, isLoading, refetch };
 }
 
-// ---------------------------------------------------------------------------
-// The discussion tab
-// ---------------------------------------------------------------------------
-
-interface DiscussionTarget extends Record<string, JsonValue> {
-  threadId: string;
-  title: string;
-}
-
-const discussionTabRef = {
-  panelId: PANEL_ID,
-  id: "discussion",
-  experimental_target: {
-    validate(value: JsonValue): value is DiscussionTarget {
-      return (
-        typeof value === "object" &&
-        value !== null &&
-        !Array.isArray(value) &&
-        typeof (value as Record<string, unknown>).threadId === "string" &&
-        typeof (value as Record<string, unknown>).title === "string"
-      );
-    },
-  },
-} as const;
-
-function DiscussionTab() {
-  const state = experimental_useFixedTabTarget(discussionTabRef);
-  if (state === null) {
-    return (
-      <div className="flex h-full items-center justify-center p-6">
-        <EmptyState
-          icon="SideChat"
-          title="No discussion open"
-          detail={'Press "Discuss" on an issue to talk it over with an agent here.'}
-        />
-      </div>
-    );
-  }
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <ThreadChat
-        key={state.target.threadId}
-        threadId={state.target.threadId}
-        variant="compact"
-        layout="contained"
-        className="min-h-0 flex-1"
-      />
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// The PR list
 // ---------------------------------------------------------------------------
 
 type FilterTab = "mine" | "teams" | "all" | "authored";
@@ -669,7 +573,6 @@ function ReviewControls({
   review: ReviewDto | null;
   skills: string[];
 }) {
-  const navigate = useBbNavigate();
   const [isStarting, setIsStarting] = useState(false);
   const isRunning = review !== null && (review.status === "running" || review.status === "queued");
 
@@ -694,17 +597,6 @@ function ReviewControls({
           />
           {isRunning ? "Reviewing…" : review === null ? "Review this PR" : "Re-run review"}
         </Button>
-        {review?.threadId != null ? (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 gap-1.5 text-xs"
-            onClick={() => navigate.toThread(review.threadId as string)}
-          >
-            <Icon name="MessageSquare" className="size-3.5" />
-            Review thread
-          </Button>
-        ) : null}
         <span className="text-xs text-muted-foreground">
           {skills.length === 0 ? "Generic review" : `Skills: ${skills.join(", ")}`}
         </span>
@@ -719,14 +611,12 @@ function PrFindingsView({
   repo,
   number,
   skills,
-  onBack,
   onOpenFinding,
 }: {
   rpc: Rpc;
   repo: string;
   number: number;
   skills: string[];
-  onBack: () => void;
   onOpenFinding: (findingId: string) => void;
 }) {
   const { data, error, isLoading } = useLiveQuery(
@@ -746,7 +636,6 @@ function PrFindingsView({
   if (error !== null) {
     return (
       <div className="flex flex-col gap-3">
-        <BackButton onBack={onBack} label="All pull requests" />
         <EmptyState icon="AlertTriangle" title="Could not load this pull request" detail={error} />
       </div>
     );
@@ -754,7 +643,6 @@ function PrFindingsView({
   if (isLoading && data === null) {
     return (
       <div className="flex flex-col gap-3">
-        <BackButton onBack={onBack} label="All pull requests" />
         <Skeleton className="h-20 w-full rounded-lg" />
         <Skeleton className="h-32 w-full rounded-lg" />
       </div>
@@ -781,8 +669,6 @@ function PrFindingsView({
 
   return (
     <div className="flex flex-col gap-4">
-      <BackButton onBack={onBack} label="All pull requests" />
-
       <div className="flex flex-col gap-1">
         <div className="flex items-start gap-2">
           <Icon name="GitPullRequest" className="mt-1 size-4 shrink-0" />
@@ -1186,7 +1072,6 @@ function FindingDetailView({
   findingId: string;
   onBack: () => void;
 }) {
-  const panel = experimental_useAppPanel();
   const [contextStep, setContextStep] = useState(0);
   const context = CONTEXT_STEPS[contextStep] ?? CONTEXT_STEPS[0];
 
@@ -1201,18 +1086,17 @@ function FindingDetailView({
     [pr.data, findingId],
   );
 
+  // The review thread is the chat beside this tab, and it already has the
+  // whole PR in context, so a discussion goes there rather than to a thread
+  // of its own.
   const discuss = useCallback(
     (target: FindingDto) => {
-      rpc.call("discussFinding", { findingId: target.id }).then((result) => {
-        const opened = panel.openFixedTab({
-          surface: { kind: "current" },
-          tab: discussionTabRef,
-          target: { threadId: result.threadId, title: target.title },
-        });
-        if (!opened) toast.error("Could not open the discussion tab.");
-      }, reportError);
+      rpc.call("discussFinding", { findingId: target.id }).then(
+        () => toast.success("Sent to the review thread"),
+        reportError,
+      );
     },
-    [rpc, panel],
+    [rpc],
   );
 
   if (pr.isLoading && pr.data === null) {
@@ -1342,6 +1226,77 @@ function FindingDetailView({
   );
 }
 
+// ---------------------------------------------------------------------------
+// The review tab — one review's issues, in its own thread's panel
+// ---------------------------------------------------------------------------
+
+/** What the tab is about, however it was opened. */
+function useReviewSubject(
+  rpc: Rpc,
+  threadId: string,
+  params: unknown,
+): { subject: { repo: string; number: number } | null; isLoading: boolean } {
+  // Params round-trip through tab persistence, so validate rather than trust.
+  const fromParams = useMemo(() => {
+    if (typeof params !== "object" || params === null || Array.isArray(params)) return null;
+    const { repo, number } = params as { repo?: unknown; number?: unknown };
+    if (typeof repo !== "string" || typeof number !== "number") return null;
+    return { repo, number };
+  }, [params]);
+
+  // A tab opened from the panel's own Actions launcher carries no params, so
+  // ask the server which review this thread is.
+  const resolved = useLiveQuery(
+    () =>
+      fromParams === null
+        ? rpc.call("getReviewForThread", { threadId })
+        : Promise.resolve(null),
+    [rpc, threadId, fromParams],
+  );
+
+  if (fromParams !== null) return { subject: fromParams, isLoading: false };
+  return { subject: resolved.data, isLoading: resolved.isLoading };
+}
+
+function ReviewTab({ threadId, params }: { threadId: string; params: unknown }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const { subject, isLoading } = useReviewSubject(rpc, threadId, params);
+  const [openFindingId, setOpenFindingId] = useState<string | null>(null);
+  const status = useLiveQuery(() => rpc.call("status"), [rpc]);
+
+  if (subject === null) {
+    return isLoading ? (
+      <Skeleton className="h-32 w-full rounded-lg" />
+    ) : (
+      <EmptyState
+        icon="Search"
+        title="Not a code review"
+        detail="This thread has no review attached. Start one from the Code Review panel."
+      />
+    );
+  }
+  if (openFindingId !== null) {
+    return (
+      <FindingDetailView
+        rpc={rpc}
+        repo={subject.repo}
+        number={subject.number}
+        findingId={openFindingId}
+        onBack={() => setOpenFindingId(null)}
+      />
+    );
+  }
+  return (
+    <PrFindingsView
+      rpc={rpc}
+      repo={subject.repo}
+      number={subject.number}
+      skills={status.data?.skills ?? []}
+      onOpenFinding={setOpenFindingId}
+    />
+  );
+}
+
 function BackButton({ onBack, label }: { onBack: () => void; label: string }) {
   return (
     <Button variant="ghost" size="sm" className="h-7 w-fit gap-1 px-1.5 text-xs" onClick={onBack}>
@@ -1377,10 +1332,13 @@ function Section({
 // The panel
 // ---------------------------------------------------------------------------
 
-function CodeReviewPanel({ subPath }: { subPath: string }) {
+/**
+ * The home screen. It owns the whole route under the panel's path, but has
+ * only one view: a link from the routed panel this replaced lands here.
+ */
+function CodeReviewPanel() {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
-  const route = useMemo(() => parseSubPath(subPath), [subPath]);
 
   const status = useLiveQuery(() => rpc.call("status"), [rpc]);
   const repos = useMemo(() => status.data?.repos ?? [], [status.data]);
@@ -1435,9 +1393,16 @@ function CodeReviewPanel({ subPath }: { subPath: string }) {
     [rpc, repo, filter],
   );
 
-  const go = useCallback(
-    (next: Route) => navigate.toPluginPanel(PANEL_PATH, { subPath: routeToSubPath(next) }),
-    [navigate],
+  // Opening a review means: make sure it and its thread exist, make sure the
+  // thread carries its review tab, then go and stand in that thread.
+  const openPr = useCallback(
+    (nextRepo: string, number: number) => {
+      rpc.call("openReview", { repo: nextRepo, number }).then(
+        (opened) => navigate.toThread(opened.threadId),
+        reportError,
+      );
+    },
+    [rpc, navigate],
   );
 
   const ghState = status.data?.state ?? "checking";
@@ -1464,25 +1429,6 @@ function CodeReviewPanel({ subPath }: { subPath: string }) {
               </>
             }
           />
-        ) : route.kind === "finding" ? (
-          <FindingDetailView
-            rpc={rpc}
-            repo={route.repo}
-            number={route.number}
-            findingId={route.findingId}
-            onBack={() => go({ kind: "pr", repo: route.repo, number: route.number })}
-          />
-        ) : route.kind === "pr" ? (
-          <PrFindingsView
-            rpc={rpc}
-            repo={route.repo}
-            number={route.number}
-            skills={status.data?.skills ?? []}
-            onBack={() => go({ kind: "list" })}
-            onOpenFinding={(findingId) =>
-              go({ kind: "finding", repo: route.repo, number: route.number, findingId })
-            }
-          />
         ) : (
           <PrListView
             rpc={rpc}
@@ -1498,7 +1444,7 @@ function CodeReviewPanel({ subPath }: { subPath: string }) {
               persist({ filter: next });
             }}
             myTeams={status.data?.myTeams ?? []}
-            onOpenPr={(nextRepo, number) => go({ kind: "pr", repo: nextRepo, number })}
+            onOpenPr={openPr}
           />
         )}
       </div>
@@ -1514,14 +1460,15 @@ export default definePluginApp((app) => {
     icon: "Search",
     path: PANEL_PATH,
     component: CodeReviewPanel,
-    fixedTabs: [
-      {
-        ...discussionTabRef,
-        title: "Discussion",
-        icon: "SideChat",
-        layout: "flush",
-        component: DiscussionTab,
-      },
-    ],
+  });
+  // One tab per review, in that review's own thread. No `run`: its context
+  // carries no RPC client, so it could not work out which review a thread is
+  // for — the component resolves that itself from `threadId`.
+  app.slots.threadPanelAction({
+    id: "review",
+    title: "Code review",
+    icon: "Search",
+    component: ReviewTab,
+    layout: "padded",
   });
 });
