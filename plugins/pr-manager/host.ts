@@ -10,6 +10,7 @@ interface SearchResult { number: number; title: string; url: string; isDraft: bo
 interface PrView {
   number: number; title: string; url: string; state: string; isDraft: boolean; headRefName: string; baseRefName: string;
   reviewDecision: string | null; reviewRequests: Array<{ login?: string; name?: string; slug?: string }>;
+  latestReviews: Array<{ state?: string; author?: { login?: string } | null }>;
   statusCheckRollup: Array<{ status?: string; conclusion?: string; state?: string }>; createdAt: string; updatedAt: string; mergedAt: string | null;
 }
 async function run(command: string, args: string[], signal: AbortSignal): Promise<string> {
@@ -35,6 +36,15 @@ function normalizeCheck(check: PrView["statusCheckRollup"][number]) {
   const status = check.status ?? (state === "PENDING" || state === "EXPECTED" ? "IN_PROGRESS" : "COMPLETED");
   return { status: status.toUpperCase(), conclusion: state.toUpperCase() };
 }
+// `latestReviews` holds one entry per reviewer, so an approval here is visible
+// even on repositories where no required review makes `reviewDecision` APPROVED.
+function reviewersWithState(view: PrView, state: string): string[] {
+  const logins = view.latestReviews
+    .filter((review) => (review.state ?? "").toUpperCase() === state)
+    .map((review) => review.author?.login)
+    .filter((login): login is string => login !== undefined && login !== "");
+  return [...new Set(logins)];
+}
 function normalizeRemote(remote: string): string | null {
   const cleaned = remote.trim().replace(/\.git$/, "").replace(/^ssh:\/\//, "");
   return cleaned.match(/(?:git@|https?:\/\/)?github\.com[:/]([^/]+\/[^/]+)$/i)?.[1]?.toLowerCase() ?? null;
@@ -53,17 +63,17 @@ export default experimental_defineHostEntry({
       const pullRequests = await mapConcurrent(unique, 6, async (result) => {
         const repository = result.repository.nameWithOwner;
         const view = JSON.parse(await run("gh", ["pr", "view", String(result.number), "--repo", repository,
-          "--json", "number,title,url,state,isDraft,headRefName,baseRefName,reviewDecision,reviewRequests,statusCheckRollup,createdAt,updatedAt,mergedAt"], context.signal)) as PrView;
+          "--json", "number,title,url,state,isDraft,headRefName,baseRefName,reviewDecision,reviewRequests,latestReviews,statusCheckRollup,createdAt,updatedAt,mergedAt"], context.signal)) as PrView;
         const requestedReviewers = view.reviewRequests.map((reviewer) => reviewer.login ?? reviewer.name ?? reviewer.slug)
           .filter((name): name is string => name !== undefined);
-        const input = { state: view.state, mergedAt: view.mergedAt, isDraft: view.isDraft, reviewDecision: view.reviewDecision ?? "",
+        const input = { state: view.state, approvedBy: reviewersWithState(view, "APPROVED"), changesRequestedBy: reviewersWithState(view, "CHANGES_REQUESTED"), mergedAt: view.mergedAt, isDraft: view.isDraft, reviewDecision: view.reviewDecision ?? "",
           requestedReviewers, checks: view.statusCheckRollup.map(normalizeCheck) };
         const status = classifyPullRequest(input);
         return { repository, number: view.number, title: view.title, url: view.url, status,
           summary: summarizePullRequest(input, status), isDraft: view.isDraft, headRefName: view.headRefName,
           baseRefName: view.baseRefName, createdAt: view.createdAt, updatedAt: view.updatedAt, mergedAt: view.mergedAt };
       });
-      const priority = { FAILING: 0, FEEDBACK: 1, WAITING: 2, APPROVED: 3, MERGED: 4 } as const;
+      const priority = { FAILING: 0, FEEDBACK: 1, APPROVED: 2, WAITING: 3, MERGED: 4 } as const;
       pullRequests.sort((a, b) => priority[a.status] - priority[b.status] || b.updatedAt.localeCompare(a.updatedAt));
       return { pullRequests };
     },
