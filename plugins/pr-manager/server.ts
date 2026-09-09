@@ -6,6 +6,9 @@ import { SORT_ORDERS, sortPullRequests } from "./pr-list.js";
 import { buildThreadPrompt } from "./thread-prompt.js";
 
 const statusSchema = z.enum(PULL_REQUEST_STATUSES);
+// Width of the status column in `bb pr-manager list`, derived so that adding a longer
+// status keeps the summary lines underneath it aligned.
+const statusColumn = Math.max(...PULL_REQUEST_STATUSES.map((status) => status.length));
 const sortOrderSchema = z.enum(SORT_ORDERS);
 const pullRequestSchema = z.object({
   key: z.string(), repository: z.string(), number: z.number().int().positive(),
@@ -213,7 +216,7 @@ export default async function plugin(bb: BbPluginApi) {
       const result = argv[0] === "refresh" ? await refreshPullRequests() : await readCachedPullRequests();
       if (argv.includes("--json")) return { exitCode: 0, stdout: JSON.stringify(result) };
       return { exitCode: 0, stdout: result.refreshedAt === null ? "No cached pull requests. Run `bb pr-manager refresh`." : result.prs.length === 0 ? "No current pull requests." : sortPullRequests(result.prs, result.sortOrder)
-        .map((pr) => `${pr.status.padEnd(8)} ${pr.repository}#${pr.number}  ${pr.title}\n         ${pr.summary}`).join("\n") };
+        .map((pr) => `${pr.status.padEnd(statusColumn)} ${pr.repository}#${pr.number}  ${pr.title}\n${" ".repeat(statusColumn + 1)}${pr.summary}`).join("\n") };
     },
   });
   bb.log.info("loaded");

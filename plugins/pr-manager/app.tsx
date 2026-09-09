@@ -15,11 +15,15 @@ const statusStyle: Record<PullRequest["status"], string> = {
   FAILING: "border-destructive/30 bg-destructive/10 text-destructive",
   FEEDBACK: "border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-300",
   APPROVED: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  // Outlined rather than filled, so a partly approved PR reads as a lighter APPROVED
+  // instead of a status of its own.
+  PART_APPROVED: "border-emerald-500/40 text-emerald-700 dark:text-emerald-300",
   MERGED: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300",
 };
 function StatusBadge({ status, count }: { status: PullRequest["status"]; count?: number }) {
   return (
     <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide", statusStyle[status])}>
+      {status === "APPROVED" ? <Icon name="CircleCheck" className="size-3.5" /> : null}
       <span>{status}</span>
       {count === undefined ? null : <span className="tabular-nums opacity-80">{count}</span>}
     </span>
@@ -63,7 +67,8 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
     } finally { setCreating(false); }
   };
   return (
-    <article className="rounded-lg border border-border bg-card px-4 py-3 shadow-sm">
+    <article className={cn("rounded-lg border border-border bg-card px-4 py-3 shadow-sm",
+      pr.status === "APPROVED" && "border-emerald-500/40 bg-emerald-500/5 ring-1 ring-emerald-500/20")}>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">

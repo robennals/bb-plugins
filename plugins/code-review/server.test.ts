@@ -14,9 +14,6 @@ const FINDING = {
   severity: "high",
   category: "correctness",
   title: "Off by one",
-  background: "b",
-  problem: "the loop runs one past the end",
-  suggestedFix: "f",
   suggestedComment: "Please fix the bound here.",
 };
 
@@ -49,6 +46,7 @@ interface SpawnRecord {
   projectId: string;
   title: string;
   parentThreadId: string | null;
+  visibility: string | null;
 }
 
 /**
@@ -65,10 +63,16 @@ async function makeHost(
     /** argv prefix -> the message that gh call should fail with. */
     ghFailures?: Record<string, string>;
     spawnError?: string;
+    /** Thread ids `threads.get` should report as gone. */
+    missingThreadIds?: string[];
+    /** Makes `threads.archive` fail with this message. */
+    archiveError?: string;
   } = {},
 ) {
   const calls: ShellCall[] = [];
   const spawned: SpawnRecord[] = [];
+  const sent: Array<{ threadId: string; text: string }> = [];
+  const archived: string[] = [];
   const files = options.files ?? {};
   /** Mutable, so a test can break a gh call after the review has already run. */
   const failures: Record<string, string> = { ...options.ghFailures };
@@ -134,11 +138,30 @@ async function makeHost(
             projectId: args.projectId,
             title: args.title ?? "",
             parentThreadId: args.parentThreadId ?? null,
+            visibility: args.visibility ?? null,
           });
           return makeThreadResponse({ id: `thr_${spawned.length}` });
         },
-        get: async ({ threadId }: { threadId: string }) =>
-          makeThreadResponse({ id: threadId, environmentId: null }),
+        get: async ({ threadId }: { threadId: string }) => {
+          if (options.missingThreadIds?.includes(threadId) === true) {
+            throw new Error(`no such thread: ${threadId}`);
+          }
+          return makeThreadResponse({ id: threadId, environmentId: null });
+        },
+        archive: async ({ threadId }: { threadId: string }) => {
+          if (options.archiveError !== undefined) throw new Error(options.archiveError);
+          archived.push(threadId);
+          return { archivedThreadIds: [threadId] };
+        },
+        send: async (args) => {
+          sent.push({
+            threadId: args.threadId,
+            text: (args.input ?? [])
+              .map((part) => ("text" in part ? part.text : ""))
+              .join(""),
+          });
+          return { ok: true as const, delivery: "sent" as const };
+        },
       },
       files: {
         read: async ({ path }: { path: string }) => {
@@ -179,7 +202,30 @@ async function makeHost(
   const review = async () =>
     (await call<{ review: ReviewDto }>("getPullRequest", { repo: REPO, number: 7 })).review;
 
-  return { bb, harness, calls, spawned, failures, call, submit, findings, review };
+  /** Change what `gh pr list` answers, the way GitHub changes underneath. */
+  const setPullRequests = (next: unknown[]) => {
+    gh["pr list"] = JSON.stringify(next);
+  };
+
+  /** A list fetch, which is also when finished reviews are swept. */
+  const listPullRequests = (repo = REPO) =>
+    call("listPullRequests", { repo, filter: { kind: "all" }, refresh: true });
+
+  return {
+    bb,
+    harness,
+    calls,
+    spawned,
+    sent,
+    archived,
+    failures,
+    call,
+    submit,
+    findings,
+    review,
+    setPullRequests,
+    listPullRequests,
+  };
 }
 
 type Host = Awaited<ReturnType<typeof makeHost>>;
@@ -912,33 +958,255 @@ it("starts a pending review when asked and there is none", async () => {
   });
 });
 
-describe("discussing a finding", () => {
-  it("spawns one thread, seeds it with the finding, and reuses it", async () => {
+describe("asking about a finding", () => {
+  // One conversation per review, in the thread that produced it: it already
+  // holds the PR, the diff, and the reasoning behind every finding.
+  it("messages the review thread rather than spawning another one", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     const [finding] = await runReview(host);
-    const first = await host.call<{ threadId: string }>("discussFinding", {
+    const first = await host.call<{ threadId: string }>("askAboutFinding", {
       findingId: finding?.id,
+      question: "Is line 12 really wrong?",
     });
-    const second = await host.call<{ threadId: string }>("discussFinding", {
+    const second = await host.call<{ threadId: string }>("askAboutFinding", {
       findingId: finding?.id,
+      question: "What about the caller?",
     });
-    expect(second.threadId).toBe(first.threadId);
-    // One review thread plus exactly one discussion thread.
-    expect(host.spawned).toHaveLength(2);
+    expect(first.threadId).toBe("thr_1");
+    expect(second.threadId).toBe("thr_1");
+    // The review thread, and nothing else.
+    expect(host.spawned).toHaveLength(1);
+    expect(host.sent.map((entry) => entry.threadId)).toEqual(["thr_1", "thr_1"]);
 
-    const prompt = host.spawned[1]?.prompt ?? "";
-    expect(prompt).toContain("src/a.ts:10-12");
-    expect(prompt).toContain(FINDING.problem);
-    expect(prompt).toContain("Do not post anything to GitHub.");
-    expect(host.spawned[1]?.parentThreadId).toBe("thr_1");
+    const text = host.sent[0]?.text ?? "";
+    expect(text).toContain("src/a.ts:10-12");
+    expect(text).toContain(FINDING.suggestedComment);
+    expect(text).toContain("My question: Is line 12 really wrong?");
+    expect(text).toContain("Do not post anything to GitHub");
   });
 
-  it("seeds the discussion with the user's edit when there is one", async () => {
+  it("quotes the user's edit when there is one", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     const [finding] = await runReview(host);
     await host.call("setFindingComment", { findingId: finding?.id, comment: "My wording." });
-    await host.call("discussFinding", { findingId: finding?.id });
-    expect(host.spawned[1]?.prompt).toContain("My wording.");
+    await host.call("askAboutFinding", { findingId: finding?.id, question: "Fair?" });
+    expect(host.sent[0]?.text).toContain("My wording.");
+  });
+
+  it("rejects an empty question instead of nudging the thread with nothing", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await expect(
+      host.call("askAboutFinding", { findingId: finding?.id, question: "" }),
+    ).rejects.toThrow();
+    expect(host.sent).toHaveLength(0);
+  });
+
+  // Between pressing "Re-run review" and the new thread starting, the review
+  // has findings (the posted and dismissed ones a re-run keeps) but no thread.
+  it("says to start the review when it has no thread yet", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    host.bb.storage.database().prepare(`UPDATE reviews SET thread_id = NULL`).run();
+    await expect(
+      host.call("askAboutFinding", { findingId: finding?.id, question: "Fair?" }),
+    ).rejects.toThrow(/start the review first/);
+    expect(host.sent).toHaveLength(0);
+  });
+
+  it("says to re-run the review when its thread has been deleted", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      missingThreadIds: ["thr_1"],
+    });
+    const [finding] = await runReview(host);
+    await expect(
+      host.call("askAboutFinding", { findingId: finding?.id, question: "Fair?" }),
+    ).rejects.toThrow(/Re-run the review/);
+  });
+});
+
+describe("the review thread a PR's discussion pane shows", () => {
+  it("is the thread of the current run, and null before there is one", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    expect(await host.call("getReviewThread", { repo: REPO, number: 7 })).toEqual({
+      threadId: null,
+    });
+    await runReview(host);
+    expect(await host.call("getReviewThread", { repo: REPO, number: 7 })).toEqual({
+      threadId: "thr_1",
+    });
+  });
+});
+
+describe("the pull request tab's view", () => {
+  // The panel's own tab replaces a shared BB browser tab, so it has to be
+  // able to show a PR nobody has reviewed yet.
+  it("fetches a pull request that has no stored snapshot", async () => {
+    const host = await makeHost();
+    const view = await host.call<{
+      isReviewedCommit: boolean;
+      snapshot: { title: string; body: string; files: Array<{ path: string }> };
+      filesWithPatch: string[];
+      url: string;
+    }>("getPullRequestView", { repo: REPO, number: 7 });
+    expect(view.snapshot.title).toBe("Add a thing");
+    expect(view.snapshot.body).toBe("Why this change exists.");
+    expect(view.snapshot.files.map((file) => file.path)).toEqual(["src/a.ts"]);
+    expect(view.filesWithPatch).toEqual(["src/a.ts"]);
+    expect(view.url).toBe("https://github.com/acme/app/pull/7");
+    // Nothing pins it, so it is not the commit any finding was written against.
+    expect(view.isReviewedCommit).toBe(false);
+  });
+
+  it("serves a reviewed pull request from the snapshot the review used", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    const before = host.calls.length;
+    const view = await host.call<{ isReviewedCommit: boolean }>("getPullRequestView", {
+      repo: REPO,
+      number: 7,
+    });
+    expect(view.isReviewedCommit).toBe(true);
+    // Served from storage: reading a reviewed PR costs no GitHub calls beyond
+    // the auth check.
+    expect(host.calls.slice(before).some((call) => call.args.includes("view"))).toBe(false);
+  });
+
+  // The findings' line numbers are resolved against the stored diff, so
+  // replacing it would move the code out from under comments already written.
+  it("refuses to refresh over a reviewed snapshot", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    const before = host.calls.length;
+    const view = await host.call<{ isReviewedCommit: boolean }>("getPullRequestView", {
+      repo: REPO,
+      number: 7,
+      refresh: true,
+    });
+    expect(view.isReviewedCommit).toBe(true);
+    expect(host.calls.slice(before).some((call) => call.args.includes("view"))).toBe(false);
+  });
+
+  it("refreshes a pull request that has not been reviewed", async () => {
+    const host = await makeHost();
+    await host.call("getPullRequestView", { repo: REPO, number: 7 });
+    const before = host.calls.length;
+    await host.call("getPullRequestView", { repo: REPO, number: 7, refresh: true });
+    expect(host.calls.slice(before).some((call) => call.args.includes("view"))).toBe(true);
+  });
+
+  it("serves one file's patch, and says when a file is not in the diff", async () => {
+    const host = await makeHost();
+    const { patch } = await host.call<{ patch: string }>("getPullRequestPatch", {
+      repo: REPO,
+      number: 7,
+      file: "src/a.ts",
+    });
+    expect(patch).toContain("@@ -1,20 +1,20 @@");
+    await expect(
+      host.call("getPullRequestPatch", { repo: REPO, number: 7, file: "src/gone.ts" }),
+    ).rejects.toThrow(/not in this pull request's diff/);
+  });
+});
+
+describe("the review thread's own lifecycle", () => {
+  it("is spawned hidden, so it does not join the user's own threads", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(host.spawned[0]?.visibility).toBe("hidden");
+  });
+
+  it("archives once GitHub stops asking the viewer — which is what submitting does", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    // Still requested: nothing to clean up yet.
+    await host.listPullRequests();
+    expect(host.archived).toEqual([]);
+
+    host.setPullRequests([{ ...PR, reviewRequests: [] }]);
+    await host.listPullRequests();
+    expect(host.archived).toEqual(["thr_1"]);
+
+    // Archiving is recorded, so a later refresh does not repeat it.
+    await host.listPullRequests();
+    expect(host.archived).toEqual(["thr_1"]);
+  });
+
+  it("archives when the pull request is no longer open", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    host.setPullRequests([]);
+    await host.listPullRequests();
+    expect(host.archived).toEqual(["thr_1"]);
+  });
+
+  // Reviewed from "All open" rather than because anyone asked: there is no
+  // request to lose, so losing one cannot be the signal that it is finished.
+  it("leaves a review nobody asked for alone", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      prs: [{ ...PR, reviewRequests: [] }],
+    });
+    await runReview(host);
+    await host.listPullRequests();
+    expect(host.archived).toEqual([]);
+  });
+
+  // A full page may have open pull requests past its end, so an absent one
+  // is not evidence that it closed.
+  it("does not read a truncated pull request list as pull requests closing", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    host.setPullRequests(
+      Array.from({ length: 100 }, (_, index) => ({ ...PR, number: 100 + index })),
+    );
+    await host.listPullRequests();
+    expect(host.archived).toEqual([]);
+  });
+
+  it("skips a review that is between runs and has no thread", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    // The state a re-run leaves a review in until its new thread starts.
+    host.bb.storage.database().prepare(`UPDATE reviews SET thread_id = NULL`).run();
+    host.setPullRequests([]);
+    await host.listPullRequests();
+    expect(host.archived).toEqual([]);
+  });
+
+  it("does not retry archiving a thread that has already been deleted", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      archiveError: "no such thread",
+    });
+    await runReview(host);
+    host.setPullRequests([{ ...PR, reviewRequests: [] }]);
+    await host.listPullRequests();
+    await host.listPullRequests();
+    // Recorded as dealt with regardless: a deleted thread needs no archiving,
+    // and every later refresh would otherwise call again and fail again.
+    expect(
+      host.bb.storage
+        .database()
+        .prepare(`SELECT thread_archived_at FROM reviews WHERE id = ?`)
+        .get(REVIEW_ID),
+    ).toEqual({ thread_archived_at: expect.any(String) });
+  });
+
+  // The panel's repo picker changes what you are looking at, not what is true
+  // about the repo you looked away from.
+  it("sweeps only the repo whose list was fetched", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    // acme/other has no open pull requests at all. An unscoped sweep would
+    // read that as acme/app's reviewed PR having closed too.
+    host.setPullRequests([]);
+    await host.listPullRequests("acme/other");
+    expect(host.archived).toEqual([]);
+
+    await host.listPullRequests(REPO);
+    expect(host.archived).toEqual(["thr_1"]);
   });
 });
 
@@ -1162,6 +1430,131 @@ describe("the code an issue points at", () => {
     expect(primary?.error).toBeNull();
   });
 
+  // The snippet is the file at the reviewed commit, not a patch, so the change
+  // has to be mapped onto it or the reader cannot tell new code from old.
+  it("marks which of the returned lines the pull request added and deleted", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghOverrides: {
+        // Line 10 replaced; line 11 added outright.
+        "pr diff": [
+          "diff --git a/src/a.ts b/src/a.ts",
+          "--- a/src/a.ts",
+          "+++ b/src/a.ts",
+          "@@ -9,3 +9,4 @@",
+          " line 9",
+          "-line 10 before",
+          "+line 10",
+          "+line 11",
+          " line 12",
+        ].join("\n"),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{
+      locations: Array<{
+        file: string;
+        isPrimary: boolean;
+        inDiff: boolean;
+        addedLines: number[];
+        removals: Array<{ afterLine: number; lines: string[] }>;
+      }>;
+    }>("getFindingCode", { findingId: finding?.id, context: 2 });
+
+    const primary = code.locations.find((location) => location.isPrimary);
+    expect(primary?.inDiff).toBe(true);
+    expect(primary?.addedLines).toEqual([10, 11]);
+    expect(primary?.removals).toEqual([{ afterLine: 9, lines: ["line 10 before"] }]);
+  });
+
+  it("says a referenced file the pull request never touched is not in it", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([
+          { ...FINDING, references: [{ file: "src/ref.ts", startLine: 5, endLine: 5, note: "" }] },
+        ]),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{
+      locations: Array<{ file: string; inDiff: boolean; addedLines: number[] }>;
+    }>("getFindingCode", { findingId: finding?.id, context: 1 });
+
+    const reference = code.locations.find((location) => location.file === "src/ref.ts");
+    // The stubbed diff only touches src/a.ts, so this is untouched context.
+    expect(reference?.inDiff).toBe(false);
+    expect(reference?.addedLines).toEqual([]);
+  });
+
+  it("marks a referenced file the pull request does change, too", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": report([
+          { ...FINDING, references: [{ file: "src/other.ts", startLine: 5, endLine: 5, note: "" }] },
+        ]),
+      },
+      ghOverrides: {
+        "pr diff": [
+          "diff --git a/src/a.ts b/src/a.ts",
+          "--- a/src/a.ts",
+          "+++ b/src/a.ts",
+          "@@ -1,2 +1,2 @@",
+          " line 1",
+          "+line 2",
+          "diff --git a/src/other.ts b/src/other.ts",
+          "--- a/src/other.ts",
+          "+++ b/src/other.ts",
+          "@@ -4,2 +4,3 @@",
+          " line 4",
+          "-line 5 before",
+          "+line 5",
+          " line 6",
+        ].join("\n"),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{
+      locations: Array<{
+        file: string;
+        inDiff: boolean;
+        addedLines: number[];
+        removals: Array<{ afterLine: number; lines: string[] }>;
+      }>;
+    }>("getFindingCode", { findingId: finding?.id, context: 2 });
+
+    const reference = code.locations.find((location) => location.file === "src/other.ts");
+    expect(reference?.inDiff).toBe(true);
+    expect(reference?.addedLines).toEqual([5]);
+    expect(reference?.removals).toEqual([{ afterLine: 4, lines: ["line 5 before"] }]);
+  });
+
+  it("only reports changes inside the window it returned", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghOverrides: {
+        "pr diff": [
+          "diff --git a/src/a.ts b/src/a.ts",
+          "--- a/src/a.ts",
+          "+++ b/src/a.ts",
+          "@@ -1,2 +1,2 @@",
+          " line 1",
+          "+line 2",
+          "@@ -10,1 +11,2 @@",
+          " line 11",
+          "+line 12",
+        ].join("\n"),
+      },
+    });
+    const [finding] = await runReview(host);
+    const code = await host.call<{ locations: Array<{ isPrimary: boolean; addedLines: number[] }> }>(
+      "getFindingCode",
+      { findingId: finding?.id, context: 2 },
+    );
+    // The window is lines 8-14, so the addition at line 2 is not in it.
+    const primary = code.locations.find((location) => location.isPrimary);
+    expect(primary?.addedLines).toEqual([12]);
+  });
+
   it("anchors the GitHub link at the file and line, the way GitHub does", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     const [finding] = await runReview(host);
@@ -1188,13 +1581,13 @@ describe("the code an issue points at", () => {
     expect(code.locations[0]?.hasMoreBelow).toBe(true);
   });
 
-  it("also shows files the finding cited in prose", async () => {
-    // Agents cite supporting code inline far more often than they fill in a
-    // structured field, and that code is worth showing.
+  it("also shows files the comment cited in passing", async () => {
+    // A comment regularly names another file mid-sentence, and that code is
+    // worth showing even without a `references` entry for it.
     const host = await makeHost({
       files: {
         "/w/f.json": report([
-          { ...FINDING, problem: "This contradicts src/other.ts:20-22, which retries." },
+          { ...FINDING, suggestedComment: "This contradicts src/other.ts:20-22, which retries." },
         ]),
       },
     });
@@ -1214,7 +1607,7 @@ it("expands a bare filename the agent cited into the PR's real path", async () =
     const host = await makeHost({
       files: {
         "/w/f.json": report([
-          { ...FINDING, problem: "Unlike a.ts:4, which retries." },
+          { ...FINDING, suggestedComment: "Unlike a.ts:4, which retries." },
         ]),
       },
     });
@@ -1231,7 +1624,7 @@ it("expands a bare filename the agent cited into the PR's real path", async () =
   it("explains a cited file that is not in the repo, without the raw gh error", async () => {
     const host = await makeHost({
       files: {
-        "/w/f.json": report([{ ...FINDING, problem: "See made/up/thing.ts:9 for the pattern." }]),
+        "/w/f.json": report([{ ...FINDING, suggestedComment: "See made/up/thing.ts:9 for the pattern." }]),
       },
       ghFailures: { "api repos/acme/app/contents/made/up/thing.ts": "gh: Not Found (HTTP 404)" },
     });
@@ -1249,7 +1642,7 @@ it("expands a bare filename the agent cited into the PR's real path", async () =
     const host = await makeHost({
       files: {
         "/w/f.json": report([
-          { ...FINDING, problem: "Also written as a.ts:10 elsewhere in this text." },
+          { ...FINDING, suggestedComment: "Also written as a.ts:10 elsewhere in this text." },
         ]),
       },
     });
@@ -1265,7 +1658,7 @@ it("expands a bare filename the agent cited into the PR's real path", async () =
   it("resolves a citation to code outside the PR using the repo tree", async () => {
     const host = await makeHost({
       files: {
-        "/w/f.json": report([{ ...FINDING, problem: "Unlike outside.ts:3, which retries." }]),
+        "/w/f.json": report([{ ...FINDING, suggestedComment: "Unlike outside.ts:3, which retries." }]),
       },
     });
     const [finding] = await runReview(host);
@@ -1407,12 +1800,21 @@ describe("a review with no stored commit", () => {
 describe("the panel's remembered state", () => {
   it("starts empty and round-trips what the panel saves", async () => {
     const host = await makeHost();
-    expect(await host.call("getPanelState", null)).toEqual({ repo: null, filter: null });
+    expect(await host.call("getPanelState", null)).toEqual({
+      repo: null,
+      filter: null,
+      sidePane: null,
+      diffFile: null,
+      diffUrl: null,
+    });
 
     await host.call("setPanelState", { repo: REPO, filter: { kind: "team", teamSlug: "acme/core" } });
     expect(await host.call("getPanelState", null)).toEqual({
       repo: REPO,
       filter: { kind: "team", teamSlug: "acme/core" },
+      sidePane: null,
+      diffFile: null,
+      diffUrl: null,
     });
   });
 
@@ -1423,14 +1825,51 @@ describe("the panel's remembered state", () => {
     expect(await host.call("getPanelState", null)).toEqual({
       repo: "acme/other",
       filter: { kind: "all" },
+      sidePane: null,
+      diffFile: null,
+      diffUrl: null,
     });
+  });
+
+  // The pull request list and the side pane write this row independently, so
+  // neither may flatten a field it does not own.
+  it("patches the fields it is given and leaves the rest alone", async () => {
+    const host = await makeHost();
+    await host.call("setPanelState", { repo: REPO, filter: { kind: "mine" } });
+    await host.call("setPanelState", { sidePane: "discussion" });
+    expect(await host.call("getPanelState", null)).toEqual({
+      repo: REPO,
+      filter: { kind: "mine" },
+      sidePane: "discussion",
+      diffFile: null,
+      diffUrl: null,
+    });
+
+    await host.call("setPanelState", { filter: { kind: "all" } });
+    expect(await host.call("getPanelState", null)).toEqual({
+      repo: REPO,
+      filter: { kind: "all" },
+      sidePane: "discussion",
+      diffFile: null,
+      diffUrl: null,
+    });
+
+    // An explicit null still clears, which is how "nothing chosen" is stored.
+    await host.call("setPanelState", { repo: null });
+    expect(await host.call("getPanelState", null)).toMatchObject({ repo: null });
   });
 
   it("ignores a stored filter a newer build no longer understands", async () => {
     const host = await makeHost();
     await host.call("setPanelState", { repo: REPO, filter: { kind: "mine" } });
     host.bb.storage.database().prepare(`UPDATE panel_state SET filter = ?`).run('{"kind":"gone"}');
-    expect(await host.call("getPanelState", null)).toEqual({ repo: REPO, filter: null });
+    expect(await host.call("getPanelState", null)).toEqual({
+      repo: REPO,
+      filter: null,
+      sidePane: null,
+      diffFile: null,
+      diffUrl: null,
+    });
   });
 });
 
@@ -1445,7 +1884,8 @@ describe("registrations", () => {
       "setFindingComment",
       "setFindingState",
       "postFinding",
-      "discussFinding",
+      "askAboutFinding",
+      "getReviewThread",
     ]) {
       expect(harness.registrations.rpcMethods).toContain(method);
     }

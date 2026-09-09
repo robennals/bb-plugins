@@ -8,8 +8,10 @@ export const SORT_ORDER_LABELS: Record<SortOrder, string> = {
 
 interface OrderablePullRequest { status: PullRequestStatus; createdAt: string; updatedAt: string }
 // Your move first — broken, then awaiting your reply, then a draft to promote, then a
-// review to request — before the ones you are waiting on someone else for.
-const STATUS_PRIORITY: Record<PullRequestStatus, number> = { FAILING: 0, FEEDBACK: 1, DRAFT: 2, OPEN: 3, WAITING: 4, APPROVED: 5, MERGED: 6 };
+// review to request, then one you can merge — before the ones still in someone else's
+// court. A part-approved PR sits between the two: closer to mergeable than an unreviewed
+// one, but not yours to act on yet.
+const STATUS_PRIORITY: Record<PullRequestStatus, number> = { FAILING: 0, FEEDBACK: 1, DRAFT: 2, OPEN: 3, APPROVED: 4, PART_APPROVED: 5, WAITING: 6, MERGED: 7 };
 export function sortPullRequests<T extends OrderablePullRequest>(prs: readonly T[], order: SortOrder): T[] {
   const recentlyUpdatedFirst = (a: T, b: T) => b.updatedAt.localeCompare(a.updatedAt);
   return [...prs].sort((a, b) => {

@@ -1,5 +1,5 @@
-export type PullRequestStatus = "OPEN" | "DRAFT" | "WAITING" | "FAILING" | "FEEDBACK" | "APPROVED" | "MERGED";
-export const PULL_REQUEST_STATUSES = ["FAILING", "FEEDBACK", "DRAFT", "OPEN", "WAITING", "APPROVED", "MERGED"] as const;
+export type PullRequestStatus = "OPEN" | "DRAFT" | "WAITING" | "FAILING" | "FEEDBACK" | "APPROVED" | "PART_APPROVED" | "MERGED";
+export const PULL_REQUEST_STATUSES = ["FAILING", "FEEDBACK", "DRAFT", "OPEN", "APPROVED", "PART_APPROVED", "WAITING", "MERGED"] as const;
 
 // An entry of the status check rollup: either a check run (name, workflowName, status,
 // conclusion, startedAt) or a commit status (context, state, createdAt).
@@ -39,7 +39,33 @@ export function latestCheckRuns(checks: CheckRun[]): CheckRun[] {
 
 const FAILING_CONCLUSIONS = new Set(["ACTION_REQUIRED", "CANCELLED", "FAILURE", "STARTUP_FAILURE", "STALE", "TIMED_OUT"]);
 const FEEDBACK_REVIEW_STATES = new Set(["CHANGES_REQUESTED", "COMMENTED"]);
+const VERDICT_REVIEW_STATES = new Set(["APPROVED", "CHANGES_REQUESTED"]);
 const sameUser = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+// A reviewer's verdict is their most recent approval or changes-requested review. Plain
+// comments are skipped rather than simply taking each reviewer's last review, because on
+// GitHub commenting after approving does not retract the approval.
+function latestVerdicts(input: PullRequestStatusInput): ReviewInput[] {
+  const verdicts = new Map<string, ReviewInput>();
+  for (const review of input.reviews) {
+    if (review.isBot || sameUser(review.author, input.author)) continue;
+    if (!VERDICT_REVIEW_STATES.has(review.state.toUpperCase())) continue;
+    const previous = verdicts.get(review.author.toLowerCase());
+    if (previous === undefined || review.submittedAt > previous.submittedAt) verdicts.set(review.author.toLowerCase(), review);
+  }
+  return [...verdicts.values()];
+}
+// Who has approved, whatever `reviewDecision` says: a repository that requires no review
+// leaves the decision empty even once someone has approved.
+export function approvedBy(input: PullRequestStatusInput): string[] {
+  return latestVerdicts(input).filter((review) => review.state.toUpperCase() === "APPROVED").map((review) => review.author);
+}
+// `reviewDecision` still catches an approval older than the reviews we fetch. It is
+// deliberately not read for changes requested: GitHub leaves that set forever, which is
+// the stale FEEDBACK that `unaddressedFeedbackFrom` exists to correct.
+function isApproved(input: PullRequestStatusInput): boolean {
+  return approvedBy(input).length > 0 || input.reviewDecision === "APPROVED";
+}
 
 // Feedback is outstanding until the ball is back in the reviewer's court:
 //   - a "changes requested" or "comment" review, unless that reviewer has since been
@@ -71,8 +97,15 @@ export function classifyPullRequest(input: PullRequestStatusInput): PullRequestS
   if (input.checks.some((check) => FAILING_CONCLUSIONS.has(check.conclusion))) return "FAILING";
   if (unaddressedFeedbackFrom(input).length > 0) return "FEEDBACK";
   if (input.isDraft) return "DRAFT";
-  if (input.reviewDecision === "APPROVED" && input.requestedReviewers.length === 0) return "APPROVED";
+  if (isApproved(input)) return input.requestedReviewers.length === 0 ? "APPROVED" : "PART_APPROVED";
   return input.requestedReviewers.length > 0 ? "WAITING" : "OPEN";
+}
+
+// Named approvers where we have them, and a bare "Approved" where the approval came from
+// `reviewDecision` alone.
+function approval(input: PullRequestStatusInput): string {
+  const approvers = approvedBy(input);
+  return approvers.length > 0 ? `Approved by ${approvers.join(", ")}` : "Approved";
 }
 
 export function summarizePullRequest(input: PullRequestStatusInput, status: PullRequestStatus): string {
@@ -83,7 +116,8 @@ export function summarizePullRequest(input: PullRequestStatusInput, status: Pull
     case "MERGED": return input.mergedAt === null ? "Merged" : `Merged ${input.mergedAt.slice(0, 10)}`;
     case "FAILING": return `${failing} ${failing === 1 ? "check is" : "checks are"} failing`;
     case "FEEDBACK": return `Feedback from ${unaddressedFeedbackFrom(input).join(", ")} needs a response`;
-    case "APPROVED": return "Approved; all requested reviews are complete";
+    case "APPROVED": return `${approval(input)}; all requested reviews are complete`;
+    case "PART_APPROVED": return `${approval(input)} · still waiting for ${input.requestedReviewers.join(", ")}`;
     case "DRAFT": return `Draft; mark it ready for review when it is${running}`;
     case "OPEN": return `No review requested yet${running}`;
     case "WAITING": return `Waiting for ${input.requestedReviewers.join(", ")}${running}`;

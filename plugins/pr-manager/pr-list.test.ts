@@ -25,6 +25,12 @@ describe("sortPullRequests", () => {
     ];
     expect(sortPullRequests(twoFailing, "STATUS")[0]!.updatedAt).toBe("2026-03-01T00:00:00Z");
   });
+  it("puts a PR you can merge above one still in someone else's court", () => {
+    const approved = pr({ status: "APPROVED" });
+    const partApproved = pr({ status: "PART_APPROVED" });
+    const waiting = pr({ status: "WAITING" });
+    expect(sortPullRequests([waiting, partApproved, approved], "STATUS")).toEqual([approved, partApproved, waiting]);
+  });
   it("orders by creation and by last update, newest first, ignoring status", () => {
     expect(sortPullRequests(all, "CREATED")).toEqual([draftNew, mergedMid, failingOld]);
     expect(sortPullRequests(all, "UPDATED")).toEqual([draftNew, mergedMid, failingOld]);
