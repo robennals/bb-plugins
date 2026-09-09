@@ -1489,3 +1489,48 @@ export function buildFileContextBlock(args: {
   const language = /^[A-Za-z0-9]{1,10}$/.test(extension) ? extension.toLowerCase() : "";
   return [link, "", `\`\`\`${language}`, ...quoted, "\`\`\`"].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// The review tab
+// ---------------------------------------------------------------------------
+
+/** The action id of the review tab, shared by the registration and the tab. */
+export const REVIEW_TAB_ACTION_ID = "review";
+
+/** A `plugin-panel` entry in a thread's tab list, as BB's tab schema wants it. */
+export interface ReviewPanelTab {
+  id: string;
+  kind: "plugin-panel";
+  pluginId: string;
+  actionId: string;
+  title: string;
+  paramsJson: string;
+}
+
+/** Lowercase, dash-separated, safe to embed in a tab id. */
+function slug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * The review tab for one pull request. The id is derived rather than random so
+ * a second `openReview` for the same PR recognises the tab it already wrote,
+ * even if the params comparison changes shape later.
+ */
+export function reviewTabFor(args: {
+  pluginId: string;
+  repo: string;
+  number: number;
+}): ReviewPanelTab {
+  return {
+    id: `${args.pluginId}-review-${slug(args.repo)}-${args.number}`,
+    kind: "plugin-panel",
+    pluginId: args.pluginId,
+    actionId: REVIEW_TAB_ACTION_ID,
+    title: "Code review",
+    paramsJson: JSON.stringify({ repo: args.repo, number: args.number }),
+  };
+}

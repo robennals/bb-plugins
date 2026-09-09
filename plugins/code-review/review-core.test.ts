@@ -19,6 +19,7 @@ import {
   resolvePostAnchor,
   needsPathResolution,
   parseSkillList,
+  reviewTabFor,
   resolveCitedPath,
   splitUnifiedDiff,
   type PullRequest,
@@ -1003,5 +1004,39 @@ describe("patchLineChanges", () => {
       added: [1],
       removals: [{ afterLine: 0, lines: ["old"] }],
     });
+  });
+});
+
+describe("reviewTabFor", () => {
+  it("builds a plugin-panel tab BB's own tab schema accepts", () => {
+    const tab = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    expect(tab).toEqual({
+      id: "code-review-review-acme-app-7",
+      kind: "plugin-panel",
+      pluginId: "code-review",
+      actionId: "review",
+      title: "Code review",
+      paramsJson: JSON.stringify({ repo: "acme/app", number: 7 }),
+    });
+  });
+
+  it("gives one review one stable id, so a repeat install is recognisable", () => {
+    const first = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    const again = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    expect(again.id).toBe(first.id);
+  });
+
+  it("gives two reviews different ids, so they are two tabs", () => {
+    const seven = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    const eight = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 8 });
+    const other = reviewTabFor({ pluginId: "code-review", repo: "acme/other", number: 7 });
+    expect(new Set([seven.id, eight.id, other.id]).size).toBe(3);
+  });
+
+  it("keeps the id safe for a repo whose name has odd characters", () => {
+    const tab = reviewTabFor({ pluginId: "code-review", repo: "Acme.Corp/my_app", number: 12 });
+    expect(tab.id).toBe("code-review-review-acme-corp-my-app-12");
+    // The params keep the real repo; only the id is slugged.
+    expect(JSON.parse(tab.paramsJson)).toEqual({ repo: "Acme.Corp/my_app", number: 12 });
   });
 });
