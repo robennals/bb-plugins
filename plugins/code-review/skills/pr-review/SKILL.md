@@ -56,20 +56,23 @@ Each finding has these parts, and they are not interchangeable:
 - **`summary`** — the gist, in at most two sentences. This is all the reviewer
   sees in the list, so it has to convey what is wrong on its own.
 
-- **`background`** — what the code does, so a reader who has not been in this
-  file can follow the rest. Not a restatement of the problem.
-- **`problem`** — what is actually wrong and why it matters. Concrete: the
-  input, the state, the wrong result.
-- **`suggestedFix`** — how you would fix it.
 - **`suggestedComment`** — posted to GitHub verbatim. Write it *to the PR
   author*, not as a note to yourself: no "the user should", no restating what
-  you did. Short and specific beats thorough and vague.
-- **`references`** — other places in the repo the finding depends on: the
-  function it contradicts, the existing pattern it diverges from, the test that
-  should have caught it. Each is `{ file, startLine, endLine, note }`, and the
-  panel shows that code next to the finding, so a reference saves the reviewer
-  the lookup. Citing `path/to/file.ts:42` inline in your prose works too — the
-  panel picks those up — but a `references` entry with a `note` is better.
+  you did. See [Writing the comment](#writing-the-comment) below — it is the
+  only field the author ever sees, so it has to stand on its own.
+- **`references`** — the code that backs the finding up, and the *only* place
+  context belongs: there is no prose field for a write-up. Each is
+  `{ file, startLine, endLine, note }`, where `note` is one line saying what
+  the reader should look at there. The panel puts that code on screen beside
+  the issue, so a reference saves the reviewer a lookup that would otherwise
+  be a paragraph of explanation.
+
+  Include the ones that decide whether the finding is right — the function it
+  contradicts, the existing pattern it diverges from, the caller that reaches
+  it, the test that should have caught it — and leave out anything the reader
+  would not open. Citing `path/to/file.ts:42` inline in the comment works too
+  (the panel picks those up), but a `references` entry with a `note` is
+  better.
 - **`file` / `startLine` / `endLine`** — where the comment anchors. Use line
   numbers in the **new** file (`side: "RIGHT"`); use `"LEFT"` and old-file line
   numbers only when commenting on a deleted line. A finding with no line
@@ -110,3 +113,45 @@ reviewer either sees the wrong file or none.
 - A single malformed finding is dropped with a warning and the rest are
   imported, so a stray field will not lose the whole review — but check the
   submit output for warnings.
+
+## Writing the comment
+
+The author has the diff and nothing else, and there is no other prose field to
+fall back on: everything you want said goes here, and everything you want
+*read* goes in `references`.
+
+**Default to two or three sentences**: what is wrong, and the question you want
+answered.
+
+> This waits on `isLoading` but not on failure, so a 5xx renders the instance
+> with every admin-enabled feature silently off. Could we treat an errored read
+> the same as an unloaded one?
+
+**Only when the reader could not get there from the diff alone**, lay the path
+out in steps. Earn the extra length — a one-hop chain stays prose.
+
+> Should this wait on the error case too, not just `isLoading`?
+>
+> I think this can happen:
+> 1. `instanceFeatures.get` fails — offline, or a 5xx
+> 2. The query settles anyway: `isLoading` false, `features` null
+> 3. `activeFeatures` falls back to `EMPTY_FEATURES`
+> 4. The instance renders with every admin-enabled feature off, and nothing
+>    says so
+>
+> Could the query return `isError`, and this treat an errored read like an
+> unloaded one?
+
+Either way:
+
+- **Name real symbols and paths.** `EMPTY_FEATURES`, `useSetSpaceFeature`,
+  `client/data/spaces.ts:258` — precise and greppable. What to avoid is the
+  *unnamed* abstraction: "the instance snapshot", "a non-space read". If a
+  concept has no name in the code, describe it in plain words instead.
+- **One idea per paragraph**, with a blank line between them. A ten-line block
+  of prose does not get read.
+- **Ask, do not pronounce.** "Could this…?", "Should this…?" — the author may
+  know something you do not.
+- **Offer the alternative last**, in one sentence, when there is an obvious one.
+- **No preamble.** Not "Great work, but…", not "Minor nit:", not restating the
+  diff back to the author.

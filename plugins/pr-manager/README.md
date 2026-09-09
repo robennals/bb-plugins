@@ -3,7 +3,8 @@
 A GitHub CLI-backed BB plugin for keeping ongoing pull requests visible and actionable.
 
 - Lists open PRs authored by the authenticated GitHub user and recently merged PRs.
-- Classifies each as WAITING, FAILING, FEEDBACK, APPROVED, or MERGED.
+- Classifies each as WAITING, FAILING, FEEDBACK, APPROVED, or MERGED, and highlights approved PRs with a green card and check badge.
+- Counts a PR as approved once any reviewer has approved it, even where GitHub reports no review decision because the repository requires no review; requested changes still win over an approval.
 - Loads the last saved result immediately and only contacts GitHub when Refresh is clicked.
 - Filters the list and status counts by repository, with recently active repositories first.
 - Finds existing BB threads by remembered PR links or matching project branches.

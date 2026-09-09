@@ -8,12 +8,14 @@ import {
   parsePrSnapshot,
   parseReviewComments,
   buildReviewPrompt,
+  awaitsReviewFrom,
   filterPullRequests,
   parsePullRequests,
   parseReport,
   parseRepoList,
   describeGitHubError,
   diffHunkRanges,
+  patchLineChanges,
   resolvePostAnchor,
   needsPathResolution,
   parseSkillList,
@@ -44,6 +46,36 @@ function pr(overrides: Partial<PullRequest>): PullRequest {
 }
 
 describe("parseReport", () => {
+  // Agents still write these — older prompts asked for them, and models pad —
+  // so they have to be dropped rather than rejected.
+  it("ignores a write-up the contract no longer asks for", () => {
+    const { report, errors } = parseReport(
+      JSON.stringify({
+        summary: "s",
+        findings: [
+          {
+            file: "src/a.ts",
+            startLine: 10,
+            endLine: 12,
+            side: "RIGHT",
+            severity: "high",
+            category: "correctness",
+            title: "Off by one",
+            summary: "Runs one past the end.",
+            background: "The loop walks the buffer.",
+            problem: "It runs one past the end.",
+            suggestedFix: "Use < instead of <=.",
+            suggestedComment: "Could this be `<` rather than `<=`?",
+            references: [],
+          },
+        ],
+      }),
+    );
+    expect(errors).toEqual([]);
+    expect(report?.findings[0]).not.toHaveProperty("problem");
+    expect(report?.findings[0]?.suggestedComment).toBe("Could this be `<` rather than `<=`?");
+  });
+
   const complete = {
     file: "src/a.ts",
     startLine: 4,
@@ -52,9 +84,6 @@ describe("parseReport", () => {
     severity: "high",
     category: "correctness",
     title: "Off by one",
-    background: "b",
-    problem: "p",
-    suggestedFix: "f",
     suggestedComment: "c",
   };
 
@@ -82,7 +111,6 @@ describe("parseReport", () => {
             line: 12,
             severity: "NIT",
             title: "x",
-            problem: "p",
             suggested_comment: "c",
             suggested_fix: "f",
           },
@@ -207,6 +235,15 @@ describe("filterPullRequests", () => {
   it("matches logins and team slugs case-insensitively", () => {
     const shouty = pr({ number: 5, reviewRequests: [{ login: "RobEnnals", teamSlug: null }] });
     expect(filterPullRequests([shouty], { kind: "mine" }, context)).toHaveLength(1);
+  });
+
+  // The thread cleanup keys off this: GitHub clears the request when you
+  // submit, and either kind of request counts as "still waiting on you".
+  it("counts a direct or a team request as awaiting the viewer", () => {
+    expect(awaitsReviewFrom(direct, context)).toBe(true);
+    expect(awaitsReviewFrom(viaTeam, context)).toBe(true);
+    expect(awaitsReviewFrom(otherTeam, context)).toBe(false);
+    expect(awaitsReviewFrom(nobody, context)).toBe(false);
   });
 
   it("passes everything through for `all`", () => {
@@ -848,5 +885,106 @@ describe("githubBlobUrl", () => {
     expect(githubBlobUrl({ ...base, file: "a/b/c.ts", startLine: null, endLine: null })).toContain(
       "/blob/abc123/a/b/c.ts",
     );
+  });
+});
+
+// The comment is the only field the PR author ever sees, so how to write one
+// travels with every review the plugin starts, on any repo.
+describe("the comment style the prompt asks for", () => {
+  const prompt = buildReviewPrompt({
+    repo: "acme/app",
+    number: 7,
+    title: "Add a thing",
+    reviewId: "acme/app#7",
+    findingsPath: ".bb/code-review/acme-app-7.json",
+    skills: [],
+    extraInstructions: "",
+    headSha: "sha7",
+  });
+
+  it("asks for a short comment by default and a numbered path only when earned", () => {
+    expect(prompt).toContain("Default to two or three sentences");
+    expect(prompt).toContain("could not get there from the diff alone");
+  });
+
+  it("keeps real symbol names while ruling out unnamed abstractions", () => {
+    expect(prompt).toContain("Name real symbols and paths");
+    expect(prompt).toContain("the instance snapshot");
+  });
+
+  it("asks rather than pronounces, and drops the preamble", () => {
+    expect(prompt).toContain("Ask, do not pronounce");
+    expect(prompt).toContain("No preamble");
+  });
+
+  it("says the comment cannot lean on another field, because there is not one", () => {
+    expect(prompt).toContain("stand on its own");
+    expect(prompt).toContain("no other prose field");
+  });
+
+  // Context is code the reader can open, not a paragraph describing it.
+  it("asks for supporting code as references with a one-line note each", () => {
+    expect(prompt).toContain("Point at the code that backs it up");
+    expect(prompt).toContain("one line");
+    expect(prompt).toContain("Leave out anything the reader would not open");
+  });
+});
+
+describe("patchLineChanges", () => {
+  const patch = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1,4 +1,5 @@",
+    " const a = 1;",
+    "-const b = 2;",
+    "-const c = 3;",
+    "+const b = 20;",
+    "+const c = 30;",
+    "+const d = 40;",
+    " const e = 5;",
+  ].join("\n");
+
+  it("reports which new-file lines the patch added", () => {
+    expect(patchLineChanges(patch).added).toEqual([2, 3, 4]);
+  });
+
+  it("anchors deleted lines to the new-file line they followed", () => {
+    // They sat after line 1 and are not in the new file at all, so this is the
+    // only way the panel can show them beside the code that replaced them.
+    expect(patchLineChanges(patch).removals).toEqual([
+      { afterLine: 1, lines: ["const b = 2;", "const c = 3;"] },
+    ]);
+  });
+
+  it("does not read the +++ header as an added line", () => {
+    // The preamble's `+++ b/file` and `--- a/file` are not content.
+    expect(patchLineChanges(patch).added).not.toContain(1);
+  });
+
+  it("keeps counting across several hunks", () => {
+    const twoHunks = [
+      "@@ -1,2 +1,2 @@",
+      " one",
+      "+two",
+      "@@ -50,2 +50,3 @@",
+      " fifty",
+      "+fifty one",
+    ].join("\n");
+    expect(patchLineChanges(twoHunks).added).toEqual([2, 51]);
+  });
+
+  it("handles a deletion at the very start of a hunk", () => {
+    const patch = ["@@ -1,2 +1,1 @@", "-gone", " kept"].join("\n");
+    expect(patchLineChanges(patch).removals).toEqual([{ afterLine: 0, lines: ["gone"] }]);
+    expect(patchLineChanges(patch).added).toEqual([]);
+  });
+
+  it("ignores the no-newline marker", () => {
+    const patch = ["@@ -1 +1 @@", "-old", "+new", "\\ No newline at end of file"].join("\n");
+    expect(patchLineChanges(patch)).toEqual({
+      added: [1],
+      removals: [{ afterLine: 0, lines: ["old"] }],
+    });
   });
 });
