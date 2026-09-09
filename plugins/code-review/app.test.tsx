@@ -139,10 +139,11 @@ function rpc(overrides: Record<string, unknown> = {}) {
   };
 }
 
-type Rpc = Record<string, unknown>;
+/** Per-test replacements for the rpc factory's default handlers. */
+type RpcOverrides = Record<string, unknown>;
 
 /** The review tab, as `openReview` opens it: params naming the review. */
-function reviewTab(app: Awaited<ReturnType<typeof load>>, overrides: Rpc = {}) {
+function reviewTab(app: Awaited<ReturnType<typeof load>>, overrides: RpcOverrides = {}) {
   return renderSlot(
     app.threadPanelActions[0]!,
     { threadId: "thr_1", params: { repo: "acme/app", number: 7 } },
@@ -171,7 +172,7 @@ async function intoIssue(slot: ReturnType<typeof renderSlot>) {
 }
 
 /** The review tab with its one issue opened. */
-async function openedIssue(overrides: Rpc = {}) {
+async function openedIssue(overrides: RpcOverrides = {}) {
   const app = await load();
   return intoIssue(reviewTab(app, overrides));
 }
@@ -987,6 +988,21 @@ describe("the review tab", () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
+      { rpc: rpc() },
+    );
+    await slot.findByText("Off by one");
+    const call = slot.inspection.rpcCalls.find((entry) => entry.method === "getReviewForThread");
+    expect(call?.input).toEqual({ threadId: "thr_1" });
+    slot.lifecycle.unmount();
+  });
+
+  it("falls back to the thread when its saved params make no sense", async () => {
+    // A tab persisted by an older version of this plugin, restored into this
+    // one: the params are not a review, so the thread has to say what it is.
+    const app = await load();
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thr_1", params: { repo: 7, number: "acme/app" } },
       { rpc: rpc() },
     );
     await slot.findByText("Off by one");

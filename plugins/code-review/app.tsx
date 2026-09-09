@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
+import type { JsonValue } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { FindingDto, PullRequestDto, ReviewDto, rpcContract } from "./server";
 import { Badge } from "@/components/ui/badge";
@@ -1234,12 +1235,12 @@ function FindingDetailView({
 function useReviewSubject(
   rpc: Rpc,
   threadId: string,
-  params: unknown,
+  params: JsonValue | null,
 ): { subject: { repo: string; number: number } | null; isLoading: boolean } {
   // Params round-trip through tab persistence, so validate rather than trust.
   const fromParams = useMemo(() => {
     if (typeof params !== "object" || params === null || Array.isArray(params)) return null;
-    const { repo, number } = params as { repo?: unknown; number?: unknown };
+    const { repo, number } = params;
     if (typeof repo !== "string" || typeof number !== "number") return null;
     return { repo, number };
   }, [params]);
@@ -1258,7 +1259,7 @@ function useReviewSubject(
   return { subject: resolved.data, isLoading: resolved.isLoading };
 }
 
-function ReviewTab({ threadId, params }: { threadId: string; params: unknown }) {
+function ReviewTab({ threadId, params }: { threadId: string; params: JsonValue | null }) {
   const rpc = useRpc<typeof rpcContract>();
   const { subject, isLoading } = useReviewSubject(rpc, threadId, params);
   const [openFindingId, setOpenFindingId] = useState<string | null>(null);
