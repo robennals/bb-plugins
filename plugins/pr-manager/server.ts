@@ -163,8 +163,10 @@ export default async function plugin(bb: BbPluginApi) {
           workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: prepared.ref } },
         },
         prompt: [
-          `Work on pull request ${input.url}.`,
-          "Review its current CI and reviewer feedback, summarize what needs attention, and help address it.",
+          `Investigate pull request ${input.url}.`,
+          "Your goal for this first turn is to recommend, not to act. Look at the current state of the PR — merge conflicts with the target branch, CI failures, review comments, unresolved threads, and anything else that needs attention — and report what you find.",
+          "Then give me a numbered list of the things you think should be done, each with a one-line explanation of why. Stop there and wait for me to pick which ones to do.",
+          "Do not edit files, commit, push, reply to review comments, or change the PR in any way until I explicitly ask you to.",
           `The worktree starts from the PR head; target branch is ${input.baseRefName}.`,
         ].join("\n\n"),
         title: `PR #${input.number}: ${input.title}`,
