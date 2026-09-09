@@ -121,6 +121,8 @@ const findingSchemaDto = z.object({
   /** The gist for the list view; derived when the agent wrote none. */
   gist: z.string(),
   summary: z.string(),
+  /** How the agent would fix it; empty when it offered none. */
+  suggestedFix: z.string(),
   suggestedComment: z.string(),
   /** The user's edit, or null when the suggested comment is unedited. */
   draftComment: z.string().nullable(),
@@ -509,6 +511,7 @@ interface FindingRow {
   category: string;
   title: string;
   summary: string;
+  suggested_fix: string;
   suggested_comment: string;
   draft_comment: string | null;
   state: string;
@@ -550,6 +553,7 @@ function toFindingDto(row: FindingRow): FindingDto {
     title: row.title,
     summary: row.summary ?? "",
     gist: findingGist({ summary: row.summary ?? "", suggestedComment: row.suggested_comment }),
+    suggestedFix: row.suggested_fix ?? "",
     suggestedComment: row.suggested_comment,
     draftComment: row.draft_comment,
     state:
@@ -757,6 +761,12 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
   ensureColumn("findings", "posted_as", `TEXT NOT NULL DEFAULT 'comment'`);
+  // Dropped with background and problem, then brought back on its own: the
+  // write-up around it was noise, but how the agent would fix a finding is
+  // often the useful part. The DROP above has already run on real databases
+  // and `migrate` hashes statements by index, so editing it would refuse the
+  // load — hence ensureColumn.
+  ensureColumn("findings", "suggested_fix", `TEXT NOT NULL DEFAULT ''`);
   ensureColumn("reviews", "awaited_me_at_start", `INTEGER NOT NULL DEFAULT 0`);
   ensureColumn("reviews", "thread_archived_at", `TEXT`);
   ensureColumn("panel_state", "side_pane", `TEXT`);
@@ -1363,10 +1373,10 @@ interface ContextRow {
       .get(reviewId) as { n: number };
     const insert = db.prepare(
       `INSERT INTO findings (id, review_id, ord, file, start_line, end_line, side, severity,
-                             category, title, summary,
+                             category, title, summary, suggested_fix,
                              suggested_comment, references_json, draft_comment, state)
        VALUES (@id, @review_id, @ord, @file, @start_line, @end_line, @side, @severity,
-               @category, @title, @summary,
+               @category, @title, @summary, @suggested_fix,
                @suggested_comment, @references_json, NULL, 'open')`,
     );
     const write = db.transaction((rows: Finding[]) => {
@@ -1387,6 +1397,7 @@ interface ContextRow {
           category: finding.category,
           title: finding.title,
           summary: finding.summary,
+          suggested_fix: finding.suggestedFix,
           suggested_comment: finding.suggestedComment,
           references_json: JSON.stringify(finding.references),
         });

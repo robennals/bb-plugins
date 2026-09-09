@@ -68,6 +68,7 @@ const FINDING: FindingDto = {
   title: "Off by one",
   gist: "The loop runs one past the end of the buffer.",
   summary: "The loop runs one past the end of the buffer.",
+  suggestedFix: "Use < instead of <=.",
   suggestedComment: "Please fix the bound here.",
   draftComment: null,
   state: "open",

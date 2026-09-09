@@ -46,9 +46,21 @@ function pr(overrides: Partial<PullRequest>): PullRequest {
 }
 
 describe("parseReport", () => {
-  // Agents still write these — older prompts asked for them, and models pad —
-  // so they have to be dropped rather than rejected.
-  it("ignores a write-up the contract no longer asks for", () => {
+  const complete = {
+    file: "src/a.ts",
+    startLine: 4,
+    endLine: 6,
+    side: "RIGHT",
+    severity: "high",
+    category: "correctness",
+    title: "Off by one",
+    suggestedComment: "c",
+  };
+
+
+  // background and problem were a write-up nobody read. suggestedFix is not:
+  // it is often the useful part, so it is asked for and kept.
+  it("keeps the suggested fix and drops the write-up around it", () => {
     const { report, errors } = parseReport(
       JSON.stringify({
         summary: "s",
@@ -73,19 +85,24 @@ describe("parseReport", () => {
     );
     expect(errors).toEqual([]);
     expect(report?.findings[0]).not.toHaveProperty("problem");
+    expect(report?.findings[0]).not.toHaveProperty("background");
+    expect(report?.findings[0]?.suggestedFix).toBe("Use < instead of <=.");
     expect(report?.findings[0]?.suggestedComment).toBe("Could this be `<` rather than `<=`?");
   });
 
-  const complete = {
-    file: "src/a.ts",
-    startLine: 4,
-    endLine: 6,
-    side: "RIGHT",
-    severity: "high",
-    category: "correctness",
-    title: "Off by one",
-    suggestedComment: "c",
-  };
+  it("takes a snake_case suggested fix, and treats a missing one as empty", () => {
+    const { report } = parseReport(
+      JSON.stringify({
+        summary: "s",
+        findings: [
+          { ...complete, suggested_fix: "Hoist the call." },
+          { ...complete, title: "No fix offered" },
+        ],
+      }),
+    );
+    expect(report?.findings[0]?.suggestedFix).toBe("Hoist the call.");
+    expect(report?.findings[1]?.suggestedFix).toBe("");
+  });
 
   it("accepts the documented envelope", () => {
     const { report, errors } = parseReport(

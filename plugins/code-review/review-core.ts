@@ -39,6 +39,9 @@ export const findingSchema = z.object({
   title: z.string().trim().min(1),
   /** The gist, for the list view: at most a few sentences. */
   summary: z.string().trim(),
+  /** How the agent would fix it. Often the useful part; empty when it has no
+   *  concrete suggestion, which is better than a padded one. */
+  suggestedFix: z.string().trim(),
   /** Ready-to-post review comment text. The only field the PR author sees. */
   suggestedComment: z.string().trim().min(1),
   /** Other places in the repo this finding depends on or points at. */
@@ -109,6 +112,7 @@ export function normalizeFinding(input: unknown): unknown {
     category: firstString(row, ["category", "kind", "type"]),
     title: firstString(row, ["title", "headline"]),
     summary: firstString(row, ["summary", "gist", "shortDescription"]),
+    suggestedFix: firstString(row, ["suggestedFix", "suggested_fix", "fix"]),
     suggestedComment: firstString(row, [
       "suggestedComment",
       "suggested_comment",
@@ -209,6 +213,7 @@ export const FINDINGS_SCHEMA_TEXT = `{
       "category": "correctness",           // free-form, e.g. correctness, security, tests, naming
       "title": "Session token is compared non-constant-time",
       "summary": "The gist, for the list view. Two sentences at most.",
+      "suggestedFix": "How you would fix it. Omit when you have no concrete fix.",
       "suggestedComment": "The exact review comment text to post on the PR.",
       "references": [                      // code the reader should look at
         { "file": "src/server/session.ts",  // full repo-relative path here too
@@ -285,10 +290,15 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "`suggestedComment` is posted verbatim to GitHub, so write it as a review comment",
     "addressed to the PR author — not as a note to yourself.",
     "",
+    "`suggestedFix` is for the reviewer, not the author: how you would fix it, in a",
+    "sentence or two, or the change itself when it is small enough to show. Leave it",
+    "empty rather than padding it — no fix in mind is useful information.",
+    "",
     "## How to write the comment",
     "",
-    "It has to stand on its own: the reader has the diff and nothing else. There is",
-    "no other prose field — do not write a separate write-up of the finding anywhere.",
+    "It has to stand on its own: the reader has the diff and nothing else. Apart from",
+    "`suggestedFix`, there is no other prose field — do not write a separate write-up",
+    "of the finding anywhere.",
     "",
     "**Default to two or three sentences.** What is wrong, and the question you want",
     "answered. Nothing else:",

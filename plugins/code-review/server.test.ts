@@ -14,6 +14,7 @@ const FINDING = {
   severity: "high",
   category: "correctness",
   title: "Off by one",
+  suggestedFix: "Use < instead of <=.",
   suggestedComment: "Please fix the bound here.",
 };
 
@@ -1870,6 +1871,31 @@ describe("the panel's remembered state", () => {
       diffFile: null,
       diffUrl: null,
     });
+  });
+});
+
+describe("the suggested fix", () => {
+  it("survives a report round trip, column drop and all", async () => {
+    // The column was dropped by a shipped migration and re-added by
+    // ensureColumn, so a plain round trip is the thing worth asserting.
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    expect(finding?.suggestedFix).toBe("Use < instead of <=.");
+  });
+
+  it("comes back empty when the agent offered none, rather than failing", async () => {
+    const withoutFix = { ...FINDING };
+    delete (withoutFix as { suggestedFix?: string }).suggestedFix;
+    const host = await makeHost({ files: { "/w/f.json": report([withoutFix]) } });
+    const [finding] = await runReview(host);
+    expect(finding?.suggestedFix).toBe("");
+  });
+
+  it("asks the agent for it in the prompt and the schema", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(host.spawned[0]?.prompt).toContain("suggestedFix");
+    expect((await host.harness.behavior.runCli(["schema"])).stdout).toContain('"suggestedFix"');
   });
 });
 
