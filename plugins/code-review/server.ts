@@ -1460,49 +1460,50 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   // -------------------------------------------------------------------------
   // Discussing a finding
   // -------------------------------------------------------------------------
+  /**
+   * Talk an issue over with the agent that found it. The review thread already
+   * holds the PR snapshot, the diff, and its own reasoning, so the discussion
+   * goes there rather than into a thread of its own.
+   */
   async function discussFinding(findingId: string): Promise<string> {
-    const row = requireFinding(findingId);
-    if (row.discussion_thread_id !== null) {
-      // Reuse the existing conversation so "Discuss" is idempotent — unless
-      // the thread has since been deleted.
-      try {
-        await bb.sdk.threads.get({ threadId: row.discussion_thread_id });
-        return row.discussion_thread_id;
-      } catch {
-        db.prepare(`UPDATE findings SET discussion_thread_id = NULL WHERE id = ?`).run(findingId);
-      }
-    }
-    const finding = toFindingDto(row);
+    const finding = toFindingDto(requireFinding(findingId));
     const review = getReview(finding.reviewId);
     if (review === null) throw new Error(`No review for finding ${findingId}.`);
-    const projectId = await resolveProjectId(review.repo);
-    const thread = await bb.sdk.threads.spawn({
-      projectId,
-      environment: { type: "project-default" },
-      title: `${review.repo}#${review.number}: ${finding.title}`.slice(0, 120),
-      parentThreadId: review.thread_id ?? undefined,
-      prompt: buildDiscussionPrompt({
-        repo: review.repo,
-        number: review.number,
-        prTitle: review.title,
-        finding: {
-          file: finding.file,
-          startLine: finding.startLine,
-          endLine: finding.endLine,
-          title: finding.title,
-          background: finding.background,
-          problem: finding.problem,
-          suggestedFix: finding.suggestedFix,
-          suggestedComment: effectiveComment(finding),
+    if (review.thread_id === null) {
+      throw new Error("This review has no thread \u2014 re-run the review first.");
+    }
+    // A review thread that goes idle without submitting is marked failed, so a
+    // question asked mid-run would be read as the review giving up.
+    if (review.status === "running" || review.status === "queued") {
+      throw new Error("The review is still running \u2014 wait for it to finish, then discuss.");
+    }
+    await bb.sdk.threads.send({
+      threadId: review.thread_id,
+      mode: "auto",
+      input: [
+        {
+          type: "text",
+          // The prompt is prose, not a composer draft: no @-mentions in it.
+          mentions: [],
+          text: buildDiscussionPrompt({
+            repo: review.repo,
+            number: review.number,
+            prTitle: review.title,
+            finding: {
+              file: finding.file,
+              startLine: finding.startLine,
+              endLine: finding.endLine,
+              title: finding.title,
+              background: finding.background,
+              problem: finding.problem,
+              suggestedFix: finding.suggestedFix,
+              suggestedComment: effectiveComment(finding),
+            },
+          }),
         },
-      }),
+      ],
     });
-    db.prepare(`UPDATE findings SET discussion_thread_id = ? WHERE id = ?`).run(
-      thread.id,
-      findingId,
-    );
-    announce();
-    return thread.id;
+    return review.thread_id;
   }
 
   // -------------------------------------------------------------------------

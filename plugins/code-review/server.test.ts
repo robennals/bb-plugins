@@ -978,32 +978,60 @@ it("starts a pending review when asked and there is none", async () => {
 });
 
 describe("discussing a finding", () => {
-  it("spawns one thread, seeds it with the finding, and reuses it", async () => {
+  it("sends the finding into the review thread rather than spawning another", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     const [finding] = await runReview(host);
-    const first = await host.call<{ threadId: string }>("discussFinding", {
+    const result = await host.call<{ threadId: string }>("discussFinding", {
       findingId: finding?.id,
     });
-    const second = await host.call<{ threadId: string }>("discussFinding", {
-      findingId: finding?.id,
-    });
-    expect(second.threadId).toBe(first.threadId);
-    // One review thread plus exactly one discussion thread.
-    expect(host.spawned).toHaveLength(2);
-
-    const prompt = host.spawned[1]?.prompt ?? "";
-    expect(prompt).toContain("src/a.ts:10-12");
-    expect(prompt).toContain(FINDING.problem);
-    expect(prompt).toContain("Do not post anything to GitHub.");
-    expect(host.spawned[1]?.parentThreadId).toBe("thr_1");
+    expect(result.threadId).toBe("thr_1");
+    // The review thread and nothing else: the review agent already has the
+    // whole PR in context.
+    expect(host.spawned).toHaveLength(1);
+    expect(host.sent).toHaveLength(1);
+    expect(host.sent[0]?.threadId).toBe("thr_1");
+    // "auto" starts an idle thread and queues or steers a running one.
+    expect(host.sent[0]?.mode).toBe("auto");
+    expect(host.sent[0]?.text).toContain("src/a.ts:10-12");
+    expect(host.sent[0]?.text).toContain(FINDING.problem);
+    expect(host.sent[0]?.text).toContain("Do not post anything to GitHub.");
   });
 
-  it("seeds the discussion with the user's edit when there is one", async () => {
+  it("seeds the message with the user's edit when there is one", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     const [finding] = await runReview(host);
     await host.call("setFindingComment", { findingId: finding?.id, comment: "My wording." });
     await host.call("discussFinding", { findingId: finding?.id });
-    expect(host.spawned[1]?.prompt).toContain("My wording.");
+    expect(host.sent[0]?.text).toContain("My wording.");
+  });
+
+  it("refuses while the review is still running, so its idle is not misread", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    // A re-run deletes only open findings, so dismiss this one to keep it,
+    // then put the review back to running the way a re-run does.
+    await host.call("setFindingState", { findingId: finding?.id, state: "dismissed" });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    await expect(host.call("discussFinding", { findingId: finding?.id })).rejects.toThrow(
+      /still running/i,
+    );
+    expect(host.sent).toHaveLength(0);
+  });
+
+  it("says what to do when the review has no thread", async () => {
+    // A review whose thread never came up: the row is there, the findings can
+    // still be submitted, but there is nobody to ask.
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      spawnError: "no project",
+    });
+    await expect(host.call("startReview", { repo: REPO, number: 7 })).rejects.toThrow();
+    expect((await host.submit()).exitCode).toBe(0);
+    const [finding] = await host.findings();
+    await expect(host.call("discussFinding", { findingId: finding?.id })).rejects.toThrow(
+      /re-run the review/i,
+    );
+    expect(host.sent).toHaveLength(0);
   });
 });
 
