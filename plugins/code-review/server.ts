@@ -54,6 +54,7 @@ import {
   PR_LIST_LIMIT,
   PR_VIEW_JSON_FIELDS,
   severityRank,
+  reviewTabFor,
   SEVERITIES,
   patchLineChanges,
   splitUnifiedDiff,
@@ -315,47 +316,23 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ finding: findingSchemaDto }),
   },
+  /**
+   * Open a review that has already run: check its thread is alive, make sure
+   * that thread carries this review's tab, and hand it back for the panel to
+   * navigate to. Never starts a review — that is what startReview is for.
+   */
+  openReview: {
+    input: z.object({ repo: z.string(), number: z.number().int().positive() }),
+    output: z.object({ threadId: z.string(), review: reviewSchema }),
+  },
+  /** Which review a thread belongs to, for a tab opened from the launcher. */
+  getReviewForThread: {
+    input: z.object({ threadId: z.string() }),
+    output: z.object({ repo: z.string(), number: z.number() }).nullable(),
+  },
   askAboutFinding: {
     input: z.object({ findingId: z.string(), question: z.string().min(1) }),
     output: z.object({ threadId: z.string() }),
-  },
-  /** The review thread for a PR, for the panel's discussion tab. A cheap read:
-   *  it never touches GitHub, so the tab can follow the route as it changes. */
-  getReviewThread: {
-    input: z.object({ repo: z.string(), number: z.number().int().positive() }),
-    output: z.object({ threadId: z.string().nullable() }),
-  },
-  /**
-   * The pull request itself — description, conversation, and changed files —
-   * for the panel's own PR tab. Patches are fetched per file rather than
-   * inlined, so opening a PR does not ship its whole diff to the panel.
-   */
-  getPullRequestView: {
-    input: z.object({
-      repo: z.string(),
-      number: z.number().int().positive(),
-      /** Re-fetch from GitHub. Ignored for a reviewed pull request, whose
-       *  snapshot is pinned to the commit its findings were written against. */
-      refresh: z.boolean().optional(),
-    }),
-    output: z.object({
-      url: z.string(),
-      fetchedAt: z.string(),
-      /** False when the snapshot is newer than the review the findings came
-       *  from, so what is shown may not be what was reviewed. */
-      isReviewedCommit: z.boolean(),
-      snapshot: prSnapshotSchema,
-      /** Changed files that the stored diff actually carries a patch for. */
-      filesWithPatch: z.array(z.string()),
-    }),
-  },
-  getPullRequestPatch: {
-    input: z.object({
-      repo: z.string(),
-      number: z.number().int().positive(),
-      file: z.string(),
-    }),
-    output: z.object({ patch: z.string() }),
   },
   getFindingCode: {
     input: z.object({
@@ -1058,86 +1035,6 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     return pr !== undefined && awaitsReviewFrom(pr, await filterContext());
   }
 
-  /**
-   * Archive the threads of this repo's finished reviews.
-   *
-   * A review is finished when GitHub has stopped asking the viewer for it —
-   * which is what submitting a review does — or when the pull request is no
-   * longer open at all. Both are only observable when a repo's list is
-   * fetched, so the sweep runs then, and only over `repo`: switching the
-   * panel to another repo says nothing about the reviews in this one.
-   */
-  async function archiveFinishedReviewThreads(repo: string, prs: PullRequest[]): Promise<void> {
-    const rows = db
-      .prepare(`SELECT * FROM reviews WHERE repo = ? AND thread_archived_at IS NULL`)
-      .all(repo) as ReviewRow[];
-    if (rows.length === 0) return;
-    // A full page means there may be open pull requests past its end, so an
-    // absent one cannot be read as closed.
-    const listIsComplete = prs.length < PR_LIST_LIMIT;
-    const context = await filterContext();
-
-    for (const row of rows) {
-      // A review re-run between pressing the button and the new thread
-      // starting has no thread to archive.
-      const threadId = row.thread_id;
-      if (threadId === null) continue;
-      const pr = prs.find((candidate) => candidate.number === row.number);
-      const isFinished =
-        pr === undefined
-          ? listIsComplete
-          : row.awaited_me_at_start === 1 && !awaitsReviewFrom(pr, context);
-      if (!isFinished) continue;
-      try {
-        await bb.sdk.threads.archive({ threadId });
-      } catch (error) {
-        // A thread the user already deleted is just as archived as one this
-        // call archives, and neither is worth retrying on every refresh.
-        bb.log.warn(`could not archive ${threadId} for ${row.id}: ${String(error)}`);
-      }
-      db.prepare(`UPDATE reviews SET thread_archived_at = ? WHERE id = ?`).run(nowIso(), row.id);
-      bb.log.info(`archived the review thread for ${row.id}`);
-    }
-  }
-
-  /**
-   * The pull request as the panel's own PR tab shows it.
-   *
-   * A reviewed PR is served from the stored snapshot, so what you read is the
-   * commit the findings were written against. One you have not reviewed has no
-   * snapshot, so it is fetched — and marked as not being a reviewed commit,
-   * because nothing pins it.
-   */
-  async function pullRequestView(
-    repo: string,
-    number: number,
-    refresh: boolean,
-  ): Promise<{
-    url: string;
-    fetchedAt: string;
-    isReviewedCommit: boolean;
-    snapshot: PrSnapshot;
-    filesWithPatch: string[];
-  }> {
-    requireRepo(repo);
-    const context = await loadContext(repo, number, refresh);
-    return {
-      url: `https://github.com/${repo}/pull/${number}`,
-      fetchedAt: storedContextFetchedAt(reviewIdFor(repo, number)),
-      isReviewedCommit: context.atReviewStart,
-      snapshot: context.snapshot,
-      filesWithPatch: splitUnifiedDiff(context.diff).map((file) => file.path),
-    };
-  }
-
-  /** One file's patch, so opening a PR does not ship its whole diff. */
-  async function pullRequestPatch(repo: string, number: number, file: string): Promise<string> {
-    requireRepo(repo);
-    const context = await loadContext(repo, number);
-    const match = splitUnifiedDiff(context.diff).find((entry) => entry.path === file);
-    if (match === undefined) throw new Error(`${file} is not in this pull request's diff.`);
-    return match.patch;
-  }
 
   /** Attach this plugin's review state to the wire DTO. */
   function withReviewState(pr: PullRequest): PullRequestDto {
@@ -1325,10 +1222,6 @@ interface ContextRow {
         environment: { type: "project-default" },
         title: `Review ${repo}#${number}: ${title}`.slice(0, 120),
         prompt,
-        // The panel's discussion pane is the only way in, so the thread stays
-        // out of the sidebar's list rather than sitting among the ones the
-        // user started themselves.
-        visibility: "hidden",
       });
       touchReview(reviewId, { thread_id: thread.id, status: "running" });
       bb.log.info(`started review thread ${thread.id} for ${reviewId}`);
@@ -1342,6 +1235,68 @@ interface ContextRow {
     const row = getReview(reviewId);
     if (row === null) throw new Error(`review ${reviewId} disappeared`);
     return toReviewDto(row);
+  }
+
+  /**
+   * Make sure this review's tab is on its thread. The tab list is BB's, and
+   * another client may be writing it at the same time, so this is a
+   * compare-and-swap with one retry. Failing to write the tab must not fail
+   * the open: the review is reachable from the thread panel's own
+   * New tab -> Actions list either way.
+   */
+  async function ensureReviewTab(threadId: string, repo: string, number: number): Promise<void> {
+    const tab = reviewTabFor({ pluginId: bb.pluginId, repo, number });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const current = await bb.sdk.threads.tabs.get({ threadId });
+        if (current.tabs.some((entry) => entry.id === tab.id)) return;
+        await bb.sdk.threads.tabs.update({
+          threadId,
+          expectedRevision: current.revision,
+          tabs: [...current.tabs, tab],
+        });
+        return;
+      } catch (error) {
+        if (attempt === 1) {
+          bb.log.warn(`could not add the review tab to ${threadId}: ${String(error)}`);
+          return;
+        }
+      }
+    }
+  }
+
+  /** Is this thread still there? A deleted one cannot be opened. */
+  async function threadExists(threadId: string): Promise<boolean> {
+    try {
+      await bb.sdk.threads.get({ threadId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Open a review that has already run. This never starts an agent: pressing
+   * "Open review" must not cost a review run, and a pull request with no
+   * review offers "Start review" instead.
+   */
+  async function openReview(
+    repo: string,
+    number: number,
+  ): Promise<{ threadId: string; review: ReviewDto }> {
+    requireRepo(repo);
+    const existing = getReview(reviewIdFor(repo, number));
+    if (
+      existing === null ||
+      existing.thread_id === null ||
+      !(await threadExists(existing.thread_id))
+    ) {
+      throw new Error(
+        "This pull request has no review thread to open \u2014 start a new review instead.",
+      );
+    }
+    await ensureReviewTab(existing.thread_id, repo, number);
+    return { threadId: existing.thread_id, review: toReviewDto(existing) };
   }
 
   // -------------------------------------------------------------------------
@@ -2012,7 +1967,6 @@ interface ContextRow {
       requireRepo(repo);
       await checkAuth();
       const { prs, fetchedAt } = await fetchPullRequests(repo, refresh === true);
-      await archiveFinishedReviewThreads(repo, prs);
       const filtered = filterPullRequests(prs, filter, await filterContext());
       return {
         fetchedAt,
@@ -2041,7 +1995,10 @@ interface ContextRow {
 
     async startReview({ repo, number, skills }) {
       await checkAuth();
-      return { review: await startReview(repo, number, skills) };
+      const review = await startReview(repo, number, skills);
+      // The caller navigates to this thread next, so its tab has to be there.
+      if (review.threadId !== null) await ensureReviewTab(review.threadId, repo, number);
+      return { review };
     },
 
     setFindingComment({ findingId, comment }) {
@@ -2071,18 +2028,14 @@ interface ContextRow {
       return { threadId: await askAboutFinding(findingId, question) };
     },
 
-    getReviewThread({ repo, number }) {
-      return { threadId: getReview(reviewIdFor(repo, number))?.thread_id ?? null };
+    async openReview({ repo, number }) {
+      await checkAuth();
+      return openReview(repo, number);
     },
 
-    async getPullRequestView({ repo, number, refresh }) {
-      await checkAuth();
-      return pullRequestView(repo, number, refresh === true);
-    },
-
-    async getPullRequestPatch({ repo, number, file }) {
-      await checkAuth();
-      return { patch: await pullRequestPatch(repo, number, file) };
+    getReviewForThread({ threadId }) {
+      const row = getReviewByThread(threadId);
+      return row === null ? null : { repo: row.repo, number: row.number };
     },
 
     async getFindingCode({ findingId, context }) {
