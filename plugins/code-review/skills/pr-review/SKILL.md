@@ -56,12 +56,17 @@ Each finding has these parts, and they are not interchangeable:
 - **`summary`** — the gist, in at most two sentences. This is all the reviewer
   sees in the list, so it has to convey what is wrong on its own.
 
+- **`suggestedFix`** — how you would fix it, in a sentence or two, or the
+  change itself when it is small enough to show. This one is for the reviewer,
+  not the author. Leave it out when you have no concrete fix in mind: that is
+  useful information, and padding it is worse than an empty field.
+
 - **`suggestedComment`** — posted to GitHub verbatim. Write it *to the PR
   author*, not as a note to yourself: no "the user should", no restating what
   you did. See [Writing the comment](#writing-the-comment) below — it is the
   only field the author ever sees, so it has to stand on its own.
-- **`references`** — the code that backs the finding up, and the *only* place
-  context belongs: there is no prose field for a write-up. Each is
+- **`references`** — the code that backs the finding up, and the place context
+  belongs: apart from `suggestedFix`, there is no prose field for a write-up. Each is
   `{ file, startLine, endLine, note }`, where `note` is one line saying what
   the reader should look at there. The panel puts that code on screen beside
   the issue, so a reference saves the reviewer a lookup that would otherwise

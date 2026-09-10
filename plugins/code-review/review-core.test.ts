@@ -19,6 +19,7 @@ import {
   resolvePostAnchor,
   needsPathResolution,
   parseSkillList,
+  reviewTabFor,
   resolveCitedPath,
   splitUnifiedDiff,
   type PullRequest,
@@ -46,9 +47,21 @@ function pr(overrides: Partial<PullRequest>): PullRequest {
 }
 
 describe("parseReport", () => {
-  // Agents still write these — older prompts asked for them, and models pad —
-  // so they have to be dropped rather than rejected.
-  it("ignores a write-up the contract no longer asks for", () => {
+  const complete = {
+    file: "src/a.ts",
+    startLine: 4,
+    endLine: 6,
+    side: "RIGHT",
+    severity: "high",
+    category: "correctness",
+    title: "Off by one",
+    suggestedComment: "c",
+  };
+
+
+  // background and problem were a write-up nobody read. suggestedFix is not:
+  // it is often the useful part, so it is asked for and kept.
+  it("keeps the suggested fix and drops the write-up around it", () => {
     const { report, errors } = parseReport(
       JSON.stringify({
         summary: "s",
@@ -73,19 +86,24 @@ describe("parseReport", () => {
     );
     expect(errors).toEqual([]);
     expect(report?.findings[0]).not.toHaveProperty("problem");
+    expect(report?.findings[0]).not.toHaveProperty("background");
+    expect(report?.findings[0]?.suggestedFix).toBe("Use < instead of <=.");
     expect(report?.findings[0]?.suggestedComment).toBe("Could this be `<` rather than `<=`?");
   });
 
-  const complete = {
-    file: "src/a.ts",
-    startLine: 4,
-    endLine: 6,
-    side: "RIGHT",
-    severity: "high",
-    category: "correctness",
-    title: "Off by one",
-    suggestedComment: "c",
-  };
+  it("takes a snake_case suggested fix, and treats a missing one as empty", () => {
+    const { report } = parseReport(
+      JSON.stringify({
+        summary: "s",
+        findings: [
+          { ...complete, suggested_fix: "Hoist the call." },
+          { ...complete, title: "No fix offered" },
+        ],
+      }),
+    );
+    expect(report?.findings[0]?.suggestedFix).toBe("Hoist the call.");
+    expect(report?.findings[1]?.suggestedFix).toBe("");
+  });
 
   it("accepts the documented envelope", () => {
     const { report, errors } = parseReport(
@@ -986,5 +1004,39 @@ describe("patchLineChanges", () => {
       added: [1],
       removals: [{ afterLine: 0, lines: ["old"] }],
     });
+  });
+});
+
+describe("reviewTabFor", () => {
+  it("builds a plugin-panel tab BB's own tab schema accepts", () => {
+    const tab = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    expect(tab).toEqual({
+      id: "code-review-review-acme-app-7",
+      kind: "plugin-panel",
+      pluginId: "code-review",
+      actionId: "review",
+      title: "Code review",
+      paramsJson: JSON.stringify({ repo: "acme/app", number: 7 }),
+    });
+  });
+
+  it("gives one review one stable id, so a repeat install is recognisable", () => {
+    const first = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    const again = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    expect(again.id).toBe(first.id);
+  });
+
+  it("gives two reviews different ids, so they are two tabs", () => {
+    const seven = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 7 });
+    const eight = reviewTabFor({ pluginId: "code-review", repo: "acme/app", number: 8 });
+    const other = reviewTabFor({ pluginId: "code-review", repo: "acme/other", number: 7 });
+    expect(new Set([seven.id, eight.id, other.id]).size).toBe(3);
+  });
+
+  it("keeps the id safe for a repo whose name has odd characters", () => {
+    const tab = reviewTabFor({ pluginId: "code-review", repo: "Acme.Corp/my_app", number: 12 });
+    expect(tab.id).toBe("code-review-review-acme-corp-my-app-12");
+    // The params keep the real repo; only the id is slugged.
+    expect(JSON.parse(tab.paramsJson)).toEqual({ repo: "Acme.Corp/my_app", number: 12 });
   });
 });

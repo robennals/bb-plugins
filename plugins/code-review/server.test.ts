@@ -14,6 +14,7 @@ const FINDING = {
   severity: "high",
   category: "correctness",
   title: "Off by one",
+  suggestedFix: "Use < instead of <=.",
   suggestedComment: "Please fix the bound here.",
 };
 
@@ -67,6 +68,8 @@ async function makeHost(
     missingThreadIds?: string[];
     /** Makes `threads.archive` fail with this message. */
     archiveError?: string;
+    /** How many leading `tabs.update` calls reject with a revision conflict. */
+    tabUpdateConflicts?: number;
   } = {},
 ) {
   const calls: ShellCall[] = [];
@@ -125,6 +128,11 @@ async function makeHost(
     ...options.ghOverrides,
   };
 
+  /** The tab list of each thread, as BB would hold it. */
+  const tabs = new Map<string, { revision: number; tabs: Record<string, unknown>[] }>();
+  /** Counts down: how many more `tabs.update` calls reject on revision. */
+  let tabUpdateConflicts = options.tabUpdateConflicts ?? 0;
+
   const { bb, harness } = createFakePluginHost({
     pluginId: "code-review",
     settings: { defaultProject: "proj_test", reviewSkills: "code-review", repos: REPO },
@@ -140,13 +148,35 @@ async function makeHost(
             parentThreadId: args.parentThreadId ?? null,
             visibility: args.visibility ?? null,
           });
-          return makeThreadResponse({ id: `thr_${spawned.length}` });
+          const id = `thr_${spawned.length}`;
+          tabs.set(id, { revision: 1, tabs: [] });
+          return makeThreadResponse({ id });
         },
         get: async ({ threadId }: { threadId: string }) => {
           if (options.missingThreadIds?.includes(threadId) === true) {
             throw new Error(`no such thread: ${threadId}`);
           }
           return makeThreadResponse({ id: threadId, environmentId: null });
+        },
+        tabs: {
+          get: async ({ threadId }: { threadId: string }) =>
+            tabs.get(threadId) ?? { revision: 1, tabs: [] },
+          update: async (args: {
+            threadId: string;
+            expectedRevision: number;
+            tabs: Record<string, unknown>[];
+          }) => {
+            const current = tabs.get(args.threadId) ?? { revision: 1, tabs: [] };
+            if (tabUpdateConflicts > 0) {
+              tabUpdateConflicts -= 1;
+              // Someone else wrote in between: bump the revision and reject.
+              tabs.set(args.threadId, { ...current, revision: current.revision + 1 });
+              throw new Error("revision mismatch");
+            }
+            if (args.expectedRevision !== current.revision) throw new Error("revision mismatch");
+            tabs.set(args.threadId, { revision: current.revision + 1, tabs: args.tabs });
+            return { revision: current.revision + 1, tabs: args.tabs };
+          },
         },
         archive: async ({ threadId }: { threadId: string }) => {
           if (options.archiveError !== undefined) throw new Error(options.archiveError);
@@ -211,9 +241,19 @@ async function makeHost(
   const listPullRequests = (repo = REPO) =>
     call("listPullRequests", { repo, filter: { kind: "all" }, refresh: true });
 
+  const tabsOf = (threadId: string) => tabs.get(threadId)?.tabs ?? [];
+
+  /** Put tabs the user opened themselves in front of the plugin's own. */
+  const seedTabs = (threadId: string, extra: Record<string, unknown>[]) => {
+    const current = tabs.get(threadId) ?? { revision: 1, tabs: [] };
+    tabs.set(threadId, { revision: current.revision, tabs: [...extra, ...current.tabs] });
+  };
+
   return {
     bb,
     harness,
+    tabsOf,
+    seedTabs,
     calls,
     spawned,
     sent,
@@ -1026,187 +1066,112 @@ describe("asking about a finding", () => {
   });
 });
 
-describe("the review thread a PR's discussion pane shows", () => {
-  it("is the thread of the current run, and null before there is one", async () => {
-    const host = await makeHost({ files: { "/w/f.json": report() } });
-    expect(await host.call("getReviewThread", { repo: REPO, number: 7 })).toEqual({
-      threadId: null,
-    });
-    await runReview(host);
-    expect(await host.call("getReviewThread", { repo: REPO, number: 7 })).toEqual({
-      threadId: "thr_1",
-    });
-  });
-});
-
-describe("the pull request tab's view", () => {
-  // The panel's own tab replaces a shared BB browser tab, so it has to be
-  // able to show a PR nobody has reviewed yet.
-  it("fetches a pull request that has no stored snapshot", async () => {
+describe("opening a review", () => {
+  it("refuses to open a PR that has never been reviewed", async () => {
+    // Opening must never start an agent run: that is what Start review is for.
     const host = await makeHost();
-    const view = await host.call<{
-      isReviewedCommit: boolean;
-      snapshot: { title: string; body: string; files: Array<{ path: string }> };
-      filesWithPatch: string[];
-      url: string;
-    }>("getPullRequestView", { repo: REPO, number: 7 });
-    expect(view.snapshot.title).toBe("Add a thing");
-    expect(view.snapshot.body).toBe("Why this change exists.");
-    expect(view.snapshot.files.map((file) => file.path)).toEqual(["src/a.ts"]);
-    expect(view.filesWithPatch).toEqual(["src/a.ts"]);
-    expect(view.url).toBe("https://github.com/acme/app/pull/7");
-    // Nothing pins it, so it is not the commit any finding was written against.
-    expect(view.isReviewedCommit).toBe(false);
+    await expect(host.call("openReview", { repo: REPO, number: 7 })).rejects.toThrow(
+      /start a new review/i,
+    );
+    expect(host.spawned).toHaveLength(0);
   });
 
-  it("serves a reviewed pull request from the snapshot the review used", async () => {
+  it("refuses to open a review whose thread has been deleted", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() }, missingThreadIds: ["thr_1"] });
+    await runReview(host);
+    await expect(host.call("openReview", { repo: REPO, number: 7 })).rejects.toThrow(
+      /start a new review/i,
+    );
+    expect(host.spawned).toHaveLength(1);
+  });
+
+  it("reuses a finished review's thread instead of running the agent again", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     await runReview(host);
-    const before = host.calls.length;
-    const view = await host.call<{ isReviewedCommit: boolean }>("getPullRequestView", {
+    const opened = await host.call<{ threadId: string }>("openReview", { repo: REPO, number: 7 });
+    expect(opened.threadId).toBe("thr_1");
+    expect(host.spawned).toHaveLength(1);
+  });
+
+  it("puts the review tab on the thread it starts, so Start review lands on it", async () => {
+    const host = await makeHost();
+    const { review } = await host.call<{ review: ReviewDto }>("startReview", {
       repo: REPO,
       number: 7,
     });
-    expect(view.isReviewedCommit).toBe(true);
-    // Served from storage: reading a reviewed PR costs no GitHub calls beyond
-    // the auth check.
-    expect(host.calls.slice(before).some((call) => call.args.includes("view"))).toBe(false);
+    expect(review.threadId).toBe("thr_1");
+    expect(host.tabsOf("thr_1")).toEqual([
+      {
+        id: "code-review-review-acme-app-7",
+        kind: "plugin-panel",
+        pluginId: "code-review",
+        actionId: "review",
+        title: "Code review",
+        paramsJson: JSON.stringify({ repo: REPO, number: 7 }),
+      },
+    ]);
   });
 
-  // The findings' line numbers are resolved against the stored diff, so
-  // replacing it would move the code out from under comments already written.
-  it("refuses to refresh over a reviewed snapshot", async () => {
+  it("keeps the tabs already on the thread, appending its own after them", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    // A terminal the user opened themselves must survive the open.
+    host.seedTabs("thr_1", [{ id: "t1", kind: "terminal", terminalId: "term_1" }]);
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1").map((tab) => tab.kind)).toEqual(["terminal", "plugin-panel"]);
+  });
+
+  it("writes the tab once, however many times the review is opened", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     await runReview(host);
-    const before = host.calls.length;
-    const view = await host.call<{ isReviewedCommit: boolean }>("getPullRequestView", {
-      repo: REPO,
-      number: 7,
-      refresh: true,
-    });
-    expect(view.isReviewedCommit).toBe(true);
-    expect(host.calls.slice(before).some((call) => call.args.includes("view"))).toBe(false);
+    await host.call("openReview", { repo: REPO, number: 7 });
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1")).toHaveLength(1);
   });
 
-  it("refreshes a pull request that has not been reviewed", async () => {
-    const host = await makeHost();
-    await host.call("getPullRequestView", { repo: REPO, number: 7 });
-    const before = host.calls.length;
-    await host.call("getPullRequestView", { repo: REPO, number: 7, refresh: true });
-    expect(host.calls.slice(before).some((call) => call.args.includes("view"))).toBe(true);
+  it("retries once when someone else changed the tabs in between", async () => {
+    const host = await makeHost({ tabUpdateConflicts: 1 });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1")).toHaveLength(1);
   });
 
-  it("serves one file's patch, and says when a file is not in the diff", async () => {
-    const host = await makeHost();
-    const { patch } = await host.call<{ patch: string }>("getPullRequestPatch", {
+  it("still starts the review when the tab cannot be written at all", async () => {
+    const host = await makeHost({ tabUpdateConflicts: 5 });
+    const { review } = await host.call<{ review: ReviewDto }>("startReview", {
       repo: REPO,
       number: 7,
-      file: "src/a.ts",
     });
-    expect(patch).toContain("@@ -1,20 +1,20 @@");
-    await expect(
-      host.call("getPullRequestPatch", { repo: REPO, number: 7, file: "src/gone.ts" }),
-    ).rejects.toThrow(/not in this pull request's diff/);
+    // A missing tab is cosmetic; losing the review would not be.
+    expect(review.threadId).toBe("thr_1");
+    expect(host.tabsOf("thr_1")).toHaveLength(0);
+  });
+
+  it("tells the tab which review a thread belongs to", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(await host.call("getReviewForThread", { threadId: "thr_1" })).toEqual({
+      repo: REPO,
+      number: 7,
+    });
+    expect(await host.call("getReviewForThread", { threadId: "thr_other" })).toBeNull();
   });
 });
 
 describe("the review thread's own lifecycle", () => {
-  it("is spawned hidden, so it does not join the user's own threads", async () => {
+  it("is an ordinary visible thread, because it is where the work happens", async () => {
     const host = await makeHost();
     await host.call("startReview", { repo: REPO, number: 7 });
-    expect(host.spawned[0]?.visibility).toBe("hidden");
+    // Hidden would keep it out of the sidebar, and out of reach.
+    expect(host.spawned[0]?.visibility).toBeNull();
   });
 
-  it("archives once GitHub stops asking the viewer — which is what submitting does", async () => {
+  it("is never archived under the user, however the review ends", async () => {
     const host = await makeHost({ files: { "/w/f.json": report() } });
     await runReview(host);
-    // Still requested: nothing to clean up yet.
-    await host.listPullRequests();
-    expect(host.archived).toEqual([]);
-
-    host.setPullRequests([{ ...PR, reviewRequests: [] }]);
-    await host.listPullRequests();
-    expect(host.archived).toEqual(["thr_1"]);
-
-    // Archiving is recorded, so a later refresh does not repeat it.
-    await host.listPullRequests();
-    expect(host.archived).toEqual(["thr_1"]);
-  });
-
-  it("archives when the pull request is no longer open", async () => {
-    const host = await makeHost({ files: { "/w/f.json": report() } });
-    await runReview(host);
-    host.setPullRequests([]);
-    await host.listPullRequests();
-    expect(host.archived).toEqual(["thr_1"]);
-  });
-
-  // Reviewed from "All open" rather than because anyone asked: there is no
-  // request to lose, so losing one cannot be the signal that it is finished.
-  it("leaves a review nobody asked for alone", async () => {
-    const host = await makeHost({
-      files: { "/w/f.json": report() },
-      prs: [{ ...PR, reviewRequests: [] }],
-    });
-    await runReview(host);
-    await host.listPullRequests();
-    expect(host.archived).toEqual([]);
-  });
-
-  // A full page may have open pull requests past its end, so an absent one
-  // is not evidence that it closed.
-  it("does not read a truncated pull request list as pull requests closing", async () => {
-    const host = await makeHost({ files: { "/w/f.json": report() } });
-    await runReview(host);
-    host.setPullRequests(
-      Array.from({ length: 100 }, (_, index) => ({ ...PR, number: 100 + index })),
-    );
-    await host.listPullRequests();
-    expect(host.archived).toEqual([]);
-  });
-
-  it("skips a review that is between runs and has no thread", async () => {
-    const host = await makeHost({ files: { "/w/f.json": report() } });
-    await runReview(host);
-    // The state a re-run leaves a review in until its new thread starts.
-    host.bb.storage.database().prepare(`UPDATE reviews SET thread_id = NULL`).run();
-    host.setPullRequests([]);
-    await host.listPullRequests();
-    expect(host.archived).toEqual([]);
-  });
-
-  it("does not retry archiving a thread that has already been deleted", async () => {
-    const host = await makeHost({
-      files: { "/w/f.json": report() },
-      archiveError: "no such thread",
-    });
-    await runReview(host);
-    host.setPullRequests([{ ...PR, reviewRequests: [] }]);
-    await host.listPullRequests();
-    await host.listPullRequests();
-    // Recorded as dealt with regardless: a deleted thread needs no archiving,
-    // and every later refresh would otherwise call again and fail again.
-    expect(
-      host.bb.storage
-        .database()
-        .prepare(`SELECT thread_archived_at FROM reviews WHERE id = ?`)
-        .get(REVIEW_ID),
-    ).toEqual({ thread_archived_at: expect.any(String) });
-  });
-
-  // The panel's repo picker changes what you are looking at, not what is true
-  // about the repo you looked away from.
-  it("sweeps only the repo whose list was fetched", async () => {
-    const host = await makeHost({ files: { "/w/f.json": report() } });
-    await runReview(host);
-    // acme/other has no open pull requests at all. An unscoped sweep would
-    // read that as acme/app's reviewed PR having closed too.
-    host.setPullRequests([]);
-    await host.listPullRequests("acme/other");
-    expect(host.archived).toEqual([]);
-
-    await host.listPullRequests(REPO);
-    expect(host.archived).toEqual(["thr_1"]);
+    // The PR list is where the old sweep ran; refreshing it must not touch
+    // a thread the user may be standing in.
+    await host.call("listPullRequests", { repo: REPO, filter: { kind: "all" }, refresh: true });
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([]);
   });
 });
 
@@ -1873,6 +1838,31 @@ describe("the panel's remembered state", () => {
   });
 });
 
+describe("the suggested fix", () => {
+  it("survives a report round trip, column drop and all", async () => {
+    // The column was dropped by a shipped migration and re-added by
+    // ensureColumn, so a plain round trip is the thing worth asserting.
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    expect(finding?.suggestedFix).toBe("Use < instead of <=.");
+  });
+
+  it("comes back empty when the agent offered none, rather than failing", async () => {
+    const withoutFix = { ...FINDING };
+    delete (withoutFix as { suggestedFix?: string }).suggestedFix;
+    const host = await makeHost({ files: { "/w/f.json": report([withoutFix]) } });
+    const [finding] = await runReview(host);
+    expect(finding?.suggestedFix).toBe("");
+  });
+
+  it("asks the agent for it in the prompt and the schema", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(host.spawned[0]?.prompt).toContain("suggestedFix");
+    expect((await host.harness.behavior.runCli(["schema"])).stdout).toContain('"suggestedFix"');
+  });
+});
+
 describe("registrations", () => {
   it("registers the panel's data plane, the CLI, and the idle handler", async () => {
     const { harness } = await makeHost();
@@ -1885,7 +1875,8 @@ describe("registrations", () => {
       "setFindingState",
       "postFinding",
       "askAboutFinding",
-      "getReviewThread",
+      "openReview",
+      "getReviewForThread",
     ]) {
       expect(harness.registrations.rpcMethods).toContain(method);
     }
@@ -1899,6 +1890,10 @@ describe("registrations", () => {
     ]);
     for (const method of ["getFindingCode", "getPanelState", "setPanelState"]) {
       expect(harness.registrations.rpcMethods).toContain(method);
+    }
+    // The four-view side tab is gone, and so is the data plane only it used.
+    for (const method of ["getReviewThread", "getPullRequestView", "getPullRequestPatch"]) {
+      expect(harness.registrations.rpcMethods).not.toContain(method);
     }
     expect(harness.registrations.threadEventHandlers["thread.idle"]).toBe(1);
   });
