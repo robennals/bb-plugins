@@ -3,41 +3,24 @@ import { promisify } from "node:util";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { hostContract } from "./contract.js";
 import { pullRequestSourceRef } from "./git-ref.js";
+import { mergedPullRequestQuery, openPullRequestQuery, pullRequestSearchArgs } from "./pr-search.js";
 import { classifyPullRequest, latestCheckRuns, normalizeCheck, summarizePullRequest, type RollupEntry } from "./pr-status.js";
 import { sortPullRequests } from "./pr-list.js";
 
 const execFileAsync = promisify(execFile);
-interface SearchResult { number: number; title: string; url: string; isDraft: boolean; createdAt: string; updatedAt: string; repository: { nameWithOwner: string } }
 interface Actor { __typename: string; login?: string; slug?: string }
 interface RollupContext extends RollupEntry { __typename: string; checkSuite?: { workflowRun?: { workflow?: { name?: string } } } }
+interface StatusCheckRollup { state?: string; contexts: { totalCount: number; nodes: RollupContext[] } }
 interface PrView {
   number: number; title: string; url: string; state: string; isDraft: boolean; headRefName: string; baseRefName: string;
   reviewDecision: string | null; createdAt: string; updatedAt: string; mergedAt: string | null;
-  author: { login: string } | null;
+  repository: { nameWithOwner: string };
+  author: Actor | null;
   reviewRequests: { nodes: Array<{ requestedReviewer: Actor | null }> };
   reviews: { nodes: Array<{ state: string; submittedAt: string; author: Actor | null }> };
   comments: { nodes: Array<{ createdAt: string; author: Actor | null }> };
-  commits: { nodes: Array<{ commit: { statusCheckRollup: { contexts: { nodes: RollupContext[] } } | null } }> };
+  commits: { nodes: Array<{ commit: { statusCheckRollup: StatusCheckRollup | null } }> };
 }
-// One query per pull request, covering everything the classifier needs. `gh pr view
-// --json` cannot report an actor's __typename, so it cannot tell a bot's comment from a
-// reviewer's, which decides whether a PR counts as having unaddressed feedback.
-const PR_QUERY = `query($owner:String!,$name:String!,$number:Int!){
-  repository(owner:$owner,name:$name){
-    pullRequest(number:$number){
-      number title url state isDraft headRefName baseRefName reviewDecision createdAt updatedAt mergedAt
-      author{login}
-      reviewRequests(first:50){nodes{requestedReviewer{__typename ... on User{login} ... on Team{slug} ... on Bot{login}}}}
-      reviews(last:50){nodes{state submittedAt author{__typename login}}}
-      comments(last:50){nodes{createdAt author{__typename login}}}
-      commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
-        __typename
-        ... on CheckRun{name status conclusion startedAt checkSuite{workflowRun{workflow{name}}}}
-        ... on StatusContext{context state createdAt}
-      }}}}}}
-    }
-  }
-}`;
 const actorName = (actor: Actor | null): string => actor?.login ?? actor?.slug ?? "";
 const isBot = (actor: Actor | null): boolean => actor?.__typename === "Bot";
 async function run(command: string, args: string[], signal: AbortSignal): Promise<string> {
@@ -49,14 +32,23 @@ async function run(command: string, args: string[], signal: AbortSignal): Promis
     throw new Error(`${command} failed: ${error.stderr?.trim() || error.message}`);
   }
 }
-async function mapConcurrent<T, R>(values: T[], limit: number, mapper: (value: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(values.length); let cursor = 0;
-  async function worker() { while (cursor < values.length) { const index = cursor++; results[index] = await mapper(values[index]!); } }
-  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
-  return results;
+async function search(query: string, limit: number, signal: AbortSignal): Promise<PrView[]> {
+  const parsed = JSON.parse(await run("gh", pullRequestSearchArgs(query, limit), signal)) as
+    { data: { search: { nodes: Array<Partial<PrView>> } } };
+  // `type: ISSUE` is the only search type that returns pull requests, so a node that is
+  // a plain issue comes back as the empty half of the inline fragment.
+  return parsed.data.search.nodes.filter((node): node is PrView => typeof node.number === "number");
 }
-async function search(args: string[], signal: AbortSignal): Promise<SearchResult[]> {
-  return JSON.parse(await run("gh", ["search", "prs", "--author=@me", ...args, "--json", "number,title,url,repository,createdAt,updatedAt,isDraft"], signal)) as SearchResult[];
+function rollupEntries(rollup: StatusCheckRollup | null | undefined): RollupContext[] {
+  if (!rollup) return [];
+  // A head commit with more than one page of contexts would otherwise be classified from
+  // the first page alone, hiding a failure further down. The rollup's own state covers
+  // every context, so when the page is short one synthetic entry stands in for the rest —
+  // cheaper, and less fragile, than paginating a connection per pull request.
+  const truncated = rollup.contexts.totalCount > rollup.contexts.nodes.length;
+  return truncated
+    ? [...rollup.contexts.nodes, { __typename: "StatusContext", context: "(checks beyond the first page)", state: rollup.state }]
+    : rollup.contexts.nodes;
 }
 function normalizeRemote(remote: string): string | null {
   const cleaned = remote.trim().replace(/\.git$/, "").replace(/^ssh:\/\//, "");
@@ -69,19 +61,15 @@ export default experimental_defineHostEntry({
       await run("gh", ["auth", "status"], context.signal);
       const since = new Date(Date.now() - mergedWithinDays * 86_400_000).toISOString().slice(0, 10);
       const [open, merged] = await Promise.all([
-        search(["--state=open", "--sort=updated", "--order=desc", `--limit=${maximumPullRequests}`], context.signal),
-        search(["--merged", `--merged-at=>=${since}`, "--sort=updated", "--order=desc", `--limit=${maximumPullRequests}`], context.signal),
+        search(openPullRequestQuery(), maximumPullRequests, context.signal),
+        search(mergedPullRequestQuery(since), maximumPullRequests, context.signal),
       ]);
       const unique = [...new Map([...open, ...merged].map((pr) => [pr.url, pr])).values()];
-      const pullRequests = await mapConcurrent(unique, 6, async (result) => {
-        const repository = result.repository.nameWithOwner;
-        const [owner, name] = repository.split("/");
-        const response = JSON.parse(await run("gh", ["api", "graphql", "-F", `owner=${owner}`, "-F", `name=${name}`,
-          "-F", `number=${result.number}`, "-f", `query=${PR_QUERY}`], context.signal)) as { data: { repository: { pullRequest: PrView } } };
-        const view = response.data.repository.pullRequest;
+      const pullRequests = unique.map((view) => {
+        const repository = view.repository.nameWithOwner;
         const requestedReviewers = view.reviewRequests.nodes
           .map((request) => actorName(request.requestedReviewer)).filter((reviewer) => reviewer !== "");
-        const rollup = view.commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? [];
+        const rollup = rollupEntries(view.commits.nodes[0]?.commit.statusCheckRollup);
         const input = { state: view.state, mergedAt: view.mergedAt, isDraft: view.isDraft, reviewDecision: view.reviewDecision ?? "",
           author: actorName(view.author), requestedReviewers,
           reviews: view.reviews.nodes.map((review) => ({ author: actorName(review.author), isBot: isBot(review.author), state: review.state, submittedAt: review.submittedAt })),
