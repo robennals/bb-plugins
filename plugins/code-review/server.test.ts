@@ -508,6 +508,10 @@ describe("startReview", () => {
     expect(review.threadId).toBe("thr_1");
     expect(review.skills).toEqual(["code-review"]);
 
+    // The repo is the thread's project already, so the title spends its first
+    // characters on what tells one review thread apart from the next.
+    expect(spawned[0]?.title).toBe("Review #7 - Add a thing");
+
     const prompt = spawned[0]?.prompt ?? "";
     expect(prompt).toContain(`bb code-review submit --review ${REVIEW_ID}`);
     expect(prompt).toContain(review.findingsPath as string);

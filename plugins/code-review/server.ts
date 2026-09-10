@@ -1220,7 +1220,9 @@ interface ContextRow {
       const thread = await bb.sdk.threads.spawn({
         projectId,
         environment: { type: "project-default" },
-        title: `Review ${repo}#${number}: ${title}`.slice(0, 120),
+        // The repo is already the thread's project, so the title spends its
+        // first characters on what tells one review thread apart from the next.
+        title: `Review #${number} - ${title}`.slice(0, 120),
         prompt,
       });
       touchReview(reviewId, { thread_id: thread.id, status: "running" });
