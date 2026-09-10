@@ -1413,9 +1413,21 @@ interface ContextRow {
       const id = raw.trim();
       return id === "" ? null : id;
     } catch (error) {
-      // Without this lookup the post still works whenever there is no pending
-      // review, which is the common case; do not fail the post over it.
-      bb.log.warn(`could not look up a pending review on ${repo}#${number}: ${String(error)}`);
+      // What a failed lookup should mean is the caller's decision: guessing
+      // "there is none" is harmless for a badge and harmful when the answer
+      // decides whether to open a second draft.
+      throw new Error(
+        `could not look up a pending review on ${repo}#${number}: ${String(error)}`,
+      );
+    }
+  }
+
+  /** The same lookup for callers that can live with an unknown answer. */
+  async function tolerantPendingReviewId(repo: string, number: number): Promise<string | null> {
+    try {
+      return await pendingReviewId(repo, number);
+    } catch (error) {
+      bb.log.warn(String(error));
       return null;
     }
   }
@@ -1456,15 +1468,38 @@ interface ContextRow {
     return ghField(raw, "html_url");
   }
 
+  /**
+   * Open the shared draft — unless one appeared between the lookup and now, in
+   * which case join it. Two drafts on one pull request split the reviewer's
+   * comments in half, and GitHub gives them no way to merge the halves.
+   */
+  async function startOrJoinPendingReview(
+    repo: string,
+    number: number,
+    finding: FindingDto,
+    anchor: PostAnchor,
+    body: string,
+  ): Promise<string> {
+    try {
+      return await startPendingReview(repo, number, finding, anchor, body);
+    } catch (error) {
+      const raced = await tolerantPendingReviewId(repo, number);
+      if (raced === null) throw error;
+      return await addToPendingReview(raced, finding, anchor, body);
+    }
+  }
+
   // One lookup per PR view would be a network call on every render, so hold
-  // the answer briefly. Posting clears it, since posting changes it.
+  // the answer briefly. This is for display only — posting asks GitHub afresh,
+  // because a cached "no draft" that the user has since contradicted by
+  // clicking "Start a review" would make the plugin open a second draft.
   const pendingReviewCache = new Map<string, { id: string | null; at: number }>();
 
   async function cachedPendingReviewId(repo: string, number: number): Promise<string | null> {
     const key = reviewIdFor(repo, number);
     const cached = pendingReviewCache.get(key);
     if (cached !== undefined && Date.now() - cached.at < 30_000) return cached.id;
-    const id = await pendingReviewId(repo, number);
+    const id = await tolerantPendingReviewId(repo, number);
     pendingReviewCache.set(key, { id, at: Date.now() });
     return id;
   }
@@ -1549,8 +1584,23 @@ interface ContextRow {
     const attachable = anchor.kind !== "pull-request";
 
     // A reviewer with a review already open in the GitHub UI cannot have a
-    // standalone comment created; the comment has to join that review.
-    const pending = attachable ? await cachedPendingReviewId(review.repo, review.number) : null;
+    // standalone comment created; the comment has to join that review. Ask
+    // GitHub now rather than reuse the panel's cached answer, which can predate
+    // the user clicking "Start a review" on GitHub seconds ago.
+    const mightOpenDraft = anchor.kind === "line" && mode === "review";
+    let pending: string | null = null;
+    if (attachable) {
+      try {
+        pending = await pendingReviewId(review.repo, review.number);
+      } catch (error) {
+        // Guessing "no draft" is safe when the fallback is a standalone
+        // comment: GitHub rejects that outright if a draft does exist. It is
+        // not safe when the fallback opens a draft, because a wrong guess
+        // leaves the reviewer with two of them.
+        if (mightOpenDraft) throw error;
+        bb.log.warn(String(error));
+      }
+    }
 
     let url: string;
     let postedAs: "comment" | "pending-review";
@@ -1560,7 +1610,7 @@ interface ContextRow {
       url =
         pending !== null
           ? await addToPendingReview(pending, finding, anchor, body)
-          : await startPendingReview(review.repo, review.number, finding, anchor, body);
+          : await startOrJoinPendingReview(review.repo, review.number, finding, anchor, body);
       postedAs = "pending-review";
     } else {
       const raw = await gh(

@@ -80,7 +80,8 @@ async function makeHost(
   /** Mutable, so a test can break a gh call after the review has already run. */
   const failures: Record<string, string> = { ...options.ghFailures };
 
-  const gh: Record<string, string> = {
+  /** A stub is a fixed answer, or a function when a test needs it to change. */
+  const gh: Record<string, string | (() => string)> = {
     "--version": "gh version 2.83.1",
     "auth status": "Logged in",
     "auth token": "gho_x",
@@ -216,7 +217,8 @@ async function makeHost(
         .sort((a, b) => b.length - a.length)
         .find((prefix) => joined.startsWith(prefix));
       if (key === undefined) throw new Error(`unstubbed command: ${file} ${joined}`);
-      return { stdout: gh[key] as string, stderr: "" };
+      const answer = gh[key] ?? "";
+      return { stdout: typeof answer === "function" ? answer() : answer, stderr: "" };
     },
   });
 
@@ -231,6 +233,11 @@ async function makeHost(
 
   const review = async () =>
     (await call<{ review: ReviewDto }>("getPullRequest", { repo: REPO, number: 7 })).review;
+
+  /** Change what a gh call answers, the way GitHub changes underneath. */
+  const setGh = (prefix: string, stdout: string | (() => string)) => {
+    gh[prefix] = stdout;
+  };
 
   /** Change what `gh pr list` answers, the way GitHub changes underneath. */
   const setPullRequests = (next: unknown[]) => {
@@ -260,6 +267,7 @@ async function makeHost(
     archived,
     failures,
     call,
+    setGh,
     submit,
     findings,
     review,
@@ -928,6 +936,57 @@ it("starts a pending review when asked and there is none", async () => {
     expect(
       host.calls.some((entry) => entry.args.join(" ").includes("addPullRequestReviewThread")),
     ).toBe(true);
+  });
+
+  it("joins a review started on GitHub since the panel last looked", async () => {
+    // The panel's cached answer is minutes old by the time the user posts, and
+    // acting on it would open a second draft the reviewer cannot merge back.
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("getPullRequest", { repo: REPO, number: 7 });
+    host.setGh("api graphql -f query=query", PENDING_ID);
+    const posted = await host.call<{ finding: FindingDto }>("postFinding", {
+      findingId: finding?.id,
+      mode: "review",
+    });
+    expect(posted.finding.postedAs).toBe("pending-review");
+    expect(
+      host.calls.some((entry) => entry.args.includes("repos/acme/app/pulls/7/reviews")),
+    ).toBe(false);
+  });
+
+  it("joins a review that appeared while it was opening one", async () => {
+    // Two reviewers of the same PR is one reviewer on two surfaces: the draft
+    // can appear between the lookup and the create.
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    let raced = false;
+    host.setGh("api graphql -f query=query", () => (raced ? PENDING_ID : ""));
+    host.setGh("api -X POST repos/acme/app/pulls/7/reviews", () => {
+      raced = true;
+      throw new Error("422 one pending review per pull request");
+    });
+    const [finding] = await runReview(host);
+    const posted = await host.call<{ finding: FindingDto }>("postFinding", {
+      findingId: finding?.id,
+      mode: "review",
+    });
+    expect(posted.finding.postedAs).toBe("pending-review");
+    expect(
+      host.calls.some((entry) => entry.args.join(" ").includes("addPullRequestReviewThread")),
+    ).toBe(true);
+  });
+
+  it("refuses to open a review when it cannot check for one", async () => {
+    // Better to make the user retry than to hand them two drafts.
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      ghFailures: { "api graphql -f query=query": "500" },
+    });
+    const [finding] = await runReview(host);
+    await expect(
+      host.call("postFinding", { findingId: finding?.id, mode: "review" }),
+    ).rejects.toThrow(/could not look up a pending review/);
+    expect((await host.findings())[0]?.state).toBe("open");
   });
 
   it("tells the panel when a review is already open", async () => {
