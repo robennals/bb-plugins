@@ -4,6 +4,7 @@
   "name": "robennals-bb-plugins",
   "plugins": [
     { "name": "code-review", "source": "./plugins/code-review" },
+    { "name": "file-browser", "source": "./plugins/file-browser" },
     { "name": "pr-manager", "source": "./plugins/pr-manager" }
   ]
 }
