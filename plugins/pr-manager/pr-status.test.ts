@@ -16,12 +16,21 @@ describe("classifyPullRequest", () => {
   it("uses the intended status priority", () => {
     expect(classifyPullRequest(base({ mergedAt: "2026-08-20T10:00:00Z", checks: [{ status: "COMPLETED", conclusion: "FAILURE" }] }))).toBe("MERGED");
     expect(classifyPullRequest(base({ reviews: [review("danielbachhuber", "CHANGES_REQUESTED")], requestedReviewers: [], checks: [{ status: "COMPLETED", conclusion: "FAILURE" }] }))).toBe("FAILING");
-    expect(classifyPullRequest(base({ reviews: [review("danielbachhuber", "CHANGES_REQUESTED")], requestedReviewers: [], isDraft: true }))).toBe("FEEDBACK");
+    expect(classifyPullRequest(base({ reviews: [review("danielbachhuber", "CHANGES_REQUESTED")], requestedReviewers: [] }))).toBe("FEEDBACK");
     expect(classifyPullRequest(base({ isDraft: true, reviews: [review("octocat", "APPROVED")] }))).toBe("DRAFT");
     expect(classifyPullRequest(base({ reviews: [review("octocat", "APPROVED")], requestedReviewers: [] }))).toBe("APPROVED");
     expect(classifyPullRequest(base({ reviews: [review("octocat", "APPROVED")], requestedReviewers: ["hubot"] }))).toBe("PART_APPROVED");
     expect(classifyPullRequest(base())).toBe("WAITING");
     expect(classifyPullRequest(base({ requestedReviewers: [], reviewDecision: "" }))).toBe("OPEN");
+  });
+  // A draft is work in progress, so it stays out of the statuses that head the list
+  // however noisy it is: nothing is owed to a reviewer until it is marked ready.
+  it("keeps a draft in DRAFT whatever feedback or checks say", () => {
+    expect(classifyPullRequest(base({ isDraft: true, reviews: [review("danielbachhuber", "CHANGES_REQUESTED")], requestedReviewers: [] }))).toBe("DRAFT");
+    expect(classifyPullRequest(base({ isDraft: true, comments: [comment("danielbachhuber", "2026-08-19T22:00:00Z")] }))).toBe("DRAFT");
+    expect(classifyPullRequest(base({ isDraft: true, checks: [{ status: "COMPLETED", conclusion: "FAILURE" }] }))).toBe("DRAFT");
+    // Merged still wins: a draft cannot be merged, but a merged PR must never read DRAFT.
+    expect(classifyPullRequest(base({ isDraft: true, mergedAt: "2026-08-20T10:00:00Z" }))).toBe("MERGED");
   });
   it("part-approves when one reviewer has approved and another is still requested", () => {
     const input = base({ reviews: [review("octocat", "APPROVED")], requestedReviewers: ["hubot"] });

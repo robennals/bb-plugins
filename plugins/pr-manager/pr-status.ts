@@ -94,9 +94,12 @@ export function unaddressedFeedbackFrom(input: PullRequestStatusInput): string[]
 
 export function classifyPullRequest(input: PullRequestStatusInput): PullRequestStatus {
   if (input.state === "MERGED" || input.mergedAt !== null) return "MERGED";
+  // A draft outranks every status but MERGED. Failing checks and unanswered feedback on
+  // work that is not yet ready for review are the author's own business, and letting them
+  // through puts pull requests nobody is working on at the head of the list.
+  if (input.isDraft) return "DRAFT";
   if (input.checks.some((check) => FAILING_CONCLUSIONS.has(check.conclusion))) return "FAILING";
   if (unaddressedFeedbackFrom(input).length > 0) return "FEEDBACK";
-  if (input.isDraft) return "DRAFT";
   if (isApproved(input)) return input.requestedReviewers.length === 0 ? "APPROVED" : "PART_APPROVED";
   return input.requestedReviewers.length > 0 ? "WAITING" : "OPEN";
 }
