@@ -70,15 +70,10 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
     <article className={cn("rounded-lg border border-border bg-card px-4 py-3 shadow-sm",
       pr.status === "APPROVED" && "border-emerald-500/40 bg-emerald-500/5 ring-1 ring-emerald-500/20")}>
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <StatusBadge status={pr.status} />
-            <span className="text-xs text-muted-foreground">{pr.repository} #{pr.number}</span>
-            {pr.isDraft ? <span className="text-xs text-muted-foreground">Draft</span> : null}
-          </div>
-          <h2 className="mt-1.5 text-sm font-medium leading-5 text-foreground">{pr.title}</h2>
-          <p className="mt-1 text-xs text-muted-foreground">{pr.summary}</p>
-          <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{pr.headRefName} → {pr.baseRefName}</p>
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <StatusBadge status={pr.status} />
+          <span className="text-xs text-muted-foreground">{pr.repository} #{pr.number}</span>
+          {pr.isDraft ? <span className="text-xs text-muted-foreground">Draft</span> : null}
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-1.5">
           {pr.threadId !== null && pr.projectId !== null ? (
@@ -98,6 +93,9 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
           </Button>
         </div>
       </div>
+      <h2 className="mt-1.5 text-sm font-medium leading-5 text-foreground">{pr.title}</h2>
+      <p className="mt-1 text-xs text-muted-foreground">{pr.summary}</p>
+      <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{pr.headRefName} → {pr.baseRefName}</p>
       {pr.threadId === null && pr.projectId === null ? (
         <p className="mt-2 text-xs text-muted-foreground">Add this repository as a BB project to create a worktree and thread.</p>
       ) : pr.threadId !== null ? (
