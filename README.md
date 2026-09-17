@@ -8,10 +8,11 @@ Personal plugins for the [BB](https://getbb.app) IDE. Each plugin lives under
 | [file-browser](plugins/file-browser) | Browse a workspace's files, highlighted by what the current branch changed, with a File/Diff toggle per file against the commit the branch forked from. |
 | [code-review](plugins/code-review) | List the PRs awaiting your review, run your review skills on one, and post the findings to GitHub comment by comment. |
 | [pr-manager](plugins/pr-manager) | Track your own open PRs and recent merges, summarised as FAILING / FEEDBACK / DRAFT / OPEN / APPROVED / PART_APPROVED / WAITING / MERGED, with links to matching BB threads. |
+| [branch-pr](plugins/branch-pr) | Open the GitHub pull request for the current thread's branch as a tab in the side panel, from the thread header, the command palette, or the panel's Actions list. |
 
-`code-review` and `pr-manager` need a connected BB machine with the GitHub CLI
-installed and authenticated (`gh auth login`); `file-browser` needs only `git`
-on the machine holding the workspace.
+`code-review`, `pr-manager` and `branch-pr` need a connected BB machine with
+the GitHub CLI installed and authenticated (`gh auth login`); `file-browser`
+needs only `git` on the machine holding the workspace.
 
 ## Installing
 
@@ -21,6 +22,7 @@ Each plugin installs on its own, by name:
 bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin file-browser
 bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin code-review
 bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin pr-manager
+bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin branch-pr
 ```
 
 `--plugin <name>` resolves against `.bb/plugins.json`; `--subdirectory
