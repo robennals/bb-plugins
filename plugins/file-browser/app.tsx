@@ -12,11 +12,11 @@ import { toast } from "sonner";
 // frame instead of flashing empty while the extended registry loads.
 import "@/components/ui/icon-extended";
 import { formatRoute, parseRoute, sameScope, type ScopeRef } from "@/lib/route";
+import { readLastScope, readSession } from "@/lib/session";
 import type { rpcContract } from "./server.js";
 import { Browser } from "./components/Browser";
 
 const PANEL_PATH = "files";
-const LAST_SCOPE_KEY = "file-browser:last-scope";
 
 /**
  * The full-page browser. The route carries both the workspace and the open
@@ -48,7 +48,10 @@ function FilesPage({ subPath }: PluginNavPanelProps) {
       .then((next) => {
         if (cancelled || next === null) return;
         navigate.toPluginPanel(PANEL_PATH, {
-          subPath: formatRoute(next, null),
+          // With the file you last had open in this workspace, so arriving from
+          // the sidebar resumes rather than restarts. Replaced, not pushed:
+          // the empty route is not somewhere Back should return you to.
+          subPath: formatRoute(next, readSession(next)?.filePath ?? null),
           replace: true,
         });
         setFallback(next);
@@ -63,10 +66,6 @@ function FilesPage({ subPath }: PluginNavPanelProps) {
   }, [context.projectId, context.threadId, navigate, route.scope, rpc]);
 
   const scope = route.scope ?? fallback;
-
-  useEffect(() => {
-    if (scope !== null) storeLastScope(scope);
-  }, [scope]);
 
   const onOpenPath = useCallback(
     (path: string | null) => {
@@ -88,13 +87,19 @@ function FilesPage({ subPath }: PluginNavPanelProps) {
 
   const onChangeScope = useCallback(
     (next: ScopeRef) => {
-      navigate.toPluginPanel(PANEL_PATH, { subPath: formatRoute(next, null) });
+      navigate.toPluginPanel(PANEL_PATH, {
+        subPath: formatRoute(next, readSession(next)?.filePath ?? null),
+      });
     },
     [navigate],
   );
 
   return (
     <Browser
+      // Keyed on the workspace, so switching one re-seeds the browser from that
+      // workspace's remembered session instead of carrying the previous one's
+      // unfolded folders across.
+      key={scope === null ? "none" : `${scope.kind}:${scope.id}`}
       scope={scope}
       filePath={route.filePath}
       onOpenPath={onOpenPath}
@@ -109,8 +114,12 @@ function FilesPage({ subPath }: PluginNavPanelProps) {
  * files the agent in this conversation is actually editing.
  */
 function ThreadFilesPanel({ threadId }: PluginThreadPanelProps) {
-  const [filePath, setFilePath] = useState<string | null>(null);
   const scope = useMemo<ScopeRef>(() => ({ kind: "thread", id: threadId }), [threadId]);
+  // A side panel has no route to carry the open file, so it comes back from the
+  // remembered session — the same record the Files page reads.
+  const [filePath, setFilePath] = useState<string | null>(
+    () => readSession(scope)?.filePath ?? null,
+  );
 
   return (
     <Browser
@@ -120,37 +129,6 @@ function ThreadFilesPanel({ threadId }: PluginThreadPanelProps) {
       variant="panel"
     />
   );
-}
-
-/**
- * Anything can be in localStorage — a value this plugin wrote two versions ago,
- * or something another script put under the key — so it is narrowed field by
- * field rather than trusted.
- */
-function readLastScope(): ScopeRef | null {
-  try {
-    const raw = window.localStorage.getItem(LAST_SCOPE_KEY);
-    if (raw === null) return null;
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return null;
-    const record: Record<string, unknown> = { ...parsed };
-    const { kind, id } = record;
-    if (typeof id !== "string" || id === "") return null;
-    if (kind !== "thread" && kind !== "environment" && kind !== "project") {
-      return null;
-    }
-    return { kind, id };
-  } catch {
-    return null;
-  }
-}
-
-function storeLastScope(scope: ScopeRef): void {
-  try {
-    window.localStorage.setItem(LAST_SCOPE_KEY, JSON.stringify(scope));
-  } catch {
-    // Storage can be unavailable; the next visit just starts from the thread.
-  }
 }
 
 export default definePluginApp((app) => {

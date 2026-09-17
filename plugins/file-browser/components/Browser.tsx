@@ -10,6 +10,7 @@ import { cn, formatHomePathForDisplay } from "@/lib/utils";
 import { EMPTY_CHANGE_INDEX, indexChanges, type ChangeIndex } from "@/lib/changes";
 import type { FlatEntry } from "@/lib/tree";
 import type { ScopeRef } from "@/lib/route";
+import { readSession, saveSession } from "@/lib/session";
 import type { ResolvedScope, rpcContract } from "../server.js";
 import { Explorer } from "./Explorer";
 import { QuickOpen } from "./QuickOpen";
@@ -80,6 +81,11 @@ export function Browser({
   const [explorerWidth, setExplorerWidth] = useState(readStoredWidth);
   const [isExplorerOpen, setIsExplorerOpen] = useState(true);
   const [isQuickOpen, setIsQuickOpen] = useState(false);
+  // Seeded from the last visit to THIS workspace. The page variant is keyed on
+  // the workspace by its caller, so a fresh workspace remounts and re-seeds.
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(
+    () => new Set(readSession(scope)?.expanded ?? []),
+  );
   const [mode, setMode] = useState<ViewMode>("source");
   const [diffView, setDiffView] = useState<DiffViewMode>(() =>
     readFlag(DIFF_VIEW_KEY, false) ? "split" : "unified",
@@ -191,6 +197,14 @@ export function Browser({
     [onOpenPath, variant],
   );
 
+  // Remember where you were, so leaving and coming back does not land you on a
+  // collapsed tree with an empty pane. Written on every change rather than on
+  // unmount, because a panel can be torn down without one.
+  useEffect(() => {
+    if (scopeKind === null || scopeId === null) return;
+    saveSession({ kind: scopeKind, id: scopeId }, { filePath, expanded: [...expanded] });
+  }, [expanded, filePath, scopeId, scopeKind]);
+
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const isAccel = event.metaKey || event.ctrlKey;
     if (isAccel && event.key.toLowerCase() === "p" && !event.shiftKey) {
@@ -290,6 +304,8 @@ export function Browser({
                 store(CHANGED_ONLY_KEY, next ? "true" : "false");
               }}
               activePath={filePath}
+              expanded={expanded}
+              setExpanded={setExpanded}
               isLoading={tree.status === "loading"}
               error={tree.error}
               truncated={tree.truncated}

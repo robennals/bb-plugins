@@ -34,6 +34,11 @@ against the commit the branch forked from.
   can read the diff of something the branch removed.
 - **⌘P go-to-file**, a search box that prunes the tree, a dotfile toggle, and a
   resizable explorer.
+- **It remembers where you were.** Leaving the Files page or closing the thread
+  tab and coming back restores the file you had open and the folders you had
+  unfolded, per workspace — so switching between two worktrees keeps a separate
+  place in each. The search box is deliberately not remembered: it is a way of
+  finding something, not a place to come back to.
 - **`bb file-browser`** gives an agent the same two answers from the CLI.
 
 All three viewers are BB's own — the source renderer, the diff renderer and the
@@ -83,6 +88,18 @@ palette, and the CLI.
 above. Set it to `develop`, `trunk`, or whatever your repository uses when
 detection gets it wrong; a name that does not exist is reported rather than
 silently replaced.
+
+## What is remembered, and where
+
+Per workspace: the open file and the unfolded folders. Globally: the explorer
+width, the dotfile toggle, the changed-files filter, and inline vs
+side-by-side. All of it is browser-local — one `localStorage` record holding
+the 24 most recently browsed workspaces, so the worktrees you have finished
+with fall off the end rather than accumulating for ever.
+
+The view mode is *not* remembered; each file lands on its preferred view as
+described above. A remembered file that has since been deleted opens on the
+viewer's "could not read" notice.
 
 ## Dotfiles
 
