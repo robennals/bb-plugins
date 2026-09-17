@@ -16,6 +16,9 @@ const pullRequestSchema = z.object({
   isDraft: z.boolean(), headRefName: z.string(), baseRefName: z.string(),
   createdAt: z.string(), updatedAt: z.string(), mergedAt: z.string().nullable(), projectId: z.string().nullable(),
   projectName: z.string().nullable(), threadId: z.string().nullable(), threadTitle: z.string().nullable(),
+  // Unarchiving is broken in BB, so an archived thread cannot be worked in. It is
+  // still worth linking to, but the PR needs a fresh thread.
+  threadArchived: z.boolean().default(false),
 });
 export type PullRequest = z.infer<typeof pullRequestSchema>;
 
@@ -36,10 +39,11 @@ export const rpcContract = defineRpcContract({
     output: z.object({ repositoryFilter: repositoryFilterSchema, sortOrder: sortOrderSchema }),
   },
   // Returns null when the PR has no live thread, so the caller knows to ask for
-  // instructions and create one instead of navigating to a dead thread.
+  // instructions and create one instead of navigating to a dead thread. An archived
+  // thread is reported with `archived: true`, which also means a new one is needed.
   prs_resolve_thread: {
     input: z.object({ repository: z.string(), number: z.number().int().positive() }),
-    output: z.object({ threadId: z.string().nullable() }),
+    output: z.object({ threadId: z.string().nullable(), archived: z.boolean() }),
   },
   prs_create_thread: {
     input: z.object({
@@ -128,6 +132,7 @@ export default async function plugin(bb: BbPluginApi) {
         ...pr, key: `${pr.repository}#${pr.number}`, projectId: project?.id ?? null,
         projectName: project?.name ?? null, threadId: thread?.id ?? null,
         threadTitle: thread?.title ?? thread?.titleFallback ?? null,
+        threadArchived: thread !== null && thread.archivedAt !== null,
       });
     }
     const repositoryFilter = cached.repositoryFilter !== null && prs.some((pr) => pr.repository === cached.repositoryFilter)
@@ -138,13 +143,13 @@ export default async function plugin(bb: BbPluginApi) {
     return result;
   }
 
-  async function resolveExistingThread(repository: string, number: number): Promise<string | null> {
+  async function resolveLinkedThread(repository: string, number: number): Promise<{ threadId: string; archived: boolean } | null> {
     const existing = (await readCachedPullRequests()).prs.find((candidate) =>
       candidate.repository === repository && candidate.number === number);
     if (existing?.threadId === null || existing?.threadId === undefined) return null;
     try {
       const thread = await bb.sdk.threads.get({ threadId: existing.threadId });
-      return thread.status === "error" ? null : existing.threadId;
+      return thread.status === "error" ? null : { threadId: existing.threadId, archived: thread.archivedAt !== null };
     } catch {
       // A missing thread is stale linkage. Report it as absent so a replacement is provisioned.
       return null;
@@ -162,7 +167,10 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(PR_LIST_CACHE_KEY, { ...cached, repositoryFilter: repository, sortOrder });
       return { repositoryFilter: repository, sortOrder };
     },
-    prs_resolve_thread: async ({ repository, number }) => ({ threadId: await resolveExistingThread(repository, number) }),
+    prs_resolve_thread: async ({ repository, number }) => {
+      const linked = await resolveLinkedThread(repository, number);
+      return { threadId: linked?.threadId ?? null, archived: linked?.archived ?? false };
+    },
     prs_create_thread: async (input) => {
       const projects = await bb.sdk.projects.list();
       const project = projects.find((candidate) => candidate.id === input.projectId);
@@ -170,8 +178,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (normalizeGitHubRepository(project.gitRemoteUrl) !== input.repository.toLowerCase()) {
         throw new Error("The selected project does not match this pull request repository.");
       }
-      const alreadyLinked = await resolveExistingThread(input.repository, input.number);
-      if (alreadyLinked !== null) return { threadId: alreadyLinked };
+      // An archived link is not reusable, so it does not block creating a replacement.
+      const alreadyLinked = await resolveLinkedThread(input.repository, input.number);
+      if (alreadyLinked !== null && !alreadyLinked.archived) return { threadId: alreadyLinked.threadId };
 
       const source = project.sources.find((candidate) => candidate.isDefault) ?? project.sources[0];
       if (source === undefined) throw new Error("The matching BB project has no workspace source.");
@@ -194,7 +203,7 @@ export default async function plugin(bb: BbPluginApi) {
         await bb.storage.kv.set(PR_LIST_CACHE_KEY, {
           ...cached,
           prs: cached.prs.map((pr) => pr.repository === input.repository && pr.number === input.number
-            ? { ...pr, threadId: thread.id, threadTitle: thread.title ?? thread.titleFallback ?? null }
+            ? { ...pr, threadId: thread.id, threadTitle: thread.title ?? thread.titleFallback ?? null, threadArchived: false }
             : pr),
         });
       }

@@ -53,14 +53,14 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally { setCreating(false); }
   };
-  // The linked thread may have been deleted since the list was cached. Ask the
-  // server before navigating, and fall back to creating a replacement.
+  // The linked thread may have been deleted or archived since the list was cached.
+  // Ask the server before navigating, and fall back to creating a replacement.
   const openThread = async () => {
     if (creating) return;
     setCreating(true); setError(null);
     try {
-      const { threadId } = await rpc.call("prs_resolve_thread", { repository: pr.repository, number: pr.number });
-      if (threadId !== null) navigate.toThread(threadId);
+      const { threadId, archived } = await rpc.call("prs_resolve_thread", { repository: pr.repository, number: pr.number });
+      if (threadId !== null && !archived) navigate.toThread(threadId);
       else setAskingInstructions(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -76,7 +76,20 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
           {pr.isDraft ? <span className="text-xs text-muted-foreground">Draft</span> : null}
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-          {pr.threadId !== null && pr.projectId !== null ? (
+          {pr.threadId !== null && pr.threadArchived ? (
+            // An archived thread cannot be worked in until BB can unarchive it, so the
+            // main action is a fresh thread and the old one is only a place to look back at.
+            <>
+              {pr.projectId !== null && pr.status !== "MERGED" && !askingInstructions ? (
+                <Button size="sm" onClick={() => setAskingInstructions(true)}>
+                  <Icon name="GitBranch" className="size-4" />Create thread
+                </Button>
+              ) : null}
+              <Button size="sm" variant="outline" onClick={() => navigate.toThread(pr.threadId!)}>
+                <Icon name="Archive" className="size-4" />Archived thread
+              </Button>
+            </>
+          ) : pr.threadId !== null && pr.projectId !== null ? (
             <Button size="sm" onClick={() => void openThread()} disabled={creating}>
               <Icon name={creating ? "Loading" : "MessageSquare"} className={cn("size-4", creating && "animate-spin")} />
               {creating ? "Opening…" : "Open thread"}
@@ -99,7 +112,9 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
       {pr.threadId === null && pr.projectId === null ? (
         <p className="mt-2 text-xs text-muted-foreground">Add this repository as a BB project to create a worktree and thread.</p>
       ) : pr.threadId !== null ? (
-        <p className="mt-2 text-xs text-muted-foreground">Thread: {pr.threadTitle ?? pr.threadId}</p>
+        <p className="mt-2 text-xs text-muted-foreground">
+          {pr.threadArchived ? "Archived thread" : "Thread"}: {pr.threadTitle ?? pr.threadId}
+        </p>
       ) : null}
       {error === null ? null : <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
       {askingInstructions ? (
