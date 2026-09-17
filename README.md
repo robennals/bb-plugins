@@ -9,10 +9,12 @@ Personal plugins for the [BB](https://getbb.app) IDE. Each plugin lives under
 | [code-review](plugins/code-review) | List the PRs awaiting your review, run your review skills on one, and post the findings to GitHub comment by comment. |
 | [pr-manager](plugins/pr-manager) | Track your own open PRs and recent merges, summarised as FAILING / FEEDBACK / DRAFT / OPEN / APPROVED / PART_APPROVED / WAITING / MERGED, with links to matching BB threads. |
 | [branch-pr](plugins/branch-pr) | Open the GitHub pull request for the current thread's branch as a tab in the side panel, from the thread header, the command palette, or the panel's Actions list. |
+| [tab-manager](plugins/tab-manager) | Edit the tabs in a thread's right-hand panel: close one, close everything below it, close them all, or reorder them. |
 
 `code-review`, `pr-manager` and `branch-pr` need a connected BB machine with
 the GitHub CLI installed and authenticated (`gh auth login`); `file-browser`
-needs only `git` on the machine holding the workspace.
+needs only `git` on the machine holding the workspace, and `tab-manager` needs
+neither.
 
 ## Installing
 
@@ -23,6 +25,7 @@ bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin 
 bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin code-review
 bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin pr-manager
 bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin branch-pr
+bb plugin install git:https://github.com/robennals/bb-plugins.git@main --plugin tab-manager
 ```
 
 `--plugin <name>` resolves against `.bb/plugins.json`; `--subdirectory
