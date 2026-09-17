@@ -20,7 +20,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --config vitest.config.ts",
-    "coverage": "vitest run --config vitest.config.ts --coverage.enabled --coverage.include='lib/changes.ts' --coverage.include='lib/git-changes.ts' --coverage.reporter=text"
+    "coverage": "vitest run --config vitest.config.ts --coverage.enabled --coverage.include='lib/changes.ts' --coverage.include='lib/git-changes.ts' --coverage.include='lib/markdown.ts' --coverage.include='lib/view-mode.ts' --coverage.reporter=text"
   },
   "dependencies": {
     "@hugeicons/core-free-icons": "^4.1.3",

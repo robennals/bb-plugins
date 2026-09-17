@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Markdown as BbMarkdown,
   experimental_Diff as BbDiff,
   experimental_SourceCode as BbSourceCode,
   useRpc,
@@ -8,10 +9,9 @@ import {
 import { cn } from "@/lib/utils";
 import type { ChangedPath } from "../contract.js";
 import type { ScopeRef } from "@/lib/route";
+import { splitFrontmatter } from "@/lib/markdown";
+import type { ViewMode } from "@/lib/view-mode";
 import type { rpcContract } from "../server.js";
-
-/** What the middle pane is showing. */
-export type ViewMode = "source" | "diff";
 
 type FileState =
   | { status: "loading" }
@@ -45,9 +45,10 @@ export interface ViewerProps {
 }
 
 /**
- * The file pane. Both renderers are BB's own — the source viewer and the diff
- * viewer the rest of the app uses — so highlighting, the code theme, and the
- * diff's expand-context controls come for free and stay consistent with it.
+ * The file pane. All three renderers are BB's own — the source viewer, the diff
+ * viewer, and the chat-message markdown renderer the rest of the app uses — so
+ * highlighting, the code theme, the diff's expand-context controls and the
+ * prose typography come for free and stay consistent with it.
  */
 export function Viewer({
   scope,
@@ -57,7 +58,11 @@ export function Viewer({
   change,
   baseCommit,
 }: ViewerProps) {
-  const file = useFileContents(scope, path, mode === "source");
+  const file = useFileContents(
+    scope,
+    path,
+    mode === "source" || mode === "preview",
+  );
   const diff = useDiff(scope, path, change, baseCommit, mode === "diff");
 
   if (mode === "diff") {
@@ -109,6 +114,8 @@ export function Viewer({
             className="max-h-full max-w-full object-contain"
           />
         </div>
+      ) : mode === "preview" ? (
+        <MarkdownPreview content={file.content} />
       ) : (
         <BbSourceCode
           content={file.content}
@@ -118,6 +125,37 @@ export function Viewer({
         />
       )}
     </Scroll>
+  );
+}
+
+/**
+ * A markdown file read as prose. The width is capped at a reading measure and
+ * centred, because a rendered document at the full width of a wide pane is the
+ * one thing that makes a preview worse than the source it replaced.
+ */
+function MarkdownPreview({ content }: { content: string }) {
+  const { frontmatter, body } = useMemo(
+    () => splitFrontmatter(content),
+    [content],
+  );
+
+  return (
+    <div className="mx-auto w-full max-w-[52rem] px-6 py-5">
+      {frontmatter === null ? null : (
+        <pre className="mb-5 overflow-x-auto rounded-md border border-border bg-surface-recessed px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre text-muted-foreground">
+          {frontmatter}
+        </pre>
+      )}
+      {body.trim() === "" ? (
+        <p className="text-sm text-muted-foreground">
+          {frontmatter === null
+            ? "This file is empty."
+            : "This file is frontmatter only."}
+        </p>
+      ) : (
+        <BbMarkdown content={body} />
+      )}
+    </div>
   );
 }
 

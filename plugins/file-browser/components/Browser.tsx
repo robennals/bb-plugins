@@ -13,7 +13,14 @@ import type { ScopeRef } from "@/lib/route";
 import type { ResolvedScope, rpcContract } from "../server.js";
 import { Explorer } from "./Explorer";
 import { QuickOpen } from "./QuickOpen";
-import { Viewer, type ViewMode } from "./Viewer";
+import {
+  availableModes,
+  preferredMode,
+  resolveMode,
+  type ViewMode,
+  type ViewModes,
+} from "@/lib/view-mode";
+import { Viewer } from "./Viewer";
 import { WorkspacePicker } from "./WorkspacePicker";
 
 interface TreeState {
@@ -138,23 +145,50 @@ export function Browser({
 
   const change = filePath === null ? null : tree.changes.byPath.get(filePath) ?? null;
   const hasFork = tree.changes.baseCommit !== null;
+  const { canPreview, canDiff } = availableModes({
+    path: filePath,
+    isChanged: change !== null,
+    hasFork,
+  });
+  // Rebuilt every render, so hold it steady on its VALUES for the effect below.
+  const modes = useMemo<ViewModes>(
+    () => ({ canPreview, canDiff }),
+    [canDiff, canPreview],
+  );
 
-  // Opening an unchanged file in diff mode would show nothing but a "not
-  // changed" notice, so fall back to source and let the toggle offer the diff.
+  // One rule for what the pane shows, applied wherever the file came from — an
+  // explorer click, ⌘P, or a link pasted into the address bar:
+  //
+  // - A file arriving in the pane lands on its preferred view: the diff when
+  //   the branch changed it, else the preview when it is markdown, else source.
+  // - The file already open keeps the view YOU chose for as long as it fits,
+  //   and falls back only when it stops fitting (git's answer was refreshed and
+  //   the diff went away).
+  //
+  // Nothing is decided until the tree has answered, because "changed" is not
+  // known before that and a file would otherwise never land on its diff.
+  const defaultedFor = useRef<string | null>(null);
+  const areChangesKnown = tree.status === "ready";
+  // Keyed on the workspace too: the same README in another worktree is another
+  // file, and it deserves its own landing view.
+  const openKey = filePath === null ? null : `${scopeKind}:${scopeId}:${filePath}`;
   useEffect(() => {
-    if (mode === "diff" && filePath !== null && change === null) setMode("source");
-  }, [change, filePath, mode]);
+    if (openKey === null || !areChangesKnown) return;
+    if (defaultedFor.current !== openKey) {
+      defaultedFor.current = openKey;
+      setMode(preferredMode(modes));
+      return;
+    }
+    setMode((current) => resolveMode(current, modes));
+  }, [areChangesKnown, modes, openKey]);
 
   const openFile = useCallback(
     (path: string) => {
       onOpenPath(path);
-      // A changed file is almost always opened to see WHAT changed; an
-      // unchanged one has no diff to show.
-      setMode(tree.changes.byPath.has(path) ? "diff" : "source");
       if (variant === "panel") setIsExplorerOpen(false);
       requestAnimationFrame(() => rootRef.current?.focus({ preventScroll: true }));
     },
-    [onOpenPath, tree.changes.byPath, variant],
+    [onOpenPath, variant],
   );
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -307,10 +341,10 @@ export function Browser({
                 <ModeToggle
                   mode={mode}
                   onChange={setMode}
+                  modes={modes}
                   // Nothing to diff: no fork point, or git says this file is
                   // the same as it was there.
-                  isDiffAvailable={hasFork && change !== null}
-                  unavailableReason={
+                  noDiffReason={
                     tree.changes.unavailable ??
                     (change === null
                       ? "This file is unchanged on this branch."
@@ -402,13 +436,13 @@ export function Browser({
 function ModeToggle({
   mode,
   onChange,
-  isDiffAvailable,
-  unavailableReason,
+  modes,
+  noDiffReason,
 }: {
   mode: ViewMode;
   onChange: (mode: ViewMode) => void;
-  isDiffAvailable: boolean;
-  unavailableReason: string | null;
+  modes: ViewModes;
+  noDiffReason: string | null;
 }) {
   return (
     <div
@@ -416,8 +450,19 @@ function ModeToggle({
       aria-label="How to show this file"
       className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5"
     >
+      {/* Only markdown has anything to render, so the button is absent rather
+          than disabled for every other file — a permanently dead third button
+          on the toolbar reads as broken. */}
+      {modes.canPreview ? (
+        <ModeButton
+          label="Preview"
+          title="Show the markdown as formatted text"
+          isActive={mode === "preview"}
+          onClick={() => onChange("preview")}
+        />
+      ) : null}
       <ModeButton
-        label="File"
+        label={modes.canPreview ? "Source" : "File"}
         title="Show the file as it is now"
         isActive={mode === "source"}
         onClick={() => onChange("source")}
@@ -425,12 +470,12 @@ function ModeToggle({
       <ModeButton
         label="Diff"
         title={
-          isDiffAvailable
+          modes.canDiff
             ? "Show what this branch changed"
-            : unavailableReason ?? "No diff available."
+            : noDiffReason ?? "No diff available."
         }
         isActive={mode === "diff"}
-        isDisabled={!isDiffAvailable}
+        isDisabled={!modes.canDiff}
         onClick={() => onChange("diff")}
       />
     </div>

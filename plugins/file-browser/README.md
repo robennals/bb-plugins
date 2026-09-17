@@ -1,8 +1,8 @@
 # file-browser
 
 Browse every file in a workspace, see at a glance what the current branch
-changed, and read any file either as source or as a diff against the commit the
-branch forked from.
+changed, and read any file as source, as formatted markdown, or as a diff
+against the commit the branch forked from.
 
 ## What it gives you
 
@@ -16,9 +16,18 @@ branch forked from.
   beneath it changed, at any depth, so a collapsed tree still shows where the
   work is. The colours are BB's own diff theme tokens, so the tree agrees with
   the diff beside it in light and dark.
-- **A File / Diff toggle** per file. Opening a changed file lands on the diff,
-  an unchanged one on the source. The diff has a second toggle for inline vs
-  side-by-side, and BB's expand-context controls between hunks.
+- **A File / Diff toggle** per file, which becomes **Preview / Source / Diff**
+  for markdown. A file arriving in the pane lands on the diff when the branch
+  changed it, else on the preview when it is markdown, else on the source; from
+  then on it keeps the view you picked for as long as that view still fits. The
+  diff has a second toggle for inline vs side-by-side, and BB's expand-context
+  controls between hunks.
+- **Markdown reads as a document**, not as source: headings, lists, tables,
+  links and fenced code rendered with BB's own chat typography, at a capped
+  reading width. YAML frontmatter is lifted out of the prose and shown as a
+  small metadata block above it, so a skill or agent file reads as the document
+  it is rather than opening on a horizontal rule. `.md`, `.markdown`, `.mdown`,
+  `.mkd`, `.mkdn` and `.mdx` all get the preview.
 - **A changed-files filter** in the explorer toolbar, which narrows the tree to
   what the branch touched, folders opened.
 - **Deleted files still appear** in the tree, greyed and struck through, so you
@@ -27,9 +36,15 @@ branch forked from.
   resizable explorer.
 - **`bb file-browser`** gives an agent the same two answers from the CLI.
 
-Both viewers are BB's own — the source renderer and the diff renderer the rest
-of the app uses — so syntax highlighting and your BB code theme come from the
-host rather than from a viewer this plugin would have to maintain.
+All three viewers are BB's own — the source renderer, the diff renderer and the
+chat-message markdown renderer the rest of the app uses — so syntax
+highlighting, your BB code theme and the prose typography come from the host
+rather than from viewers this plugin would have to maintain.
+
+Two things follow from the preview being the chat renderer: images and links
+that point at other files in the workspace are relative to a chat message, not
+to the file, so they will not resolve; and MDX's JSX shows up as literal text.
+The source view is one click away in both cases.
 
 ## What "changed" means
 

@@ -28,6 +28,24 @@ export function isImagePath(path: string): boolean {
   return IMAGE_EXTENSIONS.has(extensionOf(path));
 }
 
+/**
+ * Extensions the rendered preview is offered for. MDX is in: its JSX shows up
+ * as literal text in the preview, but the prose around it — which is most of an
+ * MDX file — still reads better rendered, and the source view is one click away.
+ */
+const MARKDOWN_EXTENSIONS = new Set([
+  "markdown",
+  "md",
+  "mdown",
+  "mdx",
+  "mkd",
+  "mkdn",
+]);
+
+export function isMarkdownPath(path: string): boolean {
+  return MARKDOWN_EXTENSIONS.has(extensionOf(path));
+}
+
 const BINARY_EXTENSIONS = new Set([
   "7z",
   "bin",
