@@ -12,14 +12,19 @@ import {
   sessionFor,
   withSession,
 } from "./session.js";
+import type { ViewMode } from "./view-mode.js";
 
 const store = (
-  entries: readonly [string, { filePath: string | null; expanded?: string[] }][],
+  entries: readonly [
+    string,
+    { filePath: string | null; mode?: ViewMode | null; expanded?: string[] },
+  ][],
 ) =>
   entries.reduce(
     (current, [key, session]) =>
       withSession(current, key, {
         filePath: session.filePath,
+        mode: session.mode ?? null,
         expanded: session.expanded ?? [],
       }),
     EMPTY_STORE,
@@ -44,35 +49,46 @@ describe("scopeKey", () => {
 });
 
 describe("withSession", () => {
-  it("remembers the file and the unfolded folders", () => {
+  it("remembers the file, how it was read, and the unfolded folders", () => {
     const current = store([
-      ["thread:a", { filePath: "src/index.ts", expanded: ["src"] }],
+      ["thread:a", { filePath: "docs/x.md", mode: "preview", expanded: ["docs"] }],
     ]);
     expect(sessionFor(current, "thread:a")).toEqual({
-      filePath: "src/index.ts",
-      expanded: ["src"],
+      filePath: "docs/x.md",
+      mode: "preview",
+      expanded: ["docs"],
     });
   });
 
-  it("keeps the remembered file when the caller has none yet", () => {
-    let current = store([["thread:a", { filePath: "README.md" }]]);
+  it("keeps the remembered file and view when the caller has neither yet", () => {
+    let current = store([
+      ["thread:a", { filePath: "README.md", mode: "preview" }],
+    ]);
     current = withSession(current, "thread:a", {
       filePath: null,
+      mode: null,
       expanded: ["docs"],
     });
     expect(sessionFor(current, "thread:a")).toEqual({
       filePath: "README.md",
+      mode: "preview",
       expanded: ["docs"],
     });
   });
 
-  it("replaces the remembered file when a new one is open", () => {
-    let current = store([["thread:a", { filePath: "README.md" }]]);
+  it("replaces the remembered file and view when a new one is open", () => {
+    let current = store([
+      ["thread:a", { filePath: "README.md", mode: "preview" }],
+    ]);
     current = withSession(current, "thread:a", {
       filePath: "src/app.ts",
+      mode: "diff",
       expanded: [],
     });
-    expect(sessionFor(current, "thread:a")?.filePath).toBe("src/app.ts");
+    expect(sessionFor(current, "thread:a")).toMatchObject({
+      filePath: "src/app.ts",
+      mode: "diff",
+    });
   });
 
   it("keeps one workspace's session out of another's", () => {
@@ -82,6 +98,7 @@ describe("withSession", () => {
     ]);
     expect(sessionFor(current, "thread:a")).toEqual({
       filePath: "a.md",
+      mode: null,
       expanded: ["docs"],
     });
     expect(sessionFor(current, "thread:b")?.filePath).toBe("b.md");
@@ -111,6 +128,7 @@ describe("withSession", () => {
     const expanded = Array.from({ length: 700 }, (_, index) => `dir${index}`);
     const current = withSession(EMPTY_STORE, "thread:a", {
       filePath: null,
+      mode: null,
       expanded,
     });
     expect(sessionFor(current, "thread:a")?.expanded).toHaveLength(500);
@@ -175,6 +193,7 @@ describe("parseStore", () => {
     expect(parsed.order).toEqual(["thread:a"]);
     expect(sessionFor(parsed, "thread:a")).toEqual({
       filePath: null,
+      mode: null,
       expanded: ["src"],
     });
     expect(sessionFor(parsed, "thread:b")).toBeNull();
@@ -189,8 +208,33 @@ describe("parseStore", () => {
     );
     expect(sessionFor(parsed, "thread:a")).toEqual({
       filePath: "a.md",
+      mode: null,
       expanded: [],
     });
+  });
+
+  it("leaves the view to be decided when the stored one is not a view", () => {
+    for (const mode of ["gallery", 7, null]) {
+      const parsed = parseStore(
+        JSON.stringify({
+          order: ["thread:a"],
+          sessions: { "thread:a": { filePath: "a.md", mode, expanded: [] } },
+        }),
+      );
+      expect(sessionFor(parsed, "thread:a")?.mode, String(mode)).toBeNull();
+    }
+  });
+
+  it("keeps every view it knows", () => {
+    for (const mode of ["preview", "source", "diff"] satisfies ViewMode[]) {
+      const parsed = parseStore(
+        JSON.stringify({
+          order: ["thread:a"],
+          sessions: { "thread:a": { filePath: "a.md", mode, expanded: [] } },
+        }),
+      );
+      expect(sessionFor(parsed, "thread:a")?.mode, mode).toBe(mode);
+    }
   });
 
   it("gives a session missing from the order a place in it", () => {
@@ -240,10 +284,15 @@ describe("readStore and saveSession", () => {
     useStorage(workingStorage());
     const scope = { kind: "thread", id: "thr_abc" } as const;
 
-    saveSession(scope, { filePath: "docs/guide.md", expanded: ["docs"] });
+    saveSession(scope, {
+      filePath: "docs/guide.md",
+      mode: "preview",
+      expanded: ["docs"],
+    });
 
     expect(readSession(scope)).toEqual({
       filePath: "docs/guide.md",
+      mode: "preview",
       expanded: ["docs"],
     });
     expect(readLastScope()).toEqual(scope);
@@ -254,11 +303,11 @@ describe("readStore and saveSession", () => {
     const first = { kind: "thread", id: "a" } as const;
     const second = { kind: "environment", id: "b" } as const;
 
-    saveSession(first, { filePath: "a.md", expanded: ["src"] });
-    saveSession(second, { filePath: "b.md", expanded: [] });
+    saveSession(first, { filePath: "a.md", mode: "preview", expanded: ["src"] });
+    saveSession(second, { filePath: "b.md", mode: "diff", expanded: [] });
 
-    expect(readSession(first)?.filePath).toBe("a.md");
-    expect(readSession(second)?.filePath).toBe("b.md");
+    expect(readSession(first)).toMatchObject({ filePath: "a.md", mode: "preview" });
+    expect(readSession(second)).toMatchObject({ filePath: "b.md", mode: "diff" });
     // The last one saved is the one a visit with no workspace falls back to.
     expect(readLastScope()).toEqual(second);
   });
@@ -276,7 +325,10 @@ describe("readStore and saveSession", () => {
     expect(readStore()).toEqual(EMPTY_STORE);
     expect(readSession({ kind: "thread", id: "a" })).toBeNull();
     expect(() =>
-      saveSession({ kind: "thread", id: "a" }, { filePath: "a.md", expanded: [] }),
+      saveSession(
+        { kind: "thread", id: "a" },
+        { filePath: "a.md", mode: "source", expanded: [] },
+      ),
     ).not.toThrow();
   });
 });

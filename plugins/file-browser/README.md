@@ -35,10 +35,10 @@ against the commit the branch forked from.
 - **⌘P go-to-file**, a search box that prunes the tree, a dotfile toggle, and a
   resizable explorer.
 - **It remembers where you were.** Leaving the Files page or closing the thread
-  tab and coming back restores the file you had open and the folders you had
-  unfolded, per workspace — so switching between two worktrees keeps a separate
-  place in each. The search box is deliberately not remembered: it is a way of
-  finding something, not a place to come back to.
+  tab and coming back restores the file you had open, the view you were reading
+  it in, and the folders you had unfolded, per workspace — so switching between
+  two worktrees keeps a separate place in each. The search box is deliberately
+  not remembered: it is a way of finding something, not a place to come back to.
 - **`bb file-browser`** gives an agent the same two answers from the CLI.
 
 All three viewers are BB's own — the source renderer, the diff renderer and the
@@ -91,15 +91,19 @@ silently replaced.
 
 ## What is remembered, and where
 
-Per workspace: the open file and the unfolded folders. Globally: the explorer
-width, the dotfile toggle, the changed-files filter, and inline vs
-side-by-side. All of it is browser-local — one `localStorage` record holding
-the 24 most recently browsed workspaces, so the worktrees you have finished
-with fall off the end rather than accumulating for ever.
+Per workspace: the open file, the view it was open in, and the unfolded
+folders. Globally: the explorer width, the dotfile toggle, the changed-files
+filter, and inline vs side-by-side. All of it is browser-local — one
+`localStorage` record holding the 24 most recently browsed workspaces, so the
+worktrees you have finished with fall off the end rather than accumulating for
+ever.
 
-The view mode is *not* remembered; each file lands on its preferred view as
-described above. A remembered file that has since been deleted opens on the
-viewer's "could not read" notice.
+The remembered view stands over the landing rule — coming back to a file you
+were previewing puts you back in the preview, even though that file is one the
+branch changed and would otherwise land on its diff. It is still checked for
+fit: a remembered diff of a file that is no longer changed falls back like any
+other. A remembered file that has since been deleted opens on the viewer's
+"could not read" notice.
 
 ## Dotfiles
 

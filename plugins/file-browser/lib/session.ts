@@ -12,10 +12,13 @@
  */
 
 import { isScopeKind, type ScopeRef } from "./route.js";
+import { isViewMode, type ViewMode } from "./view-mode.js";
 
 export interface WorkspaceSession {
   /** The file that was open; null when none has been opened yet. */
   filePath: string | null;
+  /** How that file was being read; null when no file has been opened yet. */
+  mode: ViewMode | null;
   /** Unfolded directories, as workspace-relative paths. */
   expanded: readonly string[];
 }
@@ -77,10 +80,10 @@ export function sessionFor(
 /**
  * Fold one workspace's session into the store, as the most recent.
  *
- * A null `filePath` KEEPS whatever was remembered rather than clearing it:
- * nothing in this UI closes a file, so the only way to see null is a workspace
- * whose route has not been restored yet — and letting that overwrite the record
- * would erase the very thing the restore is about to read.
+ * A null `filePath` or `mode` KEEPS whatever was remembered rather than clearing
+ * it: nothing in this UI closes a file, so the only way to see null is a
+ * workspace whose route has not been restored yet — and letting that overwrite
+ * the record would erase the very thing the restore is about to read.
  */
 export function withSession(
   store: SessionStore,
@@ -90,6 +93,7 @@ export function withSession(
   const previous = sessionFor(store, key);
   const merged: WorkspaceSession = {
     filePath: session.filePath ?? previous?.filePath ?? null,
+    mode: session.mode ?? previous?.mode ?? null,
     expanded: session.expanded.slice(0, MAX_EXPANDED),
   };
 
@@ -159,7 +163,10 @@ function narrowSession(value: unknown): WorkspaceSession | null {
         .filter((path): path is string => typeof path === "string" && path !== "")
         .slice(0, MAX_EXPANDED)
     : [];
-  return { filePath, expanded };
+  // A mode this version does not have — or one a future version adds and this
+  // one does not know — falls back to being decided from the file itself.
+  const mode = isViewMode(record.mode) ? record.mode : null;
+  return { filePath, mode, expanded };
 }
 
 export function readStore(): SessionStore {

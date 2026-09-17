@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   availableModes,
   isModeAvailable,
+  isViewMode,
   preferredMode,
   resolveMode,
 } from "./view-mode.js";
@@ -67,5 +68,19 @@ describe("resolveMode", () => {
 describe("isModeAvailable", () => {
   it("always allows source", () => {
     expect(isModeAvailable("source", { canPreview: false, canDiff: false })).toBe(true);
+  });
+});
+
+describe("isViewMode", () => {
+  it("accepts every view", () => {
+    for (const mode of ["preview", "source", "diff"]) {
+      expect(isViewMode(mode), mode).toBe(true);
+    }
+  });
+
+  it("rejects anything else a stored record might hold", () => {
+    for (const value of ["", "Preview", "gallery", 7, null, undefined, {}]) {
+      expect(isViewMode(value), String(value)).toBe(false);
+    }
   });
 });

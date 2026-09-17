@@ -81,12 +81,13 @@ export function Browser({
   const [explorerWidth, setExplorerWidth] = useState(readStoredWidth);
   const [isExplorerOpen, setIsExplorerOpen] = useState(true);
   const [isQuickOpen, setIsQuickOpen] = useState(false);
-  // Seeded from the last visit to THIS workspace. The page variant is keyed on
-  // the workspace by its caller, so a fresh workspace remounts and re-seeds.
+  // The last visit to THIS workspace, read once. The page variant is keyed on
+  // the workspace by its caller, so a fresh workspace remounts and re-reads.
+  const [restored] = useState(() => readSession(scope));
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(
-    () => new Set(readSession(scope)?.expanded ?? []),
+    () => new Set(restored?.expanded ?? []),
   );
-  const [mode, setMode] = useState<ViewMode>("source");
+  const [mode, setMode] = useState<ViewMode>(restored?.mode ?? "source");
   const [diffView, setDiffView] = useState<DiffViewMode>(() =>
     readFlag(DIFF_VIEW_KEY, false) ? "split" : "unified",
   );
@@ -142,6 +143,9 @@ export function Browser({
   // and re-run git on every keystroke and every file click.
   const scopeKind = scope?.kind ?? null;
   const scopeId = scope?.id ?? null;
+  // Which file is open, in which workspace: the same README in another worktree
+  // is another file, and it deserves its own landing view.
+  const openKeyFor = (path: string) => `${scopeKind}:${scopeId}:${path}`;
   useEffect(() => {
     loadTree(
       scopeKind === null || scopeId === null ? null : { kind: scopeKind, id: scopeId },
@@ -173,11 +177,19 @@ export function Browser({
   //
   // Nothing is decided until the tree has answered, because "changed" is not
   // known before that and a file would otherwise never land on its diff.
-  const defaultedFor = useRef<string | null>(null);
+  //
+  // The file that came back from the remembered session counts as already
+  // landed: it is not arriving in the pane, it is the one you were reading, so
+  // the view it was in stands rather than being decided afresh. It is still
+  // checked for fit, so a remembered diff of a file that is no longer changed
+  // falls back like any other.
+  const defaultedFor = useRef<string | null>(
+    restored === null || restored.filePath === null || restored.mode === null
+      ? null
+      : openKeyFor(restored.filePath),
+  );
   const areChangesKnown = tree.status === "ready";
-  // Keyed on the workspace too: the same README in another worktree is another
-  // file, and it deserves its own landing view.
-  const openKey = filePath === null ? null : `${scopeKind}:${scopeId}:${filePath}`;
+  const openKey = filePath === null ? null : openKeyFor(filePath);
   useEffect(() => {
     if (openKey === null || !areChangesKnown) return;
     if (defaultedFor.current !== openKey) {
@@ -202,8 +214,18 @@ export function Browser({
   // unmount, because a panel can be torn down without one.
   useEffect(() => {
     if (scopeKind === null || scopeId === null) return;
-    saveSession({ kind: scopeKind, id: scopeId }, { filePath, expanded: [...expanded] });
-  }, [expanded, filePath, scopeId, scopeKind]);
+    saveSession(
+      { kind: scopeKind, id: scopeId },
+      {
+        filePath,
+        // Only once a file is open is the view a fact about anything; before
+        // that it is this component's initial state, and recording it would
+        // overwrite the remembered view with a default.
+        mode: filePath === null ? null : mode,
+        expanded: [...expanded],
+      },
+    );
+  }, [expanded, filePath, mode, scopeId, scopeKind]);
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const isAccel = event.metaKey || event.ctrlKey;

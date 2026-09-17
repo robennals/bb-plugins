@@ -12,6 +12,13 @@ import { isMarkdownPath } from "./file-kind.js";
 
 export type ViewMode = "preview" | "source" | "diff";
 
+const VIEW_MODES: readonly ViewMode[] = ["preview", "source", "diff"];
+
+/** For narrowing a mode read back out of storage. */
+export function isViewMode(value: unknown): value is ViewMode {
+  return typeof value === "string" && (VIEW_MODES as readonly string[]).includes(value);
+}
+
 export interface ViewModes {
   /** Markdown, rendered the way BB renders a chat message. */
   canPreview: boolean;
