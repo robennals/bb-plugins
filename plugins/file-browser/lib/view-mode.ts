@@ -49,12 +49,14 @@ export function isModeAvailable(mode: ViewMode, modes: ViewModes): boolean {
 }
 
 /**
- * Where to land. A changed file is nearly always opened to see WHAT changed, so
- * the diff wins; failing that, markdown reads better rendered than as source.
+ * Where to land. Markdown opens rendered, changed or not — a document is a
+ * thing to read, and the diff is one click away when you want it. Anything
+ * else the branch changed opens on its diff, since a changed file of any other
+ * kind is nearly always opened to see WHAT changed.
  */
 export function preferredMode(modes: ViewModes): ViewMode {
-  if (modes.canDiff) return "diff";
   if (modes.canPreview) return "preview";
+  if (modes.canDiff) return "diff";
   return "source";
 }
 

@@ -30,13 +30,13 @@ describe("availableModes", () => {
 });
 
 describe("preferredMode", () => {
-  it("lands a changed file on its diff, markdown or not", () => {
-    expect(preferredMode({ canPreview: true, canDiff: true })).toBe("diff");
-    expect(preferredMode({ canPreview: false, canDiff: true })).toBe("diff");
+  it("lands markdown on the preview whether or not the branch changed it", () => {
+    expect(preferredMode({ canPreview: true, canDiff: true })).toBe("preview");
+    expect(preferredMode({ canPreview: true, canDiff: false })).toBe("preview");
   });
 
-  it("lands unchanged markdown on the preview", () => {
-    expect(preferredMode({ canPreview: true, canDiff: false })).toBe("preview");
+  it("lands any other changed file on its diff", () => {
+    expect(preferredMode({ canPreview: false, canDiff: true })).toBe("diff");
   });
 
   it("lands anything else on the source", () => {
@@ -60,7 +60,7 @@ describe("resolveMode", () => {
     expect(resolveMode("preview", { canPreview: false, canDiff: false })).toBe("source");
   });
 
-  it("prefers the diff over the preview when both would be a fallback", () => {
+  it("falls back to the diff when the file is not markdown but did change", () => {
     expect(resolveMode("preview", { canPreview: false, canDiff: true })).toBe("diff");
   });
 });

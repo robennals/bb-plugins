@@ -17,12 +17,12 @@ against the commit the branch forked from.
   work is. The colours are BB's own diff theme tokens, so the tree agrees with
   the diff beside it in light and dark.
 - **A File / Diff toggle** per file, which becomes **Preview / Source / Diff**
-  for markdown. A file arriving in the pane lands on the diff when the branch
-  changed it, else on the preview when it is markdown, else on the source; from
-  then on it keeps the view you picked for as long as that view still fits. The
-  diff has a second toggle for inline vs side-by-side, and BB's expand-context
-  controls between hunks.
-- **Markdown reads as a document**, not as source: headings, lists, tables,
+  for markdown. A file arriving in the pane lands on the preview when it is
+  markdown, else on the diff when the branch changed it, else on the source;
+  from then on it keeps the view you picked for as long as that view still
+  fits. The diff has a second toggle for inline vs side-by-side, and BB's
+  expand-context controls between hunks.
+- **Markdown opens as a document**, changed or not: headings, lists, tables,
   links and fenced code rendered with BB's own chat typography, at a capped
   reading width. YAML frontmatter is lifted out of the prose and shown as a
   small metadata block above it, so a skill or agent file reads as the document
@@ -98,12 +98,12 @@ filter, and inline vs side-by-side. All of it is browser-local — one
 worktrees you have finished with fall off the end rather than accumulating for
 ever.
 
-The remembered view stands over the landing rule — coming back to a file you
-were previewing puts you back in the preview, even though that file is one the
-branch changed and would otherwise land on its diff. It is still checked for
-fit: a remembered diff of a file that is no longer changed falls back like any
-other. A remembered file that has since been deleted opens on the viewer's
-"could not read" notice.
+The remembered view stands over the landing rule — coming back to a markdown
+file whose source you were reading puts you back on its source rather than on
+the preview it would otherwise open in. It is still checked for fit: a
+remembered diff of a file that is no longer changed falls back like any other.
+A remembered file that has since been deleted opens on the viewer's "could not
+read" notice.
 
 ## Dotfiles
 

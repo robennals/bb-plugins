@@ -169,8 +169,8 @@ export function Browser({
   // One rule for what the pane shows, applied wherever the file came from — an
   // explorer click, ⌘P, or a link pasted into the address bar:
   //
-  // - A file arriving in the pane lands on its preferred view: the diff when
-  //   the branch changed it, else the preview when it is markdown, else source.
+  // - A file arriving in the pane lands on its preferred view: the preview when
+  //   it is markdown, else the diff when the branch changed it, else source.
   // - The file already open keeps the view YOU chose for as long as it fits,
   //   and falls back only when it stops fitting (git's answer was refreshed and
   //   the diff went away).
