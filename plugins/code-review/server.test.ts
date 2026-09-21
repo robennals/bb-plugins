@@ -66,6 +66,10 @@ async function makeHost(
     spawnError?: string;
     /** Thread ids `threads.get` should report as gone. */
     missingThreadIds?: string[];
+    /** Thread ids BB should report as archived, both on get and in the project listing. */
+    archivedThreadIds?: string[];
+    /** Makes the bulk `threads.list` lookup of archived threads fail with this message. */
+    archivedListError?: string;
     /** Makes `threads.archive` fail with this message. */
     archiveError?: string;
     /** How many leading `tabs.update` calls reject with a revision conflict. */
@@ -138,8 +142,19 @@ async function makeHost(
     pluginId: "code-review",
     settings: { defaultProject: "proj_test", reviewSkills: "code-review", repos: REPO },
     sdk: {
-      projects: { list: async () => [] },
+      projects: {
+        list: async () =>
+          options.archivedThreadIds === undefined ? [] : [{ id: "proj_test", name: "test" }],
+      },
       threads: {
+        list: async () => {
+          if (options.archivedListError !== undefined) {
+            throw new Error(options.archivedListError);
+          }
+          return (options.archivedThreadIds ?? []).map((id) =>
+            makeThreadResponse({ id, archivedAt: 1 }),
+          );
+        },
         spawn: async (args) => {
           if (options.spawnError !== undefined) throw new Error(options.spawnError);
           spawned.push({
@@ -157,7 +172,12 @@ async function makeHost(
           if (options.missingThreadIds?.includes(threadId) === true) {
             throw new Error(`no such thread: ${threadId}`);
           }
-          return makeThreadResponse({ id: threadId, environmentId: null });
+          return makeThreadResponse({
+            id: threadId,
+            environmentId: null,
+            // An archived thread is a normal successful get, with archivedAt set.
+            archivedAt: options.archivedThreadIds?.includes(threadId) === true ? 1 : null,
+          });
         },
         tabs: {
           get: async ({ threadId }: { threadId: string }) =>
@@ -1129,6 +1149,13 @@ describe("asking about a finding", () => {
   });
 });
 
+/** The review-thread link fields of a pull request DTO, which is all these tests read. */
+interface ThreadLinkFields {
+  number: number;
+  reviewThreadId: string | null;
+  reviewThreadArchived: boolean;
+}
+
 describe("opening a review", () => {
   it("refuses to open a PR that has never been reviewed", async () => {
     // Opening must never start an agent run: that is what Start review is for.
@@ -1146,6 +1173,73 @@ describe("opening a review", () => {
       /start a new review/i,
     );
     expect(host.spawned).toHaveLength(1);
+  });
+
+  // Unarchiving is broken in BB, so walking the user into an archived thread
+  // leaves them somewhere they cannot work. `threads.get` succeeds for an
+  // archived thread, so checking only for deletion is not enough.
+  it("refuses to open a review whose thread has been archived", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() }, archivedThreadIds: ["thr_1"] });
+    await runReview(host);
+    await expect(host.call("openReview", { repo: REPO, number: 7 })).rejects.toThrow(
+      /start a new review/i,
+    );
+    expect(host.spawned).toHaveLength(1);
+  });
+
+  it("reports an archived review thread to the panel, with its id to link to", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() }, archivedThreadIds: ["thr_1"] });
+    await runReview(host);
+    const listed = await host.call<{ pullRequests: ThreadLinkFields[] }>("listPullRequests", {
+      repo: REPO,
+      filter: { kind: "all" },
+    });
+    expect(listed.pullRequests.find((pr) => pr.number === 7)).toMatchObject({
+      reviewThreadId: "thr_1",
+      reviewThreadArchived: true,
+    });
+    const one = await host.call<{ pullRequest: ThreadLinkFields | null }>("getPullRequest", {
+      repo: REPO,
+      number: 7,
+    });
+    expect(one.pullRequest?.reviewThreadArchived).toBe(true);
+  });
+
+  // The bulk lookup is an optimisation. Losing it must cost the flag, not the list.
+  it("still lists pull requests when the archived-thread lookup fails", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      archivedThreadIds: ["thr_1"],
+      archivedListError: "host unreachable",
+    });
+    await runReview(host);
+    const listed = await host.call<{ pullRequests: ThreadLinkFields[] }>("listPullRequests", {
+      repo: REPO,
+      filter: { kind: "all" },
+    });
+    expect(listed.pullRequests.find((pr) => pr.number === 7)).toMatchObject({
+      reviewThreadArchived: false,
+    });
+    // The per-thread check still refuses, so the user cannot be walked into it.
+    await expect(host.call("openReview", { repo: REPO, number: 7 })).rejects.toThrow(
+      /start a new review/i,
+    );
+  });
+
+  it("leaves a live review thread unflagged", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() }, archivedThreadIds: [] });
+    await runReview(host);
+    const listed = await host.call<{ pullRequests: ThreadLinkFields[] }>("listPullRequests", {
+      repo: REPO,
+      filter: { kind: "all" },
+    });
+    expect(listed.pullRequests.find((pr) => pr.number === 7)).toMatchObject({
+      reviewThreadId: "thr_1",
+      reviewThreadArchived: false,
+    });
+    await expect(host.call("openReview", { repo: REPO, number: 7 })).resolves.toMatchObject({
+      threadId: "thr_1",
+    });
   });
 
   it("reuses a finished review's thread instead of running the agent again", async () => {

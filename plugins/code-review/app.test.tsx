@@ -38,6 +38,8 @@ const PR: PullRequestDto = {
   reviewStatus: "reported",
   openFindings: 1,
   postedFindings: 0,
+  reviewThreadId: "thr_1",
+  reviewThreadArchived: false,
 };
 
 const REVIEW: ReviewDto = {
@@ -1213,6 +1215,41 @@ describe("starting and opening a review from the home screen", () => {
       );
     });
     expect(slot.inspection.rpcCalls.some((entry) => entry.method === "startReview")).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  // Unarchiving is broken in BB, so an archived thread is somewhere you cannot
+  // work: the row has to offer a new review, and keep the old thread readable.
+  it("offers Start review, plus a link to the thread, when the review's thread is archived", async () => {
+    const app = await load();
+    const slot = home(app, {
+      listPullRequests: () => ({
+        pullRequests: [{ ...PR, reviewThreadId: "thr_old", reviewThreadArchived: true }],
+      }),
+    });
+    await slot.findByText("Start review");
+    expect(slot.queryByText("Open review")).toBeNull();
+
+    fireEvent.click(await slot.findByText("Archived thread"));
+    await waitFor(() => {
+      expect(slot.inspection.navigateCalls).toContainEqual(
+        expect.objectContaining({ threadId: "thr_old" }),
+      );
+    });
+    // Reading the old thread must not spend an agent run or reopen the review.
+    expect(
+      slot.inspection.rpcCalls.some(
+        (entry) => entry.method === "startReview" || entry.method === "openReview",
+      ),
+    ).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("offers no archived-thread link for a live review", async () => {
+    const app = await load();
+    const slot = home(app);
+    await slot.findByText("Open review");
+    expect(slot.queryByText("Archived thread")).toBeNull();
     slot.lifecycle.unmount();
   });
 

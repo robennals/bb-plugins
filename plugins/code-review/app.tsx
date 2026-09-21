@@ -347,16 +347,21 @@ function PrRow({
   pr,
   onStart,
   onOpen,
+  onOpenArchivedThread,
 }: {
   pr: PullRequestDto;
   onStart: () => void;
   onOpen: () => void;
+  onOpenArchivedThread: () => void;
 }) {
   const requestedTeams = pr.reviewRequests
     .map((request) => request.teamSlug)
     .filter((slug): slug is string => slug !== null)
     .map((slug) => slug.split("/").pop() ?? slug);
-  const hasReview = pr.reviewStatus !== "none";
+  // An archived thread cannot be worked in until BB can unarchive it, so a
+  // review stranded in one reads as no review at all: the action is a new one.
+  const hasReview = pr.reviewStatus !== "none" && !pr.reviewThreadArchived;
+  const archivedThread = pr.reviewThreadArchived ? pr.reviewThreadId : null;
   return (
     <div className="flex w-full flex-col gap-1.5 rounded-lg border border-border bg-card px-3 py-2.5 text-left">
       <div className="flex items-start gap-2">
@@ -397,6 +402,17 @@ function PrRow({
           <Icon name={hasReview ? "Bug" : "Bot"} className="size-3.5" />
           {hasReview ? "Open review" : "Start review"}
         </Button>
+        {archivedThread === null ? null : (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1.5 text-xs"
+            onClick={onOpenArchivedThread}
+          >
+            <Icon name="Archive" className="size-3.5" />
+            Archived thread
+          </Button>
+        )}
         <GithubLink
           href={pr.url}
           className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs transition-colors hover:bg-accent"
@@ -419,6 +435,7 @@ function PrListView({
   myTeams,
   onStartReview,
   onOpenReview,
+  onOpenArchivedThread,
 }: {
   rpc: Rpc;
   repo: string | null;
@@ -429,6 +446,7 @@ function PrListView({
   myTeams: string[];
   onStartReview: (repo: string, number: number) => void;
   onOpenReview: (repo: string, number: number) => void;
+  onOpenArchivedThread: (threadId: string) => void;
 }) {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const { tab, team } = tabAndTeamFor(filter);
@@ -583,6 +601,9 @@ function PrListView({
               pr={pr}
               onStart={() => onStartReview(pr.repo, pr.number)}
               onOpen={() => onOpenReview(pr.repo, pr.number)}
+              onOpenArchivedThread={() => {
+                if (pr.reviewThreadId !== null) onOpenArchivedThread(pr.reviewThreadId);
+              }}
             />
           ))}
         </div>
@@ -1693,6 +1714,15 @@ function CodeReviewPanel() {
     [navigate],
   );
 
+  // No review tab and no pending-tab note: the thread is archived, so this is
+  // a read-only trip into the old conversation, not a place to keep working.
+  const openArchivedThread = useCallback(
+    (threadId: string) => {
+      navigate.toThread(threadId);
+    },
+    [navigate],
+  );
+
   const openReview = useCallback(
     (nextRepo: string, number: number) => {
       rpc.call("openReview", { repo: nextRepo, number }).then(
@@ -1757,6 +1787,7 @@ function CodeReviewPanel() {
             myTeams={status.data?.myTeams ?? []}
             onStartReview={startReview}
             onOpenReview={openReview}
+            onOpenArchivedThread={openArchivedThread}
           />
         )}
       </div>
