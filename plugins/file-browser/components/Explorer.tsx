@@ -27,6 +27,13 @@ export interface ExplorerProps {
   changedOnly: boolean;
   onToggleChangedOnly: (next: boolean) => void;
   activePath: string | null;
+  /**
+   * Unfolded directories. Owned by the caller so that they survive leaving the
+   * browser and coming back, which this component cannot do on its own — it is
+   * unmounted along with everything else.
+   */
+  expanded: ReadonlySet<string>;
+  setExpanded: React.Dispatch<React.SetStateAction<ReadonlySet<string>>>;
   isLoading: boolean;
   error: string | null;
   truncated: boolean;
@@ -51,6 +58,8 @@ export function Explorer({
   changedOnly,
   onToggleChangedOnly,
   activePath,
+  expanded,
+  setExpanded,
   isLoading,
   error,
   truncated,
@@ -63,7 +72,6 @@ export function Explorer({
   header,
 }: ExplorerProps) {
   const [query, setQuery] = useState("");
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const activeRowRef = useRef<HTMLButtonElement | null>(null);
 
   // Deleted files are not on disk, so the listing cannot contain them. Add them
@@ -99,7 +107,7 @@ export function Explorer({
       for (const ancestor of ancestors) next.add(ancestor);
       return next;
     });
-  }, [activePath]);
+  }, [activePath, setExpanded]);
 
   useEffect(() => {
     activeRowRef.current?.scrollIntoView({ block: "nearest" });

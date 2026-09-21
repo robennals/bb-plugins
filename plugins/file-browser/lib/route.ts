@@ -24,7 +24,7 @@ export interface Route {
 
 const SCOPE_KINDS: readonly ScopeKind[] = ["thread", "environment", "project"];
 
-function isScopeKind(value: string): value is ScopeKind {
+export function isScopeKind(value: string): value is ScopeKind {
   return (SCOPE_KINDS as readonly string[]).includes(value);
 }
 
