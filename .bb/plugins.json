@@ -7,6 +7,7 @@
     { "name": "file-browser", "source": "./plugins/file-browser" },
     { "name": "pr-manager", "source": "./plugins/pr-manager" },
     { "name": "branch-pr", "source": "./plugins/branch-pr" },
-    { "name": "tab-manager", "source": "./plugins/tab-manager" }
+    { "name": "tab-manager", "source": "./plugins/tab-manager" },
+    { "name": "progress-doc", "source": "./plugins/progress-doc" }
   ]
 }
