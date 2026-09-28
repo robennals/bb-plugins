@@ -43,6 +43,7 @@
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@vitest/coverage-v8": "^3.2.7",
     "better-sqlite3": "^12.0.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -61,7 +62,8 @@
   "scripts": {
     "build": "bb plugin build",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "coverage": "vitest run --coverage.enabled --coverage.include='*.ts' --coverage.include='app.tsx' --coverage.include='lib/*.ts' --coverage.exclude='host.ts' --coverage.exclude='lib/utils.ts' --coverage.exclude='lib/portal-scope.ts' --coverage.exclude='**/*.test.*' --coverage.exclude='vitest.config.ts' --coverage.reporter=text"
   },
   "license": "MIT"
 }

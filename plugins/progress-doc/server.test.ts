@@ -1,5 +1,6 @@
 import { createFakePluginHost, type ExperimentalFakeHostRpcCall } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
+import { hostContract } from "./contract";
 import type { DocRead } from "./lib/doc-read";
 import { DEFAULT_PROMPT, fillPrompt } from "./lib/prompt";
 import plugin from "./server";
@@ -36,11 +37,12 @@ function createHost(
     experimental_callHostRpc: (call) => {
       hostCalls.push(call);
       if (options.hostError) throw options.hostError;
-      const input = call.input as { path?: string; dir?: string };
       const expand = (value: string) => value.replace(/^~(?=\/|$)/, HOME);
-      if (call.method === "resolvePath") return { path: expand(input.path!) };
+      if (call.method === "resolvePath") {
+        return { path: expand(hostContract.resolvePath.input.parse(call.input).path) };
+      }
       if (call.method === "listMarkdown") {
-        return { kind: "ok", dir: expand(input.dir!), files: [] };
+        return { kind: "ok", dir: expand(hostContract.listMarkdown.input.parse(call.input).dir), files: [] };
       }
       return options.read ?? { kind: "content", content: "# Hello", mtimeMs: 7 };
     },
@@ -62,7 +64,7 @@ function createHost(
         send,
       },
       environments: { get: vi.fn(async () => ({ hostId: HOST })) },
-    } as never,
+    },
   });
   plugin(bb);
   const call = (method: string, input: unknown) => harness.behavior.callRpc(method, input);

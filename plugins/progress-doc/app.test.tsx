@@ -128,3 +128,78 @@ describe("a thread with no workspace", () => {
     expect(await slot.findByText(/no workspace yet/)).toBeTruthy();
   });
 });
+
+describe("when loading fails", () => {
+  it("says why instead of loading forever", async () => {
+    const slot = await renderPanel({
+      load: () => {
+        throw new Error("environment env_1 no longer exists");
+      },
+    });
+    expect(await slot.findByText(/environment env_1 no longer exists/)).toBeTruthy();
+  });
+});
+
+describe("polling", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((settle) => {
+      resolve = settle;
+    });
+    return { promise, resolve };
+  }
+
+  it("waits for a slow poll to finish before starting the next", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const slow = deferred<LoadResult>();
+    const load = vi.fn(() => slow.promise);
+    await renderPanel({ load: load as never });
+    await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a slow poll that answers after the doc was changed", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const slow = deferred<LoadResult>();
+    const chosenDoc: LoadResult = {
+      kind: "chosen",
+      docPath: DOC,
+      askedAgent: false,
+      doc: { kind: "content", content: "# Picked", mtimeMs: 1 },
+    };
+    let picked = false;
+    const answers: Array<() => LoadResult | Promise<LoadResult>> = [
+      () => ({ kind: "unchosen" }),
+      () => slow.promise,
+    ];
+    const load = vi.fn(() => (picked ? chosenDoc : answers.shift()!()));
+    const slot = await renderPanel({
+      load: load as never,
+      listFiles: () => ({
+        kind: "ok",
+        dir: "/home/me/agent-progress",
+        files: [{ name: "ship-it-thr_1.md", path: DOC, mtimeMs: 1 }],
+      }),
+      choosePath: () => {
+        picked = true;
+        return { ok: true, docPath: DOC };
+      },
+    });
+    const file = await slot.findByText("ship-it-thr_1.md");
+    await vi.advanceTimersByTimeAsync(3_000); // the second, slow poll is now in flight
+    expect(load).toHaveBeenCalledTimes(2);
+    file.click();
+    expect((await slot.findByTestId("bb-markdown")).textContent).toBe("# Picked");
+    // Real timers from here, so React's scheduler can render the stale answer
+    // if the panel accepts it; 200ms is well short of the next poll.
+    vi.useRealTimers();
+    slow.resolve({ kind: "unchosen" });
+    await new Promise((settle) => setTimeout(settle, 200));
+    expect(slot.queryByTestId("bb-markdown")?.textContent).toBe("# Picked");
+  });
+});

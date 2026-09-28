@@ -7,6 +7,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { hostContract } from "./contract";
 import type { DocRead } from "./lib/doc-read";
+import { messageOf } from "./lib/errors";
 import { DOC_DIRECTORY, docFileName } from "./lib/naming";
 import { parsePathInput } from "./lib/paths";
 import { DEFAULT_PROMPT, PATH_PLACEHOLDER, fillPrompt } from "./lib/prompt";
@@ -21,13 +22,9 @@ const choiceSchema = z.object({
   docPath: z.string().startsWith("/"),
   askedAgent: z.boolean().default(false),
 });
-type Choice = z.infer<typeof choiceSchema>;
+type StoredChoice = z.infer<typeof choiceSchema>;
 
 class NoMachineError extends Error {}
-
-function messageOf(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
-}
 
 export default function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -58,12 +55,12 @@ export default function plugin(bb: BbPluginApi) {
     return hostIdFor(await bb.sdk.threads.get({ threadId }));
   }
 
-  async function readChoice(threadId: string): Promise<Choice | null> {
+  async function readChoice(threadId: string): Promise<StoredChoice | null> {
     const parsed = choiceSchema.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId }));
     return parsed.success ? parsed.data : null;
   }
 
-  async function recordChoice(threadId: string, choice: Choice): Promise<void> {
+  async function recordChoice(threadId: string, choice: StoredChoice): Promise<void> {
     await bb.sdk.threads.updatePluginMetadata({ threadId, set: choice });
   }
 

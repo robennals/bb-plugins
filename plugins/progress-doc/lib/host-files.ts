@@ -9,8 +9,8 @@ import { expandHome, sortNewestFirst } from "./paths";
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
 
 function isMissing(cause: unknown): boolean {
-  const code = (cause as NodeJS.ErrnoException).code;
-  return code === "ENOENT" || code === "ENOTDIR";
+  if (!(cause instanceof Error) || !("code" in cause)) return false;
+  return cause.code === "ENOENT" || cause.code === "ENOTDIR";
 }
 
 export function resolvePath(input: { path: string }, home: string): { path: string } {

@@ -9,6 +9,7 @@ import { Markdown, definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { messageOf } from "./lib/errors";
 import { knownMtime, nextView, type DocView } from "./lib/view";
 import {
   PANEL_ACTION_ID,
@@ -29,14 +30,11 @@ type Choice =
   | { kind: "no-machine" }
   | { kind: "chosen"; docPath: string; askedAgent: boolean };
 
-function messageOf(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
-}
-
 /** The thread's choice and its doc, re-read every few seconds. */
 function useProgressDoc(rpc: Rpc, threadId: string) {
   const [choice, setChoice] = useState<Choice>({ kind: "loading" });
   const [view, setView] = useState<DocView>({ kind: "loading" });
+  const [loadError, setLoadError] = useState<string | null>(null);
   const viewRef = useRef<DocView>(view);
   const docPathRef = useRef<string | null>(null);
 
@@ -54,31 +52,56 @@ function useProgressDoc(rpc: Rpc, threadId: string) {
     setChoice({ kind: "chosen", docPath: result.docPath, askedAgent: result.askedAgent });
   }, []);
 
+  /**
+   * Bumped whenever the choice changes under us. A load that started before
+   * the bump answers for the old choice, so its reply is dropped — otherwise a
+   * slow poll could put back the doc you just moved away from.
+   */
+  const generation = useRef(0);
+
   const refresh = useCallback(async () => {
+    const startedIn = generation.current;
     try {
-      apply(await rpc.call("load", { threadId, knownMtimeMs: knownMtime(viewRef.current) }));
+      const result = await rpc.call("load", { threadId, knownMtimeMs: knownMtime(viewRef.current) });
+      if (startedIn !== generation.current) return;
+      setLoadError(null);
+      apply(result);
     } catch (cause) {
-      viewRef.current = { kind: "error", message: messageOf(cause) };
-      setView(viewRef.current);
+      if (startedIn !== generation.current) return;
+      // Kept apart from `view` so it shows whatever state the panel is in,
+      // including before the first load has told us anything.
+      setLoadError(messageOf(cause));
     }
   }, [apply, rpc, threadId]);
 
   /** Drop what we hold and re-read, after the choice itself changed. */
   const reset = useCallback(() => {
+    generation.current += 1;
     docPathRef.current = null;
     viewRef.current = { kind: "loading" };
     setView(viewRef.current);
     setChoice({ kind: "loading" });
+    setLoadError(null);
     void refresh();
   }, [refresh]);
 
+  // Each poll is scheduled only once the last one settles, so a slow or
+  // unreachable host never has more than one request in flight per tab.
   useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => void refresh(), POLL_MS);
-    return () => clearInterval(timer);
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      await refresh();
+      if (!stopped) timer = setTimeout(poll, POLL_MS);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
   }, [refresh]);
 
-  return { choice, view, reset };
+  return { choice, view, loadError, reset };
 }
 
 function Chooser({ rpc, threadId, onChosen }: { rpc: Rpc; threadId: string; onChosen: () => void }) {
@@ -226,8 +249,32 @@ function DocBody({ view, askedAgent }: { view: DocView; askedAgent: boolean }) {
 
 function ProgressDocPanel({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
-  const { choice, view, reset } = useProgressDoc(rpc, threadId);
+  const { choice, view, loadError, reset } = useProgressDoc(rpc, threadId);
+  return (
+    <div className="flex flex-col gap-4">
+      {loadError === null ? null : (
+        <p role="alert" className="text-sm text-destructive">
+          Could not load the progress doc: {loadError}
+        </p>
+      )}
+      <ChoiceBody rpc={rpc} threadId={threadId} choice={choice} view={view} reset={reset} />
+    </div>
+  );
+}
 
+function ChoiceBody({
+  rpc,
+  threadId,
+  choice,
+  view,
+  reset,
+}: {
+  rpc: Rpc;
+  threadId: string;
+  choice: Choice;
+  view: DocView;
+  reset: () => void;
+}) {
   switch (choice.kind) {
     case "loading":
       return <p className="text-sm text-muted-foreground">Loading…</p>;
