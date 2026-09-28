@@ -14,4 +14,4 @@ A GitHub CLI-backed BB plugin for keeping ongoing pull requests visible and acti
 - Fetches a PR-specific Git ref and spawns a managed BB worktree/thread when requested.
 - Provides cached and explicit-refresh commands through `bb pr-manager list [--json]` and `bb pr-manager refresh [--json]`.
 
-The merged-PR window and list limit are configurable in BB’s plugin settings. A connected machine needs `gh` installed and authenticated.
+Every open PR is listed. The merged-PR window and the number of merged PRs shown are configurable in BB’s plugin settings. A connected machine needs `gh` installed and authenticated.

@@ -9,7 +9,7 @@ const normalizedPullRequestSchema = z.object({
 });
 export const hostContract = defineRpcContract({
   listPullRequests: {
-    input: z.object({ mergedWithinDays: z.number().int().min(1).max(90), maximumPullRequests: z.number().int().min(1).max(100) }),
+    input: z.object({ mergedWithinDays: z.number().int().min(1).max(90), maximumMergedPullRequests: z.number().int().min(1).max(100) }),
     output: z.object({ pullRequests: z.array(normalizedPullRequestSchema) }),
   },
   preparePullRequestBranch: {

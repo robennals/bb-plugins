@@ -70,8 +70,8 @@ export default async function plugin(bb: BbPluginApi) {
     mergedWithinDays: {
       type: "select", label: "Keep merged PRs visible", options: ["7", "14", "30"], default: "14",
     },
-    maximumPullRequests: {
-      type: "select", label: "Maximum PRs per status", options: ["25", "50", "100"], default: "50",
+    maximumMergedPullRequests: {
+      type: "select", label: "Maximum merged PRs shown", options: ["25", "50", "100"], default: "50",
     },
   });
   const host = bb.hosts.experimental_client({ contract: hostContract });
@@ -92,7 +92,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function refreshPullRequests(): Promise<PullRequestList> {
-    const [{ mergedWithinDays, maximumPullRequests }, hosts, context, cached] = await Promise.all([
+    const [{ mergedWithinDays, maximumMergedPullRequests }, hosts, context, cached] = await Promise.all([
       settings.get(), bb.sdk.hosts.list(), projectAndThreadContext(), readCachedPullRequests(),
     ]);
     const connected = hosts.filter((candidate) => candidate.status === "connected");
@@ -100,7 +100,7 @@ export default async function plugin(bb: BbPluginApi) {
     const projectHostIds = new Set(context.projects.flatMap((project) => project.sources.map((source) => source.hostId)));
     const queryHost = connected.find((candidate) => projectHostIds.has(candidate.id)) ?? connected[0]!;
     const raw = await host.call("listPullRequests", {
-      mergedWithinDays: Number(mergedWithinDays), maximumPullRequests: Number(maximumPullRequests),
+      mergedWithinDays: Number(mergedWithinDays), maximumMergedPullRequests: Number(maximumMergedPullRequests),
     }, { hostId: queryHost.id });
 
     const projectByRepository = new Map<string, (typeof context.projects)[number]>();
