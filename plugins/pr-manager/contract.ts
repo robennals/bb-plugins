@@ -2,18 +2,23 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { PULL_REQUEST_STATUSES } from "./pr-status.js";
 
+export const repositoryNameSchema = z.string().regex(/^[^/\s]+\/[^/\s]+$/);
 const normalizedPullRequestSchema = z.object({
   repository: z.string(), number: z.number().int().positive(), title: z.string(), url: z.string().url(),
   status: z.enum(PULL_REQUEST_STATUSES), summary: z.string(),
   isDraft: z.boolean(), headRefName: z.string(), baseRefName: z.string(), createdAt: z.string(), updatedAt: z.string(), mergedAt: z.string().nullable(),
 });
+export type HostPullRequest = z.infer<typeof normalizedPullRequestSchema>;
 export const hostContract = defineRpcContract({
   listPullRequests: {
-    input: z.object({ mergedWithinDays: z.number().int().min(1).max(90), maximumMergedPullRequests: z.number().int().min(1).max(100) }),
+    input: z.object({
+      repository: repositoryNameSchema,
+      mergedWithinDays: z.number().int().min(1).max(90), maximumMergedPullRequests: z.number().int().min(1).max(100),
+    }),
     output: z.object({ pullRequests: z.array(normalizedPullRequestSchema) }),
   },
   preparePullRequestBranch: {
-    input: z.object({ projectPath: z.string().min(1), repository: z.string().regex(/^[^/]+\/[^/]+$/), number: z.number().int().positive() }),
+    input: z.object({ projectPath: z.string().min(1), repository: repositoryNameSchema, number: z.number().int().positive() }),
     output: z.object({ ref: z.string() }),
   },
 });
