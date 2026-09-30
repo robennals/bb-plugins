@@ -160,7 +160,7 @@ type RpcOverrides = Record<string, unknown>;
 function reviewTab(app: Awaited<ReturnType<typeof load>>, overrides: RpcOverrides = {}) {
   return renderSlot(
     app.threadPanelActions[0]!,
-    { threadId: "thr_1", params: { repo: "acme/app", number: 7 } },
+    { threadId: "thr_1", params: null },
     { rpc: rpc(overrides) },
   );
 }
@@ -169,7 +169,7 @@ function reviewTab(app: Awaited<ReturnType<typeof load>>, overrides: RpcOverride
 function reviewTabWith(app: Awaited<ReturnType<typeof load>>, options: object) {
   return renderSlot(
     app.threadPanelActions[0]!,
-    { threadId: "thr_1", params: { repo: "acme/app", number: 7 } },
+    { threadId: "thr_1", params: null },
     options as Parameters<typeof renderSlot>[2],
   );
 }
@@ -1108,8 +1108,7 @@ describe("the review tab", () => {
     slot.lifecycle.unmount();
   });
 
-  it("works out which review it is when opened from the tab launcher", async () => {
-    // A launcher-opened tab has no params, only the thread it is in.
+  it("works out which review it is from the thread it is in", async () => {
     const app = await load();
     const slot = renderSlot(
       app.threadPanelActions[0]!,
@@ -1122,19 +1121,18 @@ describe("the review tab", () => {
     slot.lifecycle.unmount();
   });
 
-  it("falls back to the thread when its saved params make no sense", async () => {
-    // A tab persisted by an older version of this plugin, restored into this
-    // one: the params are not a review, so the thread has to say what it is.
+  it("asks the thread even when a tab saved by an older version names a PR", async () => {
+    // Older versions put the PR in the tab's params. The thread gives the same
+    // answer, so the params are not trusted for it.
     const app = await load();
     const slot = renderSlot(
       app.threadPanelActions[0]!,
-      { threadId: "thr_1", params: { repo: 7, number: "acme/app" } },
+      { threadId: "thr_1", params: { repo: "acme/other", number: 99 } },
       { rpc: rpc() },
     );
     await slot.findByText("Off by one");
-    expect(
-      slot.inspection.rpcCalls.some((entry) => entry.method === "getReviewForThread"),
-    ).toBe(true);
+    const call = slot.inspection.rpcCalls.find((entry) => entry.method === "getReviewForThread");
+    expect(call?.input).toEqual({ threadId: "thr_1" });
     slot.lifecycle.unmount();
   });
 
@@ -1271,7 +1269,8 @@ describe("the review tab opening itself", () => {
       expect(slot.inspection.navigateCalls).toContainEqual(
         expect.objectContaining({
           method: "openThreadPanel",
-          options: { actionId: "review", params: { repo: "acme/app", number: 7 } },
+          // No params, so BB matches the tab the server wrote.
+          options: { actionId: "review" },
         }),
       );
     });

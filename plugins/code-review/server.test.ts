@@ -1165,12 +1165,14 @@ describe("opening a review", () => {
     expect(review.threadId).toBe("thr_1");
     expect(host.tabsOf("thr_1")).toEqual([
       {
-        id: "code-review-review-acme-app-7",
+        // BB's own id for this tab when opened with no params, so the
+        // header's open focuses it rather than adding a second copy.
+        id: "plugin-panel:code-review%3Areview%3A:none",
         kind: "plugin-panel",
         pluginId: "code-review",
         actionId: "review",
         title: "Code review",
-        paramsJson: JSON.stringify({ repo: REPO, number: 7 }),
+        paramsJson: null,
       },
     ]);
   });
@@ -1190,6 +1192,43 @@ describe("opening a review", () => {
     await host.call("openReview", { repo: REPO, number: 7 });
     await host.call("openReview", { repo: REPO, number: 7 });
     expect(host.tabsOf("thr_1")).toHaveLength(1);
+  });
+
+  it("folds the copies older versions left into the one fixed tab", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    const fixed = host.tabsOf("thr_1")[0];
+    const params = JSON.stringify({ repo: REPO, number: 7 });
+    const legacy = (id: string) => ({
+      id,
+      kind: "plugin-panel",
+      pluginId: "code-review",
+      actionId: "review",
+      title: "Code review",
+      paramsJson: params,
+    });
+    const terminal = { id: "t1", kind: "terminal", terminalId: "term_1" };
+    // What earlier versions left behind: the server's copy, then BB's copy of
+    // the same PR-carrying tab.
+    host.seedTabs("thr_1", [
+      terminal,
+      legacy("code-review-review-acme-app-7"),
+      legacy(`plugin-panel:${encodeURIComponent(`code-review:review:${params}`)}:none`),
+    ]);
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1")).toEqual([terminal, fixed]);
+  });
+
+  it("leaves another plugin's tabs alone", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    const other = { ...host.tabsOf("thr_1")[0], id: "other-tab", pluginId: "pr-manager" };
+    host.seedTabs("thr_1", [other]);
+    await host.call("openReview", { repo: REPO, number: 7 });
+    expect(host.tabsOf("thr_1").map((tab) => tab.id)).toEqual([
+      "other-tab",
+      "plugin-panel:code-review%3Areview%3A:none",
+    ]);
   });
 
   it("retries once when someone else changed the tabs in between", async () => {

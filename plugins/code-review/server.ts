@@ -1245,17 +1245,32 @@ interface ContextRow {
    * compare-and-swap with one retry. Failing to write the tab must not fail
    * the open: the review is reachable from the thread panel's own
    * New tab -> Actions list either way.
+   *
+   * Earlier versions put the PR in the tab's params, and wrote it under an id
+   * BB did not match, so their threads can carry two or three copies of it.
+   * Every review tab on the thread, whatever its params, is replaced by the
+   * one fixed tab, in the first copy's place.
    */
-  async function ensureReviewTab(threadId: string, repo: string, number: number): Promise<void> {
-    const tab = reviewTabFor({ pluginId: bb.pluginId, repo, number });
+  async function ensureReviewTab(threadId: string): Promise<void> {
+    const tab = reviewTabFor(bb.pluginId);
+    const isReviewTab = (entry: { id: string } & Record<string, unknown>) =>
+      entry.id === tab.id ||
+      (entry.kind === tab.kind &&
+        entry.pluginId === tab.pluginId &&
+        entry.actionId === tab.actionId);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         const current = await bb.sdk.threads.tabs.get({ threadId });
-        if (current.tabs.some((entry) => entry.id === tab.id)) return;
+        const copies = current.tabs.filter(isReviewTab);
+        if (copies.length === 1 && copies[0].id === tab.id) return;
+        const at = current.tabs.findIndex(isReviewTab);
+        const others = current.tabs.filter((entry) => !isReviewTab(entry));
+        const tabs =
+          at === -1 ? [...others, tab] : [...others.slice(0, at), tab, ...others.slice(at)];
         await bb.sdk.threads.tabs.update({
           threadId,
           expectedRevision: current.revision,
-          tabs: [...current.tabs, tab],
+          tabs,
         });
         return;
       } catch (error) {
@@ -1297,7 +1312,7 @@ interface ContextRow {
         "This pull request has no review thread to open \u2014 start a new review instead.",
       );
     }
-    await ensureReviewTab(existing.thread_id, repo, number);
+    await ensureReviewTab(existing.thread_id);
     return { threadId: existing.thread_id, review: toReviewDto(existing) };
   }
 
@@ -2049,7 +2064,7 @@ interface ContextRow {
       await checkAuth();
       const review = await startReview(repo, number, skills);
       // The caller navigates to this thread next, so its tab has to be there.
-      if (review.threadId !== null) await ensureReviewTab(review.threadId, repo, number);
+      if (review.threadId !== null) await ensureReviewTab(review.threadId);
       return { review };
     },
 

@@ -1504,33 +1504,28 @@ export interface ReviewPanelTab {
   pluginId: string;
   actionId: string;
   title: string;
-  paramsJson: string;
-}
-
-/** Lowercase, dash-separated, safe to embed in a tab id. */
-function slug(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  /** Always null: the tab works out its review from the thread it is in. */
+  paramsJson: null;
 }
 
 /**
- * The review tab for one pull request. The id is derived rather than random so
- * a second `openReview` for the same PR recognises the tab it already wrote,
- * even if the params comparison changes shape later.
+ * A thread's review tab. A review thread holds exactly one review, so the tab
+ * carries no params and is the same for every review.
+ *
+ * The id is the one BB itself gives this tab whenever it opens it with no
+ * params — from `openThreadPanel` or the New tab -> Actions list — and BB
+ * decides an open matches a tab already there by id. Writing the tab under any
+ * other id means BB's open adds a second, identical tab. The SDK does not
+ * export BB's recipe, so this mirrors it:
+ * `plugin-panel:<"pluginId:actionId:", URI-encoded>:none`.
  */
-export function reviewTabFor(args: {
-  pluginId: string;
-  repo: string;
-  number: number;
-}): ReviewPanelTab {
+export function reviewTabFor(pluginId: string): ReviewPanelTab {
   return {
-    id: `${args.pluginId}-review-${slug(args.repo)}-${args.number}`,
+    id: `plugin-panel:${encodeURIComponent(`${pluginId}:${REVIEW_TAB_ACTION_ID}:`)}:none`,
     kind: "plugin-panel",
-    pluginId: args.pluginId,
+    pluginId,
     actionId: REVIEW_TAB_ACTION_ID,
     title: "Code review",
-    paramsJson: JSON.stringify({ repo: args.repo, number: args.number }),
+    paramsJson: null,
   };
 }
