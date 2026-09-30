@@ -8,10 +8,11 @@ A GitHub CLI-backed BB plugin for keeping ongoing pull requests visible and acti
 - Treats a PR as needing a response when a reviewer has requested changes or commented and has not been re-requested, or when someone has left a PR comment you have not replied to since. Bots and your own activity never count.
 - Shows only the newest run of each check, so a cancelled run that a later re-run superseded no longer reads as failing.
 - Loads the last saved result immediately and only contacts GitHub when Refresh is clicked.
-- Filters the list and status counts by repository, searches by keyword across title, repository, number, branch and status, and sorts by status, creation or last update — all remembered between sessions.
+- Shows one BB project at a time, choosing among the projects whose origin is on GitHub. Each project's list is saved separately, and Refresh fetches only the selected project's PRs.
+- Filters by status, searches by keyword across title, repository, number, branch and status, and sorts by status, creation or last update. The selected project and sort order are remembered between sessions.
 - Asks what the agent should do when you create a thread, and sends that as the thread's first message.
 - Finds existing BB threads by remembered PR links or matching project branches.
 - Fetches a PR-specific Git ref and spawns a managed BB worktree/thread when requested.
-- Provides cached and explicit-refresh commands through `bb pr-manager list [--json]` and `bb pr-manager refresh [--json]`.
+- Provides cached and explicit-refresh commands through `bb pr-manager list [--repo owner/name] [--json]` and `bb pr-manager refresh [--repo owner/name] [--json]`, which act on the selected project unless `--repo` names another.
 
-The merged-PR window and list limit are configurable in BB’s plugin settings. A connected machine needs `gh` installed and authenticated.
+Every open PR is listed. The merged-PR window and the number of merged PRs per project are configurable in BB’s plugin settings. A connected machine needs `gh` installed and authenticated.

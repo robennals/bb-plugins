@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { PullRequest, rpcContract } from "./server";
+import type { PullRequest, SavedState, rpcContract } from "./server";
 import { PULL_REQUEST_STATUSES } from "./pr-status";
 import { SORT_ORDERS, SORT_ORDER_LABELS, searchPullRequests, sortPullRequests, type SortOrder } from "./pr-list";
 import { Input } from "@/components/ui/input";
@@ -152,64 +152,46 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
 }
 function PrManagerPage() {
   const rpc = useRpc<typeof rpcContract>();
-  const [prs, setPrs] = useState<PullRequest[] | null>(null);
-  const [repositoryFilter, setRepositoryFilter] = useState<string | null>(null);
+  const [saved, setSaved] = useState<SavedState | null>(null);
   const [statusFilter, setStatusFilter] = useState<PullRequest["status"] | null>(null);
-  const [sortOrder, setSortOrder] = useState<SortOrder>("STATUS");
   const [query, setQuery] = useState("");
-  const [refreshedAt, setRefreshedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const applyResult = useCallback((result: { prs: PullRequest[]; refreshedAt: string | null; repositoryFilter: string | null; sortOrder: SortOrder }) => {
-    setPrs(result.prs); setRefreshedAt(result.refreshedAt); setRepositoryFilter(result.repositoryFilter);
-    setSortOrder(result.sortOrder); setError(null);
-  }, []);
+  const applyResult = useCallback((result: SavedState) => { setSaved(result); setError(null); }, []);
   const loadCached = useCallback(async () => {
     try {
       const result = await rpc.call("prs_list");
       applyResult(result);
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
   }, [applyResult, rpc]);
+  const selectedRepository = saved?.selectedRepository ?? null;
+  const sortOrder = saved?.sortOrder ?? "STATUS";
+  // Refreshes only the selected repository; every other repository keeps its saved list.
   const refresh = useCallback(async () => {
+    if (selectedRepository === null) return;
     setRefreshing(true);
     try {
-      const result = await rpc.call("prs_refresh");
+      const result = await rpc.call("prs_refresh", { repository: selectedRepository });
       applyResult(result);
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setRefreshing(false); }
-  }, [applyResult, rpc]);
-  const changeView = useCallback(async (repository: string | null, order: SortOrder) => {
-    setRepositoryFilter(repository); setSortOrder(order);
+  }, [applyResult, rpc, selectedRepository]);
+  const changeView = useCallback(async (repository: string, order: SortOrder) => {
+    setSaved((current) => current === null ? null : { ...current, sortOrder: order });
     try {
-      await rpc.call("prs_set_view", { repository, sortOrder: order });
+      applyResult(await rpc.call("prs_set_view", { repository, sortOrder: order }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       void loadCached();
     }
-  }, [loadCached, rpc]);
+  }, [applyResult, loadCached, rpc]);
   useEffect(() => {
     void loadCached();
   }, [loadCached]);
   useRealtime("prs-changed", loadCached);
-  const repositories = useMemo(() => {
-    const latestPrByRepository = new Map<string, number>();
-    for (const pr of prs ?? []) {
-      const createdAt = Date.parse(pr.createdAt);
-      latestPrByRepository.set(pr.repository, Math.max(latestPrByRepository.get(pr.repository) ?? 0, Number.isNaN(createdAt) ? 0 : createdAt));
-    }
-    return [...latestPrByRepository.keys()].sort((a, b) =>
-      (latestPrByRepository.get(b) ?? 0) - (latestPrByRepository.get(a) ?? 0) || a.localeCompare(b));
-  }, [prs]);
-  useEffect(() => {
-    if (repositoryFilter !== null && !repositories.includes(repositoryFilter)) {
-      void changeView(null, sortOrder);
-    }
-  }, [changeView, repositories, repositoryFilter, sortOrder]);
-  const repositoryPrs = useMemo(
-    () => repositoryFilter === null ? (prs ?? []) : (prs ?? []).filter((pr) => pr.repository === repositoryFilter),
-    [prs, repositoryFilter],
-  );
-  const searchedPrs = useMemo(() => searchPullRequests(repositoryPrs, query), [query, repositoryPrs]);
+  const list = saved?.list ?? null;
+  const prs = useMemo(() => list?.prs ?? [], [list]);
+  const searchedPrs = useMemo(() => searchPullRequests(prs, query), [query, prs]);
   // Counts follow the search so the chips describe the list you are actually looking at.
   const counts = useMemo(() => {
     const result = new Map<PullRequest["status"], number>();
@@ -230,25 +212,27 @@ function PrManagerPage() {
           <div>
             <h1 className="text-base font-semibold">Your pull requests</h1>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              {prs === null
+              {saved === null
                 ? "Loading saved status…"
-                : filteredPrs.length === prs.length
-                  ? `${prs.length} current and recently merged`
-                  : `${filteredPrs.length} of ${prs.length} shown`}
-              {refreshedAt === null ? "" : ` · refreshed ${new Date(refreshedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
+                : list === null
+                  ? selectedRepository ?? ""
+                  : `${list.repository} · ${filteredPrs.length === prs.length
+                    ? `${prs.length} current and recently merged`
+                    : `${filteredPrs.length} of ${prs.length} shown`}`}
+              {list === null ? "" : ` · refreshed ${new Date(list.refreshedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {repositories.length > 1 ? (
+            {saved !== null && selectedRepository !== null ? (
               <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>Repository</span>
+                <span>Project</span>
                 <select
-                  value={repositoryFilter ?? ""}
-                  onChange={(event) => void changeView(event.target.value === "" ? null : event.target.value, sortOrder)}
+                  value={selectedRepository}
+                  onChange={(event) => void changeView(event.target.value, sortOrder)}
                   className="h-8 max-w-64 rounded-md border border-input bg-background px-2 text-sm text-foreground shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <option value="">All repositories</option>
-                  {repositories.map((repository) => <option key={repository} value={repository}>{repository}</option>)}
+                  {saved.repositories.map(({ repository, projectName }) =>
+                    <option key={repository} value={repository}>{projectName}</option>)}
                 </select>
               </label>
             ) : null}
@@ -256,13 +240,16 @@ function PrManagerPage() {
               <span>Sort</span>
               <select
                 value={sortOrder}
-                onChange={(event) => void changeView(repositoryFilter, SORT_ORDERS.find((order) => order === event.target.value) ?? sortOrder)}
+                onChange={(event) => {
+                  if (selectedRepository !== null) void changeView(selectedRepository, SORT_ORDERS.find((order) => order === event.target.value) ?? sortOrder);
+                }}
                 className="h-8 rounded-md border border-input bg-background px-2 text-sm text-foreground shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 {SORT_ORDERS.map((order) => <option key={order} value={order}>{SORT_ORDER_LABELS[order]}</option>)}
               </select>
             </label>
-            <Button size="sm" variant="outline" onClick={() => void refresh()} disabled={refreshing}>
+            <Button size="sm" variant="outline" onClick={() => void refresh()} disabled={refreshing || selectedRepository === null}
+              aria-label={`Refresh ${selectedRepository ?? ""} only`}>
               <Icon name="RotateCcw" className={cn("size-4", refreshing && "animate-spin")} />Refresh
             </Button>
           </div>
@@ -278,7 +265,7 @@ function PrManagerPage() {
             className="h-9 pl-8"
           />
         </div>
-        {prs !== null && prs.length > 0 ? (
+        {prs.length > 0 ? (
           <div className="mt-3 flex flex-wrap gap-1.5">{PULL_REQUEST_STATUSES.filter((status) => counts.has(status)).map((status) =>
             <button
               key={status}
@@ -297,9 +284,10 @@ function PrManagerPage() {
         ) : null}
         {error === null ? null : <div role="alert" className="mt-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>}
         <div className="mt-4 space-y-2.5">
-          {prs === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">Loading your saved pull request list…</div>
-          : refreshedAt === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No saved pull request list yet. Click Refresh to load it.</div>
-          : prs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No open or recently merged pull requests.</div>
+          {saved === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">Loading your saved pull request list…</div>
+          : selectedRepository === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">Add a BB project whose origin is on GitHub to see its pull requests here.</div>
+          : list === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No saved pull request list for {selectedRepository} yet. Click Refresh to load it.</div>
+          : prs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No open or recently merged pull requests in {selectedRepository}.</div>
           : filteredPrs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No pull requests match these filters.</div>
           : filteredPrs.map((pr) => <PullRequestRow key={pr.key} pr={pr} onChanged={() => void loadCached()} />)}
         </div>

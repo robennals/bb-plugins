@@ -65,12 +65,13 @@ function normalizeRemote(remote: string): string | null {
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
-    async listPullRequests({ mergedWithinDays, maximumPullRequests }, context) {
+    async listPullRequests({ repository, mergedWithinDays, maximumMergedPullRequests }, context) {
       await run("gh", ["auth", "status"], context.signal);
       const since = new Date(Date.now() - mergedWithinDays * 86_400_000).toISOString().slice(0, 10);
       const [open, merged] = await Promise.all([
-        search(["--state=open", "--sort=updated", "--order=desc", `--limit=${maximumPullRequests}`], context.signal),
-        search(["--merged", `--merged-at=>=${since}`, "--sort=updated", "--order=desc", `--limit=${maximumPullRequests}`], context.signal),
+        // Every open PR, up to GitHub search's own ceiling of 1000.
+        search([`--repo=${repository}`, "--state=open", "--sort=updated", "--order=desc", "--limit=1000"], context.signal),
+        search([`--repo=${repository}`, "--merged", `--merged-at=>=${since}`, "--sort=updated", "--order=desc", `--limit=${maximumMergedPullRequests}`], context.signal),
       ]);
       const unique = [...new Map([...open, ...merged].map((pr) => [pr.url, pr])).values()];
       const pullRequests = await mapConcurrent(unique, 6, async (result) => {

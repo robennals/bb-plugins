@@ -1,6 +1,6 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { hostContract } from "./contract.js";
+import { hostContract, repositoryNameSchema, type HostPullRequest } from "./contract.js";
 import { PULL_REQUEST_STATUSES } from "./pr-status.js";
 import { SORT_ORDERS, sortPullRequests } from "./pr-list.js";
 import { buildThreadPrompt } from "./thread-prompt.js";
@@ -22,21 +22,33 @@ const pullRequestSchema = z.object({
 });
 export type PullRequest = z.infer<typeof pullRequestSchema>;
 
-const repositoryFilterSchema = z.string().min(1).nullable();
-const pullRequestListSchema = z.object({
-  prs: z.array(pullRequestSchema), refreshedAt: z.string().nullable(),
-  repositoryFilter: repositoryFilterSchema.default(null),
+// Each repository's pull requests are saved and refreshed on their own, so refreshing
+// one repository leaves every other repository's list as it was.
+const repositoryListSchema = z.object({
+  repository: z.string(), prs: z.array(pullRequestSchema), refreshedAt: z.string(),
+});
+type RepositoryList = z.infer<typeof repositoryListSchema>;
+const viewSchema = z.object({
+  selectedRepository: repositoryNameSchema.nullable().default(null),
   sortOrder: sortOrderSchema.default("STATUS"),
 });
-type PullRequestList = z.infer<typeof pullRequestListSchema>;
+type View = z.infer<typeof viewSchema>;
+// The repositories are those of the BB projects, so there is always one selected unless
+// no project has a GitHub remote. `list` is null until that repository is first refreshed.
+const savedStateSchema = z.object({
+  repositories: z.array(z.object({ repository: z.string(), projectName: z.string() })),
+  selectedRepository: z.string().nullable(), sortOrder: sortOrderSchema,
+  list: repositoryListSchema.nullable(),
+});
+export type SavedState = z.infer<typeof savedStateSchema>;
 
 export const rpcContract = defineRpcContract({
-  prs_list: { input: z.null(), output: pullRequestListSchema },
-  prs_refresh: { input: z.null(), output: pullRequestListSchema },
+  prs_list: { input: z.null(), output: savedStateSchema },
+  prs_refresh: { input: z.object({ repository: repositoryNameSchema }), output: savedStateSchema },
   // The whole persisted view is sent at once, so there is no partial-update merge.
   prs_set_view: {
-    input: z.object({ repository: repositoryFilterSchema, sortOrder: sortOrderSchema }),
-    output: z.object({ repositoryFilter: repositoryFilterSchema, sortOrder: sortOrderSchema }),
+    input: z.object({ repository: repositoryNameSchema, sortOrder: sortOrderSchema }),
+    output: savedStateSchema,
   },
   // Returns null when the PR has no live thread, so the caller knows to ask for
   // instructions and create one instead of navigating to a dead thread. An archived
@@ -55,23 +67,28 @@ export const rpcContract = defineRpcContract({
   },
 });
 
-function normalizeGitHubRepository(remote: string | null): string | null {
+// `owner/name` as the remote spells it, which is how the repository is shown.
+function gitHubRepository(remote: string | null): string | null {
   if (remote === null) return null;
   const cleaned = remote.trim().replace(/\.git$/, "").replace(/^ssh:\/\//, "");
-  const match = cleaned.match(/(?:git@|https?:\/\/)?github\.com[:/]([^/]+\/[^/]+)$/i);
-  return match?.[1]?.toLowerCase() ?? null;
+  return cleaned.match(/(?:git@|https?:\/\/)?github\.com[:/]([^/]+\/[^/]+)$/i)?.[1] ?? null;
 }
+const normalizeGitHubRepository = (remote: string | null) => gitHubRepository(remote)?.toLowerCase() ?? null;
 
 const linkKey = (repository: string, number: number) => `thread:${repository.toLowerCase()}#${number}`;
-const PR_LIST_CACHE_KEY = "pull-request-list-v2";
+const LIST_KEY_PREFIX = "pull-requests:";
+const listKey = (repository: string) => `${LIST_KEY_PREFIX}${repository.toLowerCase()}`;
+const VIEW_KEY = "pull-request-view";
+// The single list every repository shared before lists were saved per repository.
+const LEGACY_LIST_KEY = "pull-request-list-v2";
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     mergedWithinDays: {
       type: "select", label: "Keep merged PRs visible", options: ["7", "14", "30"], default: "14",
     },
-    maximumPullRequests: {
-      type: "select", label: "Maximum PRs per status", options: ["25", "50", "100"], default: "50",
+    maximumMergedPullRequests: {
+      type: "select", label: "Maximum merged PRs per project", options: ["25", "50", "100"], default: "50",
     },
   });
   const host = bb.hosts.experimental_client({ contract: hostContract });
@@ -85,24 +102,52 @@ export default async function plugin(bb: BbPluginApi) {
     return { projects, allThreads };
   }
 
-  async function readCachedPullRequests(): Promise<PullRequestList> {
-    const cached = await bb.storage.kv.get<unknown>(PR_LIST_CACHE_KEY);
-    const parsed = pullRequestListSchema.safeParse(cached);
-    return parsed.success ? parsed.data : { prs: [], refreshedAt: null, repositoryFilter: null, sortOrder: "STATUS" };
+  async function readRepositoryList(repository: string): Promise<RepositoryList | null> {
+    const parsed = repositoryListSchema.safeParse(await bb.storage.kv.get<unknown>(listKey(repository)));
+    return parsed.success ? parsed.data : null;
   }
 
-  async function refreshPullRequests(): Promise<PullRequestList> {
-    const [{ mergedWithinDays, maximumPullRequests }, hosts, context, cached] = await Promise.all([
-      settings.get(), bb.sdk.hosts.list(), projectAndThreadContext(), readCachedPullRequests(),
-    ]);
-    const connected = hosts.filter((candidate) => candidate.status === "connected");
-    if (connected.length === 0) throw new Error("No connected BB machine is available.");
-    const projectHostIds = new Set(context.projects.flatMap((project) => project.sources.map((source) => source.hostId)));
-    const queryHost = connected.find((candidate) => projectHostIds.has(candidate.id)) ?? connected[0]!;
-    const raw = await host.call("listPullRequests", {
-      mergedWithinDays: Number(mergedWithinDays), maximumPullRequests: Number(maximumPullRequests),
-    }, { hostId: queryHost.id });
+  // One entry per GitHub repository, named after the first project that uses it.
+  async function projectRepositories(): Promise<SavedState["repositories"]> {
+    const byKey = new Map<string, SavedState["repositories"][number]>();
+    for (const project of await bb.sdk.projects.list()) {
+      const repository = gitHubRepository(project.gitRemoteUrl);
+      if (repository !== null && !byKey.has(listKey(repository))) byKey.set(listKey(repository), { repository, projectName: project.name });
+    }
+    return [...byKey.values()].sort((a, b) => a.projectName.localeCompare(b.projectName, undefined, { sensitivity: "base" }));
+  }
 
+  async function readView(): Promise<View> {
+    const parsed = viewSchema.safeParse(await bb.storage.kv.get<unknown>(VIEW_KEY));
+    return parsed.success ? parsed.data : { selectedRepository: null, sortOrder: "STATUS" };
+  }
+
+  function findRepository(repositories: SavedState["repositories"], repository: string) {
+    const found = repositories.find((candidate) => listKey(candidate.repository) === listKey(repository));
+    if (found === undefined) throw new Error(`${repository} is not the GitHub repository of any BB project.`);
+    return found.repository;
+  }
+
+  // The saved selection, or the first project's repository once that selection is gone.
+  // `repository` shows another repository without changing the saved selection.
+  async function readSavedState(repository?: string): Promise<SavedState> {
+    const [repositories, view] = await Promise.all([projectRepositories(), readView()]);
+    const { selectedRepository: savedRepository } = view;
+    const saved = savedRepository === null ? undefined
+      : repositories.find((candidate) => listKey(candidate.repository) === listKey(savedRepository));
+    const selectedRepository = repository !== undefined ? findRepository(repositories, repository)
+      : saved?.repository ?? repositories[0]?.repository ?? null;
+    const list = selectedRepository === null ? null : await readRepositoryList(selectedRepository);
+    return { repositories, selectedRepository, sortOrder: view.sortOrder, list };
+  }
+
+  async function saveView(view: View) {
+    await bb.storage.kv.set(VIEW_KEY, view);
+  }
+
+  async function linkProjectsAndThreads(
+    pullRequests: HostPullRequest[], context: Awaited<ReturnType<typeof projectAndThreadContext>>,
+  ): Promise<PullRequest[]> {
     const projectByRepository = new Map<string, (typeof context.projects)[number]>();
     const usableThreads = context.allThreads.filter((thread) => thread.status !== "error");
     for (const project of context.projects) {
@@ -110,11 +155,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (repository !== null && !projectByRepository.has(repository)) projectByRepository.set(repository, project);
     }
     const prs: PullRequest[] = [];
-    for (const pr of raw.pullRequests) {
+    for (const pr of pullRequests) {
       const project = projectByRepository.get(pr.repository.toLowerCase()) ?? null;
       let thread = null;
       const storedThreadId = await bb.storage.kv.get<string>(linkKey(pr.repository, pr.number));
-      if (storedThreadId !== null) thread = usableThreads.find((candidate) => candidate.id === storedThreadId) ?? null;
+      if (storedThreadId !== undefined) thread = usableThreads.find((candidate) => candidate.id === storedThreadId) ?? null;
       if (thread === null && project !== null) {
         thread = usableThreads.find((candidate) =>
           candidate.projectId === project.id && candidate.environmentBranchName === pr.headRefName) ?? null;
@@ -135,17 +180,34 @@ export default async function plugin(bb: BbPluginApi) {
         threadArchived: thread !== null && thread.archivedAt !== null,
       });
     }
-    const repositoryFilter = cached.repositoryFilter !== null && prs.some((pr) => pr.repository === cached.repositoryFilter)
-      ? cached.repositoryFilter
-      : null;
-    const result = { prs, refreshedAt: new Date().toISOString(), repositoryFilter, sortOrder: cached.sortOrder };
-    await bb.storage.kv.set(PR_LIST_CACHE_KEY, result);
-    return result;
+    return prs;
+  }
+
+  async function refreshPullRequests(requested: string): Promise<SavedState> {
+    const [{ mergedWithinDays, maximumMergedPullRequests }, hosts, context, repositories] = await Promise.all([
+      settings.get(), bb.sdk.hosts.list(), projectAndThreadContext(), projectRepositories(),
+    ]);
+    const repository = findRepository(repositories, requested);
+    const connected = hosts.filter((candidate) => candidate.status === "connected");
+    if (connected.length === 0) throw new Error("No connected BB machine is available.");
+    const projectHostIds = new Set(context.projects.flatMap((project) => project.sources.map((source) => source.hostId)));
+    const queryHost = connected.find((candidate) => projectHostIds.has(candidate.id)) ?? connected[0]!;
+    const raw = await host.call("listPullRequests", {
+      repository, mergedWithinDays: Number(mergedWithinDays), maximumMergedPullRequests: Number(maximumMergedPullRequests),
+    }, { hostId: queryHost.id });
+    const list: RepositoryList = {
+      repository, prs: await linkProjectsAndThreads(raw.pullRequests, context), refreshedAt: new Date().toISOString(),
+    };
+    await bb.storage.kv.set(listKey(repository), list);
+    // Lists of repositories that no project uses any more would never be shown again.
+    const kept = new Set(repositories.map((candidate) => listKey(candidate.repository)));
+    const stale = (await bb.storage.kv.list(LIST_KEY_PREFIX)).filter((key) => !kept.has(key));
+    await Promise.all(stale.map((key) => bb.storage.kv.delete(key)));
+    return readSavedState(repository);
   }
 
   async function resolveLinkedThread(repository: string, number: number): Promise<{ threadId: string; archived: boolean } | null> {
-    const existing = (await readCachedPullRequests()).prs.find((candidate) =>
-      candidate.repository === repository && candidate.number === number);
+    const existing = (await readRepositoryList(repository))?.prs.find((candidate) => candidate.number === number);
     if (existing?.threadId === null || existing?.threadId === undefined) return null;
     try {
       const thread = await bb.sdk.threads.get({ threadId: existing.threadId });
@@ -157,15 +219,12 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(rpcContract, {
-    prs_list: () => readCachedPullRequests(),
-    prs_refresh: () => refreshPullRequests(),
+    prs_list: () => readSavedState(),
+    prs_refresh: ({ repository }) => refreshPullRequests(repository),
     prs_set_view: async ({ repository, sortOrder }) => {
-      const cached = await readCachedPullRequests();
-      if (repository !== null && !cached.prs.some((pr) => pr.repository === repository)) {
-        throw new Error("That repository is not in the saved pull request list.");
-      }
-      await bb.storage.kv.set(PR_LIST_CACHE_KEY, { ...cached, repositoryFilter: repository, sortOrder });
-      return { repositoryFilter: repository, sortOrder };
+      const selectedRepository = findRepository(await projectRepositories(), repository);
+      await saveView({ selectedRepository, sortOrder });
+      return readSavedState();
     },
     prs_resolve_thread: async ({ repository, number }) => {
       const linked = await resolveLinkedThread(repository, number);
@@ -198,11 +257,11 @@ export default async function plugin(bb: BbPluginApi) {
         origin: "plugin",
       });
       await bb.storage.kv.set(linkKey(input.repository, input.number), thread.id);
-      const cached = await readCachedPullRequests();
-      if (cached.refreshedAt !== null) {
-        await bb.storage.kv.set(PR_LIST_CACHE_KEY, {
-          ...cached,
-          prs: cached.prs.map((pr) => pr.repository === input.repository && pr.number === input.number
+      const list = await readRepositoryList(input.repository);
+      if (list !== null) {
+        await bb.storage.kv.set(listKey(input.repository), {
+          ...list,
+          prs: list.prs.map((pr) => pr.number === input.number
             ? { ...pr, threadId: thread.id, threadTitle: thread.title ?? thread.titleFallback ?? null, threadArchived: false }
             : pr),
         });
@@ -215,18 +274,26 @@ export default async function plugin(bb: BbPluginApi) {
   bb.cli.register({
     name: "pr-manager", summary: "List pull requests tracked by PR Manager",
     commands: [
-      { name: "list", summary: "List cached PR statuses", usage: "bb pr-manager list [--json]" },
-      { name: "refresh", summary: "Refresh PR statuses from GitHub", usage: "bb pr-manager refresh [--json]" },
+      { name: "list", summary: "List cached PR statuses", usage: "bb pr-manager list [--repo owner/name] [--json]" },
+      { name: "refresh", summary: "Refresh PR statuses from GitHub", usage: "bb pr-manager refresh [--repo owner/name] [--json]" },
     ],
+    // Without --repo, both commands act on the repository selected in the panel.
     async run(argv) {
-      if (argv[0] !== "list" && argv[0] !== "refresh") {
-        return { exitCode: 1, stderr: "Usage: bb pr-manager <list|refresh> [--json]" };
-      }
-      const result = argv[0] === "refresh" ? await refreshPullRequests() : await readCachedPullRequests();
-      if (argv.includes("--json")) return { exitCode: 0, stdout: JSON.stringify(result) };
-      return { exitCode: 0, stdout: result.refreshedAt === null ? "No cached pull requests. Run `bb pr-manager refresh`." : result.prs.length === 0 ? "No current pull requests." : sortPullRequests(result.prs, result.sortOrder)
+      const usage = "Usage: bb pr-manager <list|refresh> [--repo owner/name] [--json]";
+      if (argv[0] !== "list" && argv[0] !== "refresh") return { exitCode: 1, stderr: usage };
+      const repoFlag = argv.indexOf("--repo");
+      const requested = repoFlag === -1 ? null : repositoryNameSchema.safeParse(argv[repoFlag + 1]);
+      if (requested !== null && !requested.success) return { exitCode: 1, stderr: usage };
+      const selected = await readSavedState(requested?.data);
+      if (selected.selectedRepository === null) return { exitCode: 1, stderr: "No BB project has a GitHub remote." };
+      const state = argv[0] === "refresh" ? await refreshPullRequests(selected.selectedRepository) : selected;
+      if (argv.includes("--json")) return { exitCode: 0, stdout: JSON.stringify(state) };
+      if (state.list === null) return { exitCode: 0, stdout: `No saved pull requests for ${state.selectedRepository}. Run \`bb pr-manager refresh\`.` };
+      if (state.list.prs.length === 0) return { exitCode: 0, stdout: `No current pull requests in ${state.selectedRepository}.` };
+      return { exitCode: 0, stdout: sortPullRequests(state.list.prs, state.sortOrder)
         .map((pr) => `${pr.status.padEnd(statusColumn)} ${pr.repository}#${pr.number}  ${pr.title}\n${" ".repeat(statusColumn + 1)}${pr.summary}`).join("\n") };
     },
   });
+  await bb.storage.kv.delete(LEGACY_LIST_KEY);
   bb.log.info("loaded");
 }
