@@ -106,6 +106,13 @@ const pullRequestSchema = z.object({
   reviewStatus: z.enum(["none", "queued", "running", "reported", "failed"]),
   openFindings: z.number(),
   postedFindings: z.number(),
+  /** The review's thread, when it has one — so the panel can link to an archived one. */
+  reviewThreadId: z.string().nullable(),
+  /**
+   * Unarchiving is broken in BB, so an archived thread cannot be worked in. The
+   * panel offers a new review instead, and keeps the old thread as a read-only link.
+   */
+  reviewThreadArchived: z.boolean(),
 });
 export type PullRequestDto = z.infer<typeof pullRequestSchema>;
 
@@ -1036,15 +1043,42 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   }
 
 
+  /**
+   * Every archived thread BB knows about, as one list call per project rather
+   * than a `threads.get` per pull request, so the cost does not grow with the
+   * list. A project with more archived threads than the limit, or a thread in
+   * no listed project, can still slip through — `openReview` re-checks the one
+   * thread it is about to open.
+   */
+  async function listArchivedThreadIds(): Promise<Set<string>> {
+    try {
+      const projects = await bb.sdk.projects.list();
+      const lists = await Promise.all(
+        projects.map((project) =>
+          bb.sdk.threads.list({ projectId: project.id, archived: true, limit: 500 }),
+        ),
+      );
+      return new Set(lists.flat().map((thread) => thread.id));
+    } catch (error) {
+      // A failed lookup must not empty the pull request list. Treat every thread
+      // as live and leave it to openReview's own check.
+      bb.log.warn(`could not list archived threads: ${String(error)}`);
+      return new Set();
+    }
+  }
+
   /** Attach this plugin's review state to the wire DTO. */
-  function withReviewState(pr: PullRequest): PullRequestDto {
+  function withReviewState(pr: PullRequest, archivedThreadIds: Set<string>): PullRequestDto {
     const review = getReview(reviewIdFor(pr.repo, pr.number));
     const findings = review === null ? [] : listFindings(review.id);
+    const threadId = review?.thread_id ?? null;
     return {
       ...pr,
       reviewStatus: review === null ? "none" : toReviewDto(review).status,
       openFindings: findings.filter((finding) => finding.state === "open").length,
       postedFindings: findings.filter((finding) => finding.state === "posted").length,
+      reviewThreadId: threadId,
+      reviewThreadArchived: threadId !== null && archivedThreadIds.has(threadId),
     };
   }
 
@@ -1282,11 +1316,16 @@ interface ContextRow {
     }
   }
 
-  /** Is this thread still there? A deleted one cannot be opened. */
-  async function threadExists(threadId: string): Promise<boolean> {
+  /**
+   * Can this thread still be opened? A deleted one is gone, and an archived one
+   * cannot be worked in while unarchiving is broken in BB — and `threads.get`
+   * returns an archived thread perfectly happily, so only checking for deletion
+   * would walk the user into a thread they cannot use.
+   */
+  async function threadOpenable(threadId: string): Promise<boolean> {
     try {
-      await bb.sdk.threads.get({ threadId });
-      return true;
+      const thread = await bb.sdk.threads.get({ threadId });
+      return thread.archivedAt === null;
     } catch {
       return false;
     }
@@ -1306,7 +1345,7 @@ interface ContextRow {
     if (
       existing === null ||
       existing.thread_id === null ||
-      !(await threadExists(existing.thread_id))
+      !(await threadOpenable(existing.thread_id))
     ) {
       throw new Error(
         "This pull request has no review thread to open \u2014 start a new review instead.",
@@ -2035,11 +2074,12 @@ interface ContextRow {
       await checkAuth();
       const { prs, fetchedAt } = await fetchPullRequests(repo, refresh === true);
       const filtered = filterPullRequests(prs, filter, await filterContext());
+      const archivedThreadIds = await listArchivedThreadIds();
       return {
         fetchedAt,
         pullRequests: filtered
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-          .map(withReviewState),
+          .map((candidate) => withReviewState(candidate, archivedThreadIds)),
       };
     },
 
@@ -2052,8 +2092,9 @@ interface ContextRow {
       const { prs } = await fetchPullRequests(repo);
       const pr = prs.find((candidate) => candidate.number === number) ?? null;
       const review = getReview(reviewIdFor(repo, number));
+      const archivedThreadIds = await listArchivedThreadIds();
       return {
-        pullRequest: pr === null ? null : withReviewState(pr),
+        pullRequest: pr === null ? null : withReviewState(pr, archivedThreadIds),
         review: review === null ? null : toReviewDto(review),
         findings: review === null ? [] : listFindings(review.id),
         hasPendingReview: (await cachedPendingReviewId(repo, number)) !== null,
