@@ -6,6 +6,10 @@ export const SORT_ORDER_LABELS: Record<SortOrder, string> = {
   STATUS: "Status", CREATED: "Created", UPDATED: "Last updated",
 };
 
+// How often an open panel refreshes its list by itself. A refresh in which nothing has
+// changed costs GitHub a handful of small requests, so this stays far inside its limits.
+export const AUTO_REFRESH_INTERVAL_SECONDS = 120;
+
 interface OrderablePullRequest { status: PullRequestStatus; createdAt: string; updatedAt: string }
 // Your move first — broken, then awaiting your reply, then a review to request, then one
 // you can merge — before the ones still in someone else's court. A part-approved PR sits

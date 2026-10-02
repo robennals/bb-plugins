@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { PullRequest, SavedState, rpcContract } from "./server";
 import { PULL_REQUEST_STATUSES } from "./pr-status";
-import { SORT_ORDERS, SORT_ORDER_LABELS, searchPullRequests, sortPullRequests, type SortOrder } from "./pr-list";
+import { AUTO_REFRESH_INTERVAL_SECONDS, SORT_ORDERS, SORT_ORDER_LABELS, searchPullRequests, sortPullRequests, type SortOrder } from "./pr-list";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -167,15 +167,29 @@ function PrManagerPage() {
   const selectedRepository = saved?.selectedRepository ?? null;
   const sortOrder = saved?.sortOrder ?? "STATUS";
   // Refreshes only the selected repository; every other repository keeps its saved list.
-  const refresh = useCallback(async () => {
+  // `unlessRefreshedWithinSeconds` leaves a list refreshed that recently as it is.
+  const refresh = useCallback(async (unlessRefreshedWithinSeconds?: number) => {
     if (selectedRepository === null) return;
     setRefreshing(true);
     try {
-      const result = await rpc.call("prs_refresh", { repository: selectedRepository });
+      // The key is left out rather than sent as undefined, which is not a JSON value.
+      const result = await rpc.call("prs_refresh", unlessRefreshedWithinSeconds === undefined
+        ? { repository: selectedRepository } : { repository: selectedRepository, unlessRefreshedWithinSeconds });
       applyResult(result);
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setRefreshing(false); }
   }, [applyResult, rpc, selectedRepository]);
+  // Keeps the list current while it is on screen: when the panel opens or the window
+  // comes back into view, and on a timer in between. A hidden window asks for nothing.
+  // Half the interval counts as fresh: a list refreshed by the previous tick is always a
+  // little younger than the interval, and must not make this tick skip.
+  useEffect(() => {
+    const refreshIfStale = () => { if (!document.hidden) void refresh(AUTO_REFRESH_INTERVAL_SECONDS / 2); };
+    refreshIfStale();
+    const timer = setInterval(refreshIfStale, AUTO_REFRESH_INTERVAL_SECONDS * 1000);
+    document.addEventListener("visibilitychange", refreshIfStale);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", refreshIfStale); };
+  }, [refresh]);
   const changeView = useCallback(async (repository: string, order: SortOrder) => {
     setSaved((current) => current === null ? null : { ...current, sortOrder: order });
     try {

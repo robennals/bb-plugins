@@ -1,12 +1,13 @@
 import { createFakePluginHost, makeThreadResponse, type ExperimentalFakeHostRpcCall } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { hostContract, type HostPullRequest } from "./contract.js";
 import plugin, { rpcContract } from "./server.js";
 
 const hostPr = (repository: string, number: number, overrides: Partial<HostPullRequest> = {}): HostPullRequest => ({
-  repository, number, title: `PR ${number}`, url: `https://github.com/${repository}/pull/${number}`,
+  id: `id-${number}`, repository, number, title: `PR ${number}`, url: `https://github.com/${repository}/pull/${number}`,
   status: "OPEN", summary: "No review requested yet", isDraft: false, headRefName: `branch-${number}`,
-  baseRefName: "main", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z", mergedAt: null, ...overrides,
+  baseRefName: "main", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z", mergedAt: null,
+  changeMarker: "2026-09-01T00:00:00Z", ...overrides,
 });
 const project = (id: string, name: string, gitRemoteUrl: string | null) => ({
   id, name, gitRemoteUrl, sources: [{ hostId: "host-1", path: `/work/${name}`, isDefault: true }],
@@ -39,6 +40,8 @@ async function loadPlugin(pullRequests: HostPullRequest[]) {
   return { world, harness, listCalls, call };
 }
 
+afterEach(() => { vi.useRealTimers(); });
+
 describe("per-project pull request lists", () => {
   it("offers each project's GitHub repository once, by project name, before anything is refreshed", async () => {
     const { world, call, listCalls } = await loadPlugin([]);
@@ -63,6 +66,37 @@ describe("per-project pull request lists", () => {
     expect(web.list).toEqual(webBefore);
     expect(web.list?.prs[0]?.status).toBe("OPEN");
     expect(await call("prs_list", null)).toMatchObject({ selectedRepository: "acme/web", sortOrder: "UPDATED" });
+  });
+
+  it("hands the host that repository's saved pull requests, so it can reuse the unchanged ones", async () => {
+    const { call, listCalls } = await loadPlugin([hostPr("acme/web", 1), hostPr("Acme/Api", 2)]);
+    await call("prs_refresh", { repository: "Acme/Api" });
+    await call("prs_refresh", { repository: "acme/web" });
+    await call("prs_refresh", { repository: "acme/web" });
+    expect(listCalls.map((input) => hostContract.listPullRequests.input.parse(input).savedPullRequests))
+      .toEqual([[], [], [hostPr("acme/web", 1)]]);
+  });
+
+  it("leaves a recently refreshed list alone when asked to refresh only a stale one", async () => {
+    vi.useFakeTimers({ now: new Date("2026-09-01T12:00:00Z"), toFake: ["Date"] });
+    const { call, listCalls } = await loadPlugin([hostPr("acme/web", 1)]);
+    const first = await call("prs_refresh", { repository: "acme/web", unlessRefreshedWithinSeconds: 60 });
+    expect(listCalls).toHaveLength(1);
+    vi.setSystemTime(new Date("2026-09-01T12:00:59Z"));
+    expect(await call("prs_refresh", { repository: "acme/web", unlessRefreshedWithinSeconds: 60 })).toEqual(first);
+    expect(listCalls).toHaveLength(1);
+    vi.setSystemTime(new Date("2026-09-01T12:01:00Z"));
+    await call("prs_refresh", { repository: "acme/web", unlessRefreshedWithinSeconds: 60 });
+    expect(listCalls).toHaveLength(2);
+    await call("prs_refresh", { repository: "acme/web" });
+    expect(listCalls).toHaveLength(3);
+  });
+
+  it("asks GitHub once when the same repository is refreshed twice at the same moment", async () => {
+    const { call, listCalls } = await loadPlugin([hostPr("acme/web", 1)]);
+    const [one, other] = await Promise.all([call("prs_refresh", { repository: "acme/web" }), call("prs_refresh", { repository: "acme/web" })]);
+    expect(listCalls).toHaveLength(1);
+    expect(other).toEqual(one);
   });
 
   it("refuses repositories that are no project's", async () => {
