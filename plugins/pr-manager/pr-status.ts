@@ -1,5 +1,5 @@
 export type PullRequestStatus = "OPEN" | "DRAFT" | "WAITING" | "FAILING" | "FEEDBACK" | "APPROVED" | "PART_APPROVED" | "MERGED";
-export const PULL_REQUEST_STATUSES = ["FAILING", "FEEDBACK", "DRAFT", "OPEN", "APPROVED", "PART_APPROVED", "WAITING", "MERGED"] as const;
+export const PULL_REQUEST_STATUSES = ["FAILING", "FEEDBACK", "OPEN", "APPROVED", "PART_APPROVED", "WAITING", "DRAFT", "MERGED"] as const;
 
 // An entry of the status check rollup: either a check run (name, workflowName, status,
 // conclusion, startedAt) or a commit status (context, state, createdAt).

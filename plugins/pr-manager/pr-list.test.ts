@@ -25,6 +25,12 @@ describe("sortPullRequests", () => {
     ];
     expect(sortPullRequests(twoFailing, "STATUS")[0]!.updatedAt).toBe("2026-03-01T00:00:00Z");
   });
+  it("sinks a draft below every pull request you are actually watching", () => {
+    const draft = pr({ status: "DRAFT" });
+    const waiting = pr({ status: "WAITING" });
+    const merged = pr({ status: "MERGED" });
+    expect(sortPullRequests([merged, draft, waiting], "STATUS")).toEqual([waiting, draft, merged]);
+  });
   it("puts a PR you can merge above one still in someone else's court", () => {
     const approved = pr({ status: "APPROVED" });
     const partApproved = pr({ status: "PART_APPROVED" });
