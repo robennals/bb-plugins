@@ -62,7 +62,6 @@ export interface BrowserProps {
   onOpenPath: (path: string | null) => void;
   /** Omit to pin the surface to one workspace (the thread panel does). */
   onChangeScope?: (scope: ScopeRef) => void;
-  variant: "page" | "panel";
 }
 
 export function Browser({
@@ -70,7 +69,6 @@ export function Browser({
   filePath,
   onOpenPath,
   onChangeScope,
-  variant,
 }: BrowserProps) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -81,7 +79,7 @@ export function Browser({
   const [explorerWidth, setExplorerWidth] = useState(readStoredWidth);
   const [isExplorerOpen, setIsExplorerOpen] = useState(true);
   const [isQuickOpen, setIsQuickOpen] = useState(false);
-  // The last visit to THIS workspace, read once. The page variant is keyed on
+  // The last visit to THIS workspace, read once. The Files page is keyed on
   // the workspace by its caller, so a fresh workspace remounts and re-reads.
   const [restored] = useState(() => readSession(scope));
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(
@@ -203,10 +201,9 @@ export function Browser({
   const openFile = useCallback(
     (path: string) => {
       onOpenPath(path);
-      if (variant === "panel") setIsExplorerOpen(false);
       requestAnimationFrame(() => rootRef.current?.focus({ preventScroll: true }));
     },
-    [onOpenPath, variant],
+    [onOpenPath],
   );
 
   // Remember where you were, so leaving and coming back does not land you on a
