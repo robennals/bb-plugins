@@ -19,6 +19,8 @@ const pullRequestSchema = z.object({
   // Unarchiving is broken in BB, so an archived thread cannot be worked in. It is
   // still worth linking to, but the PR needs a fresh thread.
   threadArchived: z.boolean().default(false),
+  // Both missing from lists saved before refreshes reused unchanged entries.
+  id: z.string().optional(), changeMarker: z.string().optional(),
 });
 export type PullRequest = z.infer<typeof pullRequestSchema>;
 
@@ -192,8 +194,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (connected.length === 0) throw new Error("No connected BB machine is available.");
     const projectHostIds = new Set(context.projects.flatMap((project) => project.sources.map((source) => source.hostId)));
     const queryHost = connected.find((candidate) => projectHostIds.has(candidate.id)) ?? connected[0]!;
+    const savedPullRequests = ((await readRepositoryList(repository))?.prs ?? [])
+      .flatMap(({ id, changeMarker, ...pr }) => id === undefined || changeMarker === undefined ? [] : [{ ...pr, id, changeMarker }]);
     const raw = await host.call("listPullRequests", {
       repository, mergedWithinDays: Number(mergedWithinDays), maximumMergedPullRequests: Number(maximumMergedPullRequests),
+      savedPullRequests,
     }, { hostId: queryHost.id });
     const list: RepositoryList = {
       repository, prs: await linkProjectsAndThreads(raw.pullRequests, context), refreshedAt: new Date().toISOString(),

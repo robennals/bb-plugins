@@ -4,9 +4,10 @@ import { hostContract, type HostPullRequest } from "./contract.js";
 import plugin, { rpcContract } from "./server.js";
 
 const hostPr = (repository: string, number: number, overrides: Partial<HostPullRequest> = {}): HostPullRequest => ({
-  repository, number, title: `PR ${number}`, url: `https://github.com/${repository}/pull/${number}`,
+  id: `id-${number}`, repository, number, title: `PR ${number}`, url: `https://github.com/${repository}/pull/${number}`,
   status: "OPEN", summary: "No review requested yet", isDraft: false, headRefName: `branch-${number}`,
-  baseRefName: "main", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z", mergedAt: null, ...overrides,
+  baseRefName: "main", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z", mergedAt: null,
+  changeMarker: "2026-09-01T00:00:00Z", ...overrides,
 });
 const project = (id: string, name: string, gitRemoteUrl: string | null) => ({
   id, name, gitRemoteUrl, sources: [{ hostId: "host-1", path: `/work/${name}`, isDefault: true }],
@@ -63,6 +64,15 @@ describe("per-project pull request lists", () => {
     expect(web.list).toEqual(webBefore);
     expect(web.list?.prs[0]?.status).toBe("OPEN");
     expect(await call("prs_list", null)).toMatchObject({ selectedRepository: "acme/web", sortOrder: "UPDATED" });
+  });
+
+  it("hands the host that repository's saved pull requests, so it can reuse the unchanged ones", async () => {
+    const { call, listCalls } = await loadPlugin([hostPr("acme/web", 1), hostPr("Acme/Api", 2)]);
+    await call("prs_refresh", { repository: "Acme/Api" });
+    await call("prs_refresh", { repository: "acme/web" });
+    await call("prs_refresh", { repository: "acme/web" });
+    expect(listCalls.map((input) => hostContract.listPullRequests.input.parse(input).savedPullRequests))
+      .toEqual([[], [], [hostPr("acme/web", 1)]]);
   });
 
   it("refuses repositories that are no project's", async () => {
