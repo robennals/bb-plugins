@@ -104,7 +104,6 @@ function FilesPage({ subPath }: PluginNavPanelProps) {
       filePath={route.filePath}
       onOpenPath={onOpenPath}
       onChangeScope={onChangeScope}
-      variant="page"
     />
   );
 }
@@ -126,7 +125,6 @@ function ThreadFilesPanel({ threadId }: PluginThreadPanelProps) {
       scope={scope}
       filePath={filePath}
       onOpenPath={setFilePath}
-      variant="panel"
     />
   );
 }
