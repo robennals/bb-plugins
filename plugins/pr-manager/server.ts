@@ -46,7 +46,12 @@ export type SavedState = z.infer<typeof savedStateSchema>;
 
 export const rpcContract = defineRpcContract({
   prs_list: { input: z.null(), output: savedStateSchema },
-  prs_refresh: { input: z.object({ repository: repositoryNameSchema }), output: savedStateSchema },
+  // With `unlessRefreshedWithinSeconds`, a list saved more recently than that is returned
+  // as it is, so panels refreshing on a timer cannot ask GitHub more often than they mean to.
+  prs_refresh: {
+    input: z.object({ repository: repositoryNameSchema, unlessRefreshedWithinSeconds: z.number().positive().optional() }),
+    output: savedStateSchema,
+  },
   // The whole persisted view is sent at once, so there is no partial-update merge.
   prs_set_view: {
     input: z.object({ repository: repositoryNameSchema, sortOrder: sortOrderSchema }),
@@ -185,7 +190,7 @@ export default async function plugin(bb: BbPluginApi) {
     return prs;
   }
 
-  async function refreshPullRequests(requested: string): Promise<SavedState> {
+  async function fetchAndSavePullRequests(requested: string): Promise<SavedState> {
     const [{ mergedWithinDays, maximumMergedPullRequests }, hosts, context, repositories] = await Promise.all([
       settings.get(), bb.sdk.hosts.list(), projectAndThreadContext(), projectRepositories(),
     ]);
@@ -211,6 +216,22 @@ export default async function plugin(bb: BbPluginApi) {
     return readSavedState(repository);
   }
 
+  // A refresh asked for while the same repository is already refreshing joins that one.
+  const refreshesInProgress = new Map<string, Promise<SavedState>>();
+  async function refreshPullRequests(requested: string, unlessRefreshedWithinSeconds?: number): Promise<SavedState> {
+    const key = listKey(requested);
+    const inProgress = refreshesInProgress.get(key);
+    if (inProgress !== undefined) return inProgress;
+    if (unlessRefreshedWithinSeconds !== undefined) {
+      const saved = await readRepositoryList(requested);
+      const ageSeconds = saved === null ? Infinity : (Date.now() - Date.parse(saved.refreshedAt)) / 1000;
+      if (ageSeconds < unlessRefreshedWithinSeconds) return readSavedState(requested);
+    }
+    const refresh = fetchAndSavePullRequests(requested).finally(() => refreshesInProgress.delete(key));
+    refreshesInProgress.set(key, refresh);
+    return refresh;
+  }
+
   async function resolveLinkedThread(repository: string, number: number): Promise<{ threadId: string; archived: boolean } | null> {
     const existing = (await readRepositoryList(repository))?.prs.find((candidate) => candidate.number === number);
     if (existing?.threadId === null || existing?.threadId === undefined) return null;
@@ -225,7 +246,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     prs_list: () => readSavedState(),
-    prs_refresh: ({ repository }) => refreshPullRequests(repository),
+    prs_refresh: ({ repository, unlessRefreshedWithinSeconds }) => refreshPullRequests(repository, unlessRefreshedWithinSeconds),
     prs_set_view: async ({ repository, sortOrder }) => {
       const selectedRepository = findRepository(await projectRepositories(), repository);
       await saveView({ selectedRepository, sortOrder });

@@ -7,7 +7,7 @@ A GitHub CLI-backed BB plugin for keeping ongoing pull requests visible and acti
 - Counts a PR as approved once any reviewer has approved it, even where GitHub reports no review decision because the repository requires no review. PART_APPROVED means someone has approved but another reviewer is still requested.
 - Treats a PR as needing a response when a reviewer has requested changes or commented and has not been re-requested, or when someone has left a PR comment you have not replied to since. Bots and your own activity never count.
 - Shows only the newest run of each check, so a cancelled run that a later re-run superseded no longer reads as failing.
-- Loads the last saved result immediately and only contacts GitHub when Refresh is clicked.
+- Loads the last saved result immediately, then refreshes it from GitHub when the panel opens, every two minutes while its window is visible, and when Refresh is clicked. A refresh fetches full details only for pull requests that have changed since the last one.
 - Shows one BB project at a time, choosing among the projects whose origin is on GitHub. Each project's list is saved separately, and Refresh fetches only the selected project's PRs.
 - Filters by status, searches by keyword across title, repository, number, branch and status, and sorts by status, creation or last update. The selected project and sort order are remembered between sessions.
 - Asks what the agent should do when you create a thread, and sends that as the thread's first message.
