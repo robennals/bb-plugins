@@ -24,6 +24,7 @@ beforeEach(() => {
 });
 
 const THREAD = "thr_1";
+const PROJECT = "proj_1";
 const dev: Preset = { id: "dev", name: "Dev server", command: "npm run dev", url: "" };
 
 async function loadApp() {
@@ -45,17 +46,24 @@ async function renderHeader(rpc: Rpc) {
   const registration = app.threadHeaderActions.find((entry) => entry.id === "run-commands")!;
   const slot = renderSlot(
     registration,
-    { threadId: THREAD, projectId: "prj_1", isCompactViewport: false },
+    { threadId: THREAD, projectId: PROJECT, isCompactViewport: false },
     { rpc },
   );
   mounted = slot;
   return slot;
 }
 
+const projects = () => ({
+  projects: [
+    { id: PROJECT, name: "app" },
+    { id: "proj_2", name: "site" },
+  ],
+});
+
 async function renderSettings(rpc: Rpc) {
   const app = await loadApp();
   const registration = app.settingsSections.find((entry) => entry.id === "commands")!;
-  const slot = renderSlot(registration, {}, { rpc });
+  const slot = renderSlot(registration, {}, { rpc: { projects, ...rpc } });
   mounted = slot;
   return slot;
 }
@@ -98,11 +106,12 @@ describe("the header menu", () => {
     expect(await slot.findByText("Edit commands…")).toBeTruthy();
   });
 
-  it("refetches the list when it is edited elsewhere", async () => {
+  it("asks for this project's commands, and refetches when they are edited elsewhere", async () => {
     const presets_get = vi.fn(() => ({ presets: [dev] }));
     const slot = await renderHeader({ presets_get });
-    await vi.waitFor(() => expect(presets_get).toHaveBeenCalledTimes(1));
-    await slot.behavior.emitRealtime("presets-changed", {});
+    await vi.waitFor(() => expect(presets_get).toHaveBeenCalledWith({ projectId: PROJECT }));
+    await slot.behavior.emitRealtime("presets-changed", { projectId: "proj_2" });
+    await slot.behavior.emitRealtime("presets-changed", { projectId: PROJECT });
     await vi.waitFor(() => expect(presets_get).toHaveBeenCalledTimes(2));
   });
 });
@@ -200,6 +209,7 @@ describe("the command editor", () => {
     fireEvent.click(slot.getByText("Save"));
     await vi.waitFor(() =>
       expect(save).toHaveBeenCalledWith({
+        projectId: PROJECT,
         presets: [
           { id: expect.any(String), name: "Dev server", command: "npm run dev", url: "" },
         ],
@@ -223,6 +233,13 @@ describe("the command editor", () => {
     const slot = await renderSettings({ presets_get: () => ({ presets: [dev] }), presets_save: save });
     fireEvent.click(await slot.findByLabelText('Remove "Dev server"'));
     fireEvent.click(slot.getByText("Save"));
-    await vi.waitFor(() => expect(save).toHaveBeenCalledWith({ presets: [] }));
+    await vi.waitFor(() => expect(save).toHaveBeenCalledWith({ projectId: PROJECT, presets: [] }));
+  });
+
+  it("edits the commands of whichever project is picked", async () => {
+    const presets_get = vi.fn(() => ({ presets: [] }));
+    const slot = await renderSettings({ presets_get });
+    fireEvent.change(await slot.findByLabelText("Project"), { target: { value: "proj_2" } });
+    await vi.waitFor(() => expect(presets_get).toHaveBeenLastCalledWith({ projectId: "proj_2" }));
   });
 });

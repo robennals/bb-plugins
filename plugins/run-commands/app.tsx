@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
+import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -26,7 +27,7 @@ import {
 import { Icon } from "@/components/ui/icon";
 import { messageOf } from "./errors";
 import { OutputPanel } from "./output-panel";
-import { PresetEditor } from "./preset-editor";
+import { PresetEditor, ProjectPresetEditor } from "./preset-editor";
 import type { Preset } from "./presets";
 import { PRESETS_CHANGED, type rpcContract } from "./server";
 
@@ -34,22 +35,27 @@ const HEADER_LABEL = "Run a command";
 const OUTPUT_ACTION_ID = "output";
 const OUTPUT_TITLE = "Command output";
 
-function usePresets() {
+// Realtime payloads arrive as untyped JSON; this is the field we filter on.
+const presetsChangedSchema = z.object({ projectId: z.string() });
+
+function usePresets(projectId: string) {
   const rpc = useRpc<typeof rpcContract>();
   const [presets, setPresets] = useState<Preset[] | null>(null);
   const refresh = useCallback(() => {
-    rpc.call("presets_get", null).then(
+    rpc.call("presets_get", { projectId }).then(
       (result) => setPresets(result.presets),
       (cause) => toast.error(messageOf(cause)),
     );
-  }, [rpc]);
+  }, [rpc, projectId]);
   useEffect(refresh, [refresh]);
-  useRealtime(PRESETS_CHANGED, refresh);
+  useRealtime(PRESETS_CHANGED, (payload) => {
+    if (presetsChangedSchema.safeParse(payload).data?.projectId === projectId) refresh();
+  });
   return { rpc, presets };
 }
 
-function HeaderMenu({ threadId }: { threadId: string }) {
-  const { rpc, presets } = usePresets();
+function HeaderMenu({ threadId, projectId }: { threadId: string; projectId: string }) {
+  const { rpc, presets } = usePresets(projectId);
   const navigate = useBbNavigate();
   const [editing, setEditing] = useState(false);
 
@@ -98,11 +104,11 @@ function HeaderMenu({ threadId }: { threadId: string }) {
           <DialogHeader>
             <DialogTitle>Commands</DialogTitle>
             <DialogDescription>
-              Each one runs in the thread's workspace. Its output appears in the thread's{" "}
+              These are this project's commands. Each one runs in the thread's workspace. Its output appears in the thread's{" "}
               {OUTPUT_TITLE} tab.
             </DialogDescription>
           </DialogHeader>
-          <PresetEditor onSaved={() => setEditing(false)} />
+          <PresetEditor projectId={projectId} onSaved={() => setEditing(false)} />
         </DialogContent>
       </Dialog>
     </>
@@ -113,7 +119,7 @@ export default definePluginApp((app) => {
   app.slots.experimental_threadHeaderAction({
     id: "run-commands",
     title: HEADER_LABEL,
-    component: ({ threadId }) => <HeaderMenu threadId={threadId} />,
+    component: ({ threadId, projectId }) => <HeaderMenu threadId={threadId} projectId={projectId} />,
   });
 
   app.slots.threadPanelAction({
@@ -125,7 +131,7 @@ export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "commands",
     title: "Commands",
-    description: "The commands offered by the Run button at the top of every thread.",
-    component: () => <PresetEditor />,
+    description: "The commands the Run button offers at the top of each of a project's threads.",
+    component: () => <ProjectPresetEditor />,
   });
 });

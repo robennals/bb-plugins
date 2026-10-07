@@ -26,13 +26,16 @@ import { outputMentions, stripAnsiStreaming } from "./terminal-text.js";
 import { browserTabFor, panelTabsSchema, withTab, type PanelTab } from "./tabs.js";
 
 /** Realtime channels app.tsx listens on to know its copy is stale. */
+/** Payload `{ projectId }`: that project's list of commands was edited. */
 export const PRESETS_CHANGED = "presets-changed";
 /** Payload `{ threadId }`: a run was added, removed, or changed status. */
 export const RUNS_CHANGED = "runs-changed";
 /** Payload `{ threadId, runId }`: a run printed more. */
 export const OUTPUT_ADDED = "output-added";
 
-const PRESETS_KEY = "presets";
+// One list per project: the command that starts one repo's dev server means
+// nothing in another.
+const presetsKeyFor = (projectId: string) => `presets:${projectId}`;
 const RUNS_PREFIX = "runs:";
 const runsKeyFor = (threadId: string) => `${RUNS_PREFIX}${threadId}`;
 const outputKeyFor = (runId: string) => `output:${runId}`;
@@ -51,15 +54,21 @@ const MAX_DRAIN_READS = 20;
 const TERMINAL_COLS = 120;
 const TERMINAL_ROWS = 30;
 
+const projectInput = z.object({ projectId: z.string() });
 const threadInput = z.object({ threadId: z.string() });
 const runOutput = z.object({ run: runSummarySchema });
 const runsOutput = z.object({ runs: z.array(runSummarySchema) });
 
 export const rpcContract = defineRpcContract({
-  presets_get: { input: z.null(), output: z.object({ presets: presetsSchema }) },
+  presets_get: { input: projectInput, output: z.object({ presets: presetsSchema }) },
   presets_save: {
-    input: z.object({ presets: presetsSchema }),
+    input: projectInput.extend({ presets: presetsSchema }),
     output: z.object({ presets: presetsSchema }),
+  },
+  /** Every project, for the Settings page, which BB does not tell which one is in view. */
+  projects: {
+    input: z.null(),
+    output: z.object({ projects: z.array(z.object({ id: z.string(), name: z.string() })) }),
   },
   /**
    * Run a preset in the thread. If the same preset is still running there it
@@ -100,8 +109,8 @@ function summarize(run: Run): RunSummary {
 export default function plugin(bb: BbPluginApi) {
   // ── storage ────────────────────────────────────────────────────────────
 
-  async function readPresets(): Promise<Preset[]> {
-    return parseStoredPresets(await bb.storage.kv.get(PRESETS_KEY));
+  async function readPresets(projectId: string): Promise<Preset[]> {
+    return parseStoredPresets(await bb.storage.kv.get(presetsKeyFor(projectId)));
   }
 
   /** Stored JSON this plugin wrote; anything unreadable counts as no runs. */
@@ -312,7 +321,8 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   async function start(threadId: string, presetId: string): Promise<Run> {
-    const preset = (await readPresets()).find((candidate) => candidate.id === presetId);
+    const { projectId } = await bb.sdk.threads.get({ threadId });
+    const preset = (await readPresets(projectId)).find((candidate) => candidate.id === presetId);
     if (preset === undefined) throw new Error("That command is no longer in the list.");
     const previous: Run[] = [];
     for (const run of await readRuns(threadId)) {
@@ -355,13 +365,17 @@ export default function plugin(bb: BbPluginApi) {
   const newestFirst = (runs: readonly Run[]) => [...runs].reverse().map(summarize);
 
   bb.rpc.register(rpcContract, {
-    presets_get: async () => ({ presets: await readPresets() }),
+    presets_get: async ({ projectId }) => ({ presets: await readPresets(projectId) }),
 
-    presets_save: async ({ presets }) => {
-      await bb.storage.kv.set(PRESETS_KEY, presets);
-      bb.realtime.publish(PRESETS_CHANGED, {});
+    presets_save: async ({ projectId, presets }) => {
+      await bb.storage.kv.set(presetsKeyFor(projectId), presets);
+      bb.realtime.publish(PRESETS_CHANGED, { projectId });
       return { presets };
     },
+
+    projects: async () => ({
+      projects: (await bb.sdk.projects.list({})).map(({ id, name }) => ({ id, name })),
+    }),
 
     run: ({ threadId, presetId }) =>
       serialized(threadId, async () => ({ run: summarize(await start(threadId, presetId)) })),

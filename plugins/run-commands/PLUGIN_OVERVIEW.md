@@ -3,7 +3,8 @@ top of a thread, and watch what it prints without opening a terminal.
 
 ## What you get
 
-- A **Run button in the thread header** with a dropdown of your saved commands.
+- A **Run button in the thread header** with a dropdown of the commands saved for
+  that thread's project.
   Pick one and it runs in that thread's workspace.
 - A **Command output tab** in the right-hand panel that opens every time you
   run something. Each run gets a collapsible box with its output, live while
@@ -17,9 +18,8 @@ top of a thread, and watch what it prints without opening a terminal.
 Each command runs in a bb terminal on the machine that holds the thread's
 workspace. The plugin copies what that terminal prints into its own storage
 once a second, so the output tab can show it as plain text and keep it after
-the command has exited. The list of commands is edited from "Edit commands…"
-in the dropdown, or on this plugin's page in Settings, and is shared by every
-thread.
+the command has exited. Each project has its own list of commands, edited from
+"Edit commands…" in the dropdown or on this plugin's page in Settings.
 
 ## Requirements
 

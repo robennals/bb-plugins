@@ -1,6 +1,6 @@
-// The form for the list of preset commands. Shown in two places — the dialog
-// the header dropdown opens, and the plugin's page in Settings — so it owns
-// its own loading and saving rather than being handed a list.
+// The form for one project's list of preset commands. Shown in two places —
+// the dialog the header dropdown opens, and the plugin's page in Settings — so
+// it owns its own loading and saving rather than being handed a list.
 import { useCallback, useEffect, useState } from "react";
 import { useRpc } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
@@ -60,19 +60,22 @@ function PresetFields({
   );
 }
 
-/** `onSaved` lets the dialog close itself; the Settings page leaves it out. */
-export function PresetEditor({ onSaved }: { onSaved?: () => void }) {
+/**
+ * Edits one project's commands. `onSaved` lets the dialog close itself; the
+ * Settings page leaves it out.
+ */
+export function PresetEditor({ projectId, onSaved }: { projectId: string; onSaved?: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [draft, setDraft] = useState<Preset[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(() => {
-    rpc.call("presets_get", null).then(
+    rpc.call("presets_get", { projectId }).then(
       (result) => setDraft(result.presets),
       (cause) => setError(messageOf(cause)),
     );
-  }, [rpc]);
+  }, [rpc, projectId]);
   useEffect(load, [load]);
 
   const save = async () => {
@@ -83,7 +86,7 @@ export function PresetEditor({ onSaved }: { onSaved?: () => void }) {
     }
     setSaving(true);
     try {
-      const saved = await rpc.call("presets_save", { presets: parsed.data });
+      const saved = await rpc.call("presets_save", { projectId, presets: parsed.data });
       setDraft(saved.presets);
       setError(null);
       onSaved?.();
@@ -135,6 +138,58 @@ export function PresetEditor({ onSaved }: { onSaved?: () => void }) {
           Save
         </Button>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The Settings page's editor. BB does not tell a settings section which
+ * project is in view, so this one asks: pick a project, then edit its list.
+ */
+export function ProjectPresetEditor() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [projects, setProjects] = useState<{ id: string; name: string }[] | null>(null);
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    rpc.call("projects", null).then(
+      (result) => {
+        setProjects(result.projects);
+        setProjectId((chosen) => chosen ?? result.projects[0]?.id ?? null);
+      },
+      (cause) => setError(messageOf(cause)),
+    );
+  }, [rpc]);
+
+  if (projects === null) {
+    return (
+      <p role={error === null ? "status" : "alert"} className="text-sm text-muted-foreground">
+        {error ?? "Loading projects…"}
+      </p>
+    );
+  }
+  if (projectId === null) {
+    return <p className="text-sm text-muted-foreground">Add a project to give it commands.</p>;
+  }
+  return (
+    <div className="flex flex-col gap-3">
+      <label className="flex items-center gap-2 text-sm">
+        Project
+        <select
+          value={projectId}
+          onChange={(event) => setProjectId(event.target.value)}
+          className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+        >
+          {projects.map((project) => (
+            <option key={project.id} value={project.id}>
+              {project.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      {/* Keyed so switching project discards the other project's unsaved draft. */}
+      <PresetEditor key={projectId} projectId={projectId} />
     </div>
   );
 }

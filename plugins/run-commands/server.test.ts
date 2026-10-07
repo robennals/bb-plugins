@@ -8,6 +8,7 @@ import type { PanelTab } from "./tabs.js";
 const PLUGIN = "run-commands";
 const THREAD = "thr_1";
 const ENVIRONMENT = "env_1";
+const PROJECT = "proj_1";
 
 const infoTab: PanelTab = { id: "a", kind: "thread-info" };
 
@@ -114,10 +115,16 @@ async function createHost(presets: Preset[] = [dev, tests, web]) {
     pluginId: PLUGIN,
     sdk: {
       threads: {
-        get: vi.fn(async () => ({ environmentId: ENVIRONMENT })),
+        get: vi.fn(async () => ({ environmentId: ENVIRONMENT, projectId: PROJECT })),
         tabs: { get: store.get, update: store.update },
       },
       terminals,
+      projects: {
+        list: vi.fn(async () => [
+          { id: PROJECT, name: "app", path: "/repos/app" },
+          { id: "proj_2", name: "site", path: "/repos/site" },
+        ]),
+      },
     },
   });
   plugin(bb);
@@ -132,7 +139,7 @@ async function createHost(presets: Preset[] = [dev, tests, web]) {
     rpcContract.output.output.parse(await rpc("output", { runId, from }));
   /** Let the background loop take another look. */
   const tick = () => vi.advanceTimersByTimeAsync(POLL_MS);
-  await harness.behavior.callRpc("presets_save", { presets });
+  await harness.behavior.callRpc("presets_save", { projectId: PROJECT, presets });
   return { harness, store, terminals, rpc, run, runs, output, tick };
 }
 
@@ -300,9 +307,31 @@ describe("a command with an address to open", () => {
 });
 
 describe("the list of commands", () => {
-  it("is saved, and tells open headers to refetch", async () => {
+  it("is saved for its project, and tells that project's open headers to refetch", async () => {
     const { harness } = await createHost([dev]);
-    await expect(harness.behavior.callRpc("presets_get", null)).resolves.toEqual({ presets: [dev] });
-    expect(harness.realtimeSignals).toContainEqual({ channel: "presets-changed", payload: {} });
+    await expect(harness.behavior.callRpc("presets_get", { projectId: PROJECT })).resolves.toEqual({
+      presets: [dev],
+    });
+    expect(harness.realtimeSignals).toContainEqual({
+      channel: "presets-changed",
+      payload: { projectId: PROJECT },
+    });
+  });
+
+  it("belongs to one project: another project starts with none", async () => {
+    const { harness } = await createHost([dev]);
+    await expect(harness.behavior.callRpc("presets_get", { projectId: "proj_2" })).resolves.toEqual({
+      presets: [],
+    });
+  });
+
+  it("offers every project to the Settings page, by id and name only", async () => {
+    const { harness } = await createHost();
+    await expect(harness.behavior.callRpc("projects", null)).resolves.toEqual({
+      projects: [
+        { id: PROJECT, name: "app" },
+        { id: "proj_2", name: "site" },
+      ],
+    });
   });
 });

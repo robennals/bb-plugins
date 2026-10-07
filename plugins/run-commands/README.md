@@ -6,15 +6,16 @@ in the right-hand panel that shows what each run printed.
 
 ## Surfaces
 
-- **Thread header button** ("Run a command") — a dropdown of the saved
-  commands, then "Show output" and "Edit commands…". Picking a command runs it
+- **Thread header button** ("Run a command") — a dropdown of the project's
+  saved commands, then "Show output" and "Edit commands…". Picking a command runs it
   and brings up the output tab.
 - **Command output tab** — one collapsible box per run, newest first and open,
   older ones closed. Each shows the command's status (running, finished,
   failed with its exit code, stopped) and a Stop button while it runs. Also in
   the panel's Actions list.
 - **Settings section** ("Commands") on the plugin's page in Settings — the same
-  editor the dropdown opens.
+  editor the dropdown opens, behind a project picker, because BB does not tell
+  a settings page which project is in view.
 
 ## A saved command
 
@@ -46,8 +47,9 @@ in the right-hand panel that shows what each run printed.
   with an error, or one that was stopped first.
 - **Following survives a plugin reload.** Runs are stored, not held in memory,
   so a reloaded plugin carries on copying output where it left off.
-- **The list is shared by every project and thread.** It lives in the plugin's
-  own storage, not in any repository.
+- **Each project has its own list.** A thread offers the commands of the
+  project it belongs to. The lists live in the plugin's own storage, not in
+  any repository.
 
 ## Development
 
