@@ -1,8 +1,9 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Preset } from "./presets.js";
+import { OUTPUT_ADDED, RUNS_CHANGED } from "./channels.js";
 import { MAX_RUNS } from "./runs.js";
-import plugin, { ADDRESS_WAIT_MS, OUTPUT_ADDED, POLL_MS, RUNS_CHANGED, rpcContract } from "./server.js";
+import plugin, { ADDRESS_WAIT_MS, POLL_MS, rpcContract } from "./server.js";
 import type { PanelTab } from "./tabs.js";
 
 const PLUGIN = "run-commands";
