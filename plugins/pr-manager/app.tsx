@@ -41,14 +41,16 @@ function PullRequestRow({ pr, onChanged }: { pr: PullRequest; onChanged: () => v
     if (pr.projectId === null || creating || instructions.trim() === "") return;
     setCreating(true); setError(null);
     try {
-      const result = await rpc.call("prs_create_thread", {
+      await rpc.call("prs_create_thread", {
         repository: pr.repository, number: pr.number, title: pr.title, url: pr.url,
         headRefName: pr.headRefName, baseRefName: pr.baseRefName, projectId: pr.projectId,
         instructions,
       });
+      // Stay on the list so the next pull request can be dealt with; the row's
+      // "Open thread" button goes to the new thread when it is wanted.
       setAskingInstructions(false);
+      setInstructions("");
       onChanged();
-      navigate.toThread(result.threadId);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally { setCreating(false); }
