@@ -7,9 +7,10 @@ import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import { OUTPUT_ADDED, RUNS_CHANGED } from "./channels";
 import { messageOf } from "./errors";
 import type { RunSummary } from "./runs";
-import { OUTPUT_ADDED, RUNS_CHANGED, type rpcContract } from "./server";
+import type { rpcContract } from "./server";
 import { displayText } from "./terminal-text";
 
 // Realtime payloads arrive as untyped JSON; these are the fields we filter on.

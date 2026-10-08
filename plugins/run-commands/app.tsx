@@ -25,11 +25,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Icon } from "@/components/ui/icon";
+import { PRESETS_CHANGED } from "./channels";
 import { messageOf } from "./errors";
 import { OutputPanel } from "./output-panel";
 import { PresetEditor, ProjectPresetEditor } from "./preset-editor";
 import type { Preset } from "./presets";
-import { PRESETS_CHANGED, type rpcContract } from "./server";
+import type { rpcContract } from "./server";
 
 const HEADER_LABEL = "Run a command";
 const OUTPUT_ACTION_ID = "output";
