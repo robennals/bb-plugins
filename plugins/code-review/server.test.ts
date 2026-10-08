@@ -68,6 +68,8 @@ async function makeHost(
     missingThreadIds?: string[];
     /** Thread ids BB should report as archived, both on get and in the project listing. */
     archivedThreadIds?: string[];
+    /** Thread ids BB hides from its sidebar, and so leaves out of a listing that does not ask for them. */
+    hiddenThreadIds?: string[];
     /** Makes the bulk `threads.list` lookup of archived threads fail with this message. */
     archivedListError?: string;
     /** Makes `threads.archive` fail with this message. */
@@ -147,13 +149,16 @@ async function makeHost(
           options.archivedThreadIds === undefined ? [] : [{ id: "proj_test", name: "test" }],
       },
       threads: {
-        list: async () => {
+        list: async (args) => {
           if (options.archivedListError !== undefined) {
             throw new Error(options.archivedListError);
           }
-          return (options.archivedThreadIds ?? []).map((id) =>
-            makeThreadResponse({ id, archivedAt: 1 }),
-          );
+          return (options.archivedThreadIds ?? [])
+            .filter(
+              (id) =>
+                args?.includeHidden === true || options.hiddenThreadIds?.includes(id) !== true,
+            )
+            .map((id) => makeThreadResponse({ id, archivedAt: 1 }));
         },
         spawn: async (args) => {
           if (options.spawnError !== undefined) throw new Error(options.spawnError);
@@ -1203,6 +1208,25 @@ describe("opening a review", () => {
       number: 7,
     });
     expect(one.pullRequest?.reviewThreadArchived).toBe(true);
+  });
+
+  // BB leaves hidden threads out of a listing unless asked for them, and a
+  // review thread can be hidden as well as archived.
+  it("reports an archived review thread that is also hidden", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      archivedThreadIds: ["thr_1"],
+      hiddenThreadIds: ["thr_1"],
+    });
+    await runReview(host);
+    const listed = await host.call<{ pullRequests: ThreadLinkFields[] }>("listPullRequests", {
+      repo: REPO,
+      filter: { kind: "all" },
+    });
+    expect(listed.pullRequests.find((pr) => pr.number === 7)).toMatchObject({
+      reviewThreadId: "thr_1",
+      reviewThreadArchived: true,
+    });
   });
 
   // The bulk lookup is an optimisation. Losing it must cost the flag, not the list.

@@ -1055,7 +1055,14 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       const projects = await bb.sdk.projects.list();
       const lists = await Promise.all(
         projects.map((project) =>
-          bb.sdk.threads.list({ projectId: project.id, archived: true, limit: 500 }),
+          // A review thread can be hidden from the sidebar as well as archived,
+          // and BB leaves hidden threads out unless asked for them.
+          bb.sdk.threads.list({
+            projectId: project.id,
+            archived: true,
+            includeHidden: true,
+            limit: 500,
+          }),
         ),
       );
       return new Set(lists.flat().map((thread) => thread.id));
