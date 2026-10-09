@@ -19,7 +19,9 @@ const outputAddedSchema = z.object({ runId: z.string() });
 export function describeStatus(run: RunSummary): string {
   switch (run.status) {
     case "running":
-      return "Running";
+      // BB shows the run's terminal as a tab of its own, titled with the
+      // command's name, and takes it away again when the command ends.
+      return `Running in the "${run.name}" terminal tab`;
     case "exited":
       return run.exitCode === 0 ? "Finished" : `Failed (exit code ${run.exitCode ?? "unknown"})`;
     case "stopped":
@@ -138,9 +140,12 @@ function RunBox({
             ▶
           </span>
           <span className="truncate font-medium">{run.name}</span>
+          {run.status === "running" ? (
+            <span aria-hidden className="size-2 shrink-0 animate-pulse rounded-full bg-emerald-500" />
+          ) : null}
           <span
             className={cn(
-              "shrink-0 text-xs",
+              "min-w-0 truncate text-xs",
               failed ? "text-destructive" : "text-muted-foreground",
             )}
           >

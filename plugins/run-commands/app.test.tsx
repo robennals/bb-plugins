@@ -170,6 +170,19 @@ describe("the output tab", () => {
     await vi.waitFor(() => expect(slot.container.querySelector("pre")?.textContent).toBe("one\ntwo\n"));
   });
 
+  it("says which terminal tab a running command is in, and stops saying so once it ends", async () => {
+    let runs = [summary()];
+    const slot = await renderOutput({
+      runs: () => ({ runs }),
+      output: () => ({ text: "", start: 0, end: 0 }),
+    });
+    expect(await slot.findByText('Running in the "Dev server" terminal tab')).toBeTruthy();
+    runs = [summary({ status: "exited", exitCode: 0 })];
+    await slot.behavior.emitRealtime("runs-changed", { threadId: THREAD });
+    expect(await slot.findByText("Finished")).toBeTruthy();
+    expect(slot.queryByText(/terminal tab/)).toBeNull();
+  });
+
   it("stops a running command", async () => {
     const stop = vi.fn(() => ({ run: summary({ status: "stopped" }) }));
     const slot = await renderOutput({
