@@ -66,14 +66,15 @@ describe("resolveMode", () => {
 });
 
 describe("isModeAvailable", () => {
-  it("always allows source", () => {
+  it("always allows source and edit", () => {
     expect(isModeAvailable("source", { canPreview: false, canDiff: false })).toBe(true);
+    expect(isModeAvailable("edit", { canPreview: false, canDiff: false })).toBe(true);
   });
 });
 
 describe("isViewMode", () => {
   it("accepts every view", () => {
-    for (const mode of ["preview", "source", "diff"]) {
+    for (const mode of ["preview", "source", "edit", "diff"]) {
       expect(isViewMode(mode), mode).toBe(true);
     }
   });

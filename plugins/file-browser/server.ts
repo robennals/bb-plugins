@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   defineRpcContract,
   PLUGIN_CLI_OUTPUT_MAX_BYTES,
@@ -25,6 +26,11 @@ const REMOTE_ENTRY_LIMIT = 10_000;
 
 /** Inline images round-trip as base64 through RPC, so keep them modest. */
 const MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024;
+
+/** How long a page may keep loading the editor's files from one address. */
+const MONACO_ASSETS_TTL_MS = 60 * 60 * 1000;
+/** Hand out a fresh address once the current one is this close to expiring. */
+const MONACO_ASSETS_RENEW_MS = 5 * 60 * 1000;
 
 // The three dependency directories big enough to truncate a listing on their
 // own, across the JS, PHP and Go worlds. Editable in settings.
@@ -91,6 +97,8 @@ export const rpcContract = defineRpcContract({
       z.object({
         kind: z.literal("text"),
         content: z.string(),
+        /** What `write` is asked to check the file still is before replacing it. */
+        sha256: z.string(),
         sizeBytes: z.number(),
         absolutePath: z.string(),
       }),
@@ -106,6 +114,30 @@ export const rpcContract = defineRpcContract({
         absolutePath: z.string(),
         reason: z.string(),
       }),
+    ]),
+  },
+  /** Where the page can load the Monaco editor's files from. */
+  monacoAssets: {
+    input: z.null(),
+    output: z.object({ baseUrl: z.string(), expiresAtMs: z.number() }),
+  },
+  write: {
+    input: z
+      .object({
+        scope: scopeSchema,
+        path: z.string().min(1),
+        content: z.string(),
+        /**
+         * The hash of the file the edit started from; null when the file is
+         * expected to be gone. A file that is anything else is left alone.
+         */
+        expectedSha256: z.string().nullable(),
+      })
+      .strict(),
+    output: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("written"), sha256: z.string() }),
+      /** The file changed on disk since it was read; null = it was deleted. */
+      z.object({ kind: z.literal("conflict"), currentSha256: z.string().nullable() }),
     ]),
   },
   diff: {
@@ -371,6 +403,7 @@ export default function plugin(bb: BbPluginApi) {
       return {
         kind: "text" as const,
         content: file.content,
+        sha256: file.sha256,
         sizeBytes: file.sizeBytes,
         absolutePath,
       };
@@ -402,7 +435,28 @@ export default function plugin(bb: BbPluginApi) {
     };
   }
 
+  let monacoAssets: { baseUrl: string; expiresAtMs: number } | null = null;
+
   bb.rpc.register(rpcContract, {
+    async monacoAssets() {
+      if (
+        monacoAssets === null ||
+        monacoAssets.expiresAtMs - Date.now() < MONACO_ASSETS_RENEW_MS
+      ) {
+        const rootPath = await monacoBundleDirectory((message) => bb.log.info(message));
+        const local = await localHostId();
+        const preview = await bb.sdk.files.createPreview({
+          rootPath,
+          ttlMs: MONACO_ASSETS_TTL_MS,
+          // The bundle is on the machine this server runs on, whichever machine
+          // the workspace being browsed is on.
+          ...(local === null ? {} : { hostId: local }),
+        });
+        monacoAssets = { baseUrl: preview.baseUrl, expiresAtMs: preview.expiresAtMs };
+      }
+      return monacoAssets;
+    },
+
     async workspaces() {
       // One request gives every project, its checkouts, and the environments
       // its threads run in — which is where a worktree's branch name lives.
@@ -469,6 +523,21 @@ export default function plugin(bb: BbPluginApi) {
       const resolved = await resolveScope(scope);
       if (!resolved.ok) throw new Error(resolved.reason);
       return readWorkspaceFile(resolved.scope, relativePath);
+    },
+
+    async write({ scope, path: relativePath, content, expectedSha256 }) {
+      const resolved = await resolveScope(scope);
+      if (!resolved.ok) throw new Error(resolved.reason);
+      const saved = await bb.sdk.files.write({
+        hostId: resolved.scope.hostId,
+        path: resolveWithinRoot(resolved.scope.root, relativePath),
+        rootPath: resolved.scope.root,
+        content,
+        expectedSha256,
+      });
+      return saved.outcome === "written"
+        ? { kind: "written" as const, sha256: saved.sha256 }
+        : { kind: "conflict" as const, currentSha256: saved.currentSha256 };
     },
 
     async diff({ scope, path: relativePath, baseCommit, status, from }) {
@@ -566,6 +635,38 @@ export default function plugin(bb: BbPluginApi) {
       return { exitCode: 1, stderr: `Unknown command "${command}".\n` };
     },
   });
+}
+
+/**
+ * The directory holding the Monaco bundle, built first if it is not there yet —
+ * which it will not be on the first edit after a fresh install, since the
+ * bundle is several megabytes and is not checked in.
+ *
+ * This file runs from the plugin's root in tests and from `dist/` once built,
+ * so the build script is looked for beside it and one level up.
+ */
+async function monacoBundleDirectory(log: (message: string) => void): Promise<string> {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  for (const pluginRoot of [here, path.dirname(here)]) {
+    const script = path.join(pluginRoot, "scripts", "build-monaco.mjs");
+    if (!(await exists(script))) continue;
+    const bundle = path.join(pluginRoot, "monaco-bundle");
+    if (!(await exists(path.join(bundle, "editor.js")))) {
+      log("Monaco bundle missing; building it");
+      await import(pathToFileURL(script).href);
+    }
+    return bundle;
+  }
+  throw new Error("Could not find the Monaco build script beside the plugin.");
+}
+
+async function exists(target: string): Promise<boolean> {
+  try {
+    await access(target);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** The host rejects an oversized result outright, so clip before returning. */

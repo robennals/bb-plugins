@@ -19,6 +19,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build:monaco": "node scripts/build-monaco.mjs",
     "test": "vitest run --config vitest.config.ts",
     "coverage": "vitest run --config vitest.config.ts --coverage.enabled --coverage.include='lib/changes.ts' --coverage.include='lib/git-changes.ts' --coverage.include='lib/markdown.ts' --coverage.include='lib/session.ts' --coverage.include='lib/view-mode.ts' --coverage.reporter=text"
   },
@@ -49,8 +50,11 @@
     "better-sqlite3": "^12.0.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "cron-parser": "^5.10.1",
+    "esbuild": "^0.28.2",
     "hono": "^4.11.9",
     "jsdom": "^26.1.0",
+    "monaco-editor": "^0.56.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "sonner": "^1.7.4",
