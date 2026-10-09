@@ -27,8 +27,10 @@ in the right-hand panel that shows what each run printed.
 
 ## Behavior worth knowing
 
-- **Commands run in bb terminals nobody looks at.** A terminal is what puts
-  the process on the machine that holds the workspace. A background loop
+- **Each command runs in a bb terminal.** A terminal is what puts the process
+  on the machine that holds the workspace. bb shows it as a tab of its own
+  while the command runs, and the run's row in the output tab names that tab
+  until the command ends. A background loop
   copies what it prints into the plugin's storage once a second and tells the
   output tab, which fetches only the part it does not have yet.
 - **The output is plain text.** Colour and cursor codes are dropped, and a line

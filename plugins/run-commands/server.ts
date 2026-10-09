@@ -2,10 +2,11 @@
 //
 // Keeps the list of preset commands, and runs one for a thread by starting a
 // BB terminal with the command already in it — the terminal is what puts the
-// process on the machine that holds the thread's workspace. Nobody looks at
-// that terminal directly: a background loop copies what it prints into this
-// plugin's storage, where the thread's "Command output" tab reads it, so the
-// output outlives the process and the terminal can be closed once it exits.
+// process on the machine that holds the thread's workspace. BB shows that
+// terminal as a tab of its own while the command runs. A background loop
+// copies what it prints into this plugin's storage, where the thread's
+// "Command output" tab reads it, so the output outlives the process and the
+// terminal can be closed once it exits.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { messageOf } from "./errors.js";
@@ -49,8 +50,7 @@ const ADDRESS_OVERLAP_CHARS = 256;
 /** Reads per poll when draining a finished command's last output. */
 const MAX_DRAIN_READS = 20;
 
-// Nobody sees these terminals, but they still need a size. Wide enough that a
-// dev server's banner does not wrap.
+// Wide enough that a dev server's banner does not wrap.
 const TERMINAL_COLS = 120;
 const TERMINAL_ROWS = 30;
 
