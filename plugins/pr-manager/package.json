@@ -50,10 +50,15 @@
     "cron-parser": "^5.10.1",
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",
-    "vaul": "^1.1.2"
+    "vaul": "^1.1.2",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@vitest/coverage-v8": "^3.2.4",
+    "jsdom": "^25.0.1"
   },
   "scripts": {
     "build": "bb plugin build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   }
 }

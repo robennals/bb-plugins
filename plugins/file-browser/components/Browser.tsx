@@ -54,6 +54,7 @@ const WIDTH_KEY = "file-browser:explorer-width";
 const HIDDEN_KEY = "file-browser:include-hidden";
 const CHANGED_ONLY_KEY = "file-browser:changed-only";
 const DIFF_VIEW_KEY = "file-browser:diff-view";
+const WRAP_KEY = "file-browser:wrap-lines";
 
 export interface BrowserProps {
   scope: ScopeRef | null;
@@ -89,6 +90,8 @@ export function Browser({
   const [diffView, setDiffView] = useState<DiffViewMode>(() =>
     readFlag(DIFF_VIEW_KEY, false) ? "split" : "unified",
   );
+
+  const [wrapLines, setWrapLines] = useState(() => readFlag(WRAP_KEY, false));
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const requestRef = useRef(0);
@@ -144,12 +147,15 @@ export function Browser({
   // Which file is open, in which workspace: the same README in another worktree
   // is another file, and it deserves its own landing view.
   const openKeyFor = (path: string) => `${scopeKind}:${scopeId}:${path}`;
-  useEffect(() => {
-    loadTree(
-      scopeKind === null || scopeId === null ? null : { kind: scopeKind, id: scopeId },
-      includeHidden,
-    );
-  }, [includeHidden, loadTree, scopeId, scopeKind]);
+  const reloadTree = useCallback(
+    () =>
+      loadTree(
+        scopeKind === null || scopeId === null ? null : { kind: scopeKind, id: scopeId },
+        includeHidden,
+      ),
+    [includeHidden, loadTree, scopeId, scopeKind],
+  );
+  useEffect(reloadTree, [reloadTree]);
 
   const change = filePath === null ? null : tree.changes.byPath.get(filePath) ?? null;
   const hasFork = tree.changes.baseCommit !== null;
@@ -198,12 +204,24 @@ export function Browser({
     setMode((current) => resolveMode(current, modes));
   }, [areChangesKnown, modes, openKey]);
 
+  // Opening another file or workspace replaces the pane, and an edit that has
+  // not been saved goes with it — so ask first.
+  const hasUnsavedEdit = useRef(false);
+  const onUnsavedChange = useCallback((hasUnsaved: boolean) => {
+    hasUnsavedEdit.current = hasUnsaved;
+  }, []);
+  const mayLeaveFile = () =>
+    !hasUnsavedEdit.current ||
+    window.confirm(`Discard your unsaved changes to ${filePath}?`);
+
   const openFile = useCallback(
     (path: string) => {
+      if (path !== filePath && !mayLeaveFile()) return;
       onOpenPath(path);
       requestAnimationFrame(() => rootRef.current?.focus({ preventScroll: true }));
     },
-    [onOpenPath],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filePath, onOpenPath],
   );
 
   // Remember where you were, so leaving and coming back does not land you on a
@@ -283,6 +301,7 @@ export function Browser({
           <WorkspacePicker
             current={resolved}
             onSelect={(next) => {
+              if (!mayLeaveFile()) return;
               onChangeScope(next);
               setIsQuickOpen(false);
             }}
@@ -290,7 +309,8 @@ export function Browser({
         )}
       </div>
     ),
-    [onChangeScope, resolved],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filePath, onChangeScope, resolved],
   );
 
   return (
@@ -373,19 +393,9 @@ export function Browser({
           <div className="ml-auto flex shrink-0 items-center gap-1">
             {filePath === null ? null : (
               <>
-                <ModeToggle
-                  mode={mode}
-                  onChange={setMode}
-                  modes={modes}
-                  // Nothing to diff: no fork point, or git says this file is
-                  // the same as it was there.
-                  noDiffReason={
-                    tree.changes.unavailable ??
-                    (change === null
-                      ? "This file is unchanged on this branch."
-                      : null)
-                  }
-                />
+                {/* These two sit to the LEFT of the mode buttons because they
+                    come and go with the mode: appearing on the right would
+                    slide the mode buttons out from under the pointer. */}
                 {mode === "diff" ? (
                   <ToolbarButton
                     icon={diffView === "split" ? "Columns2" : "Rows2"}
@@ -401,6 +411,30 @@ export function Browser({
                     }}
                   />
                 ) : null}
+                {mode === "preview" ? null : (
+                  <ToolbarButton
+                    icon="TextWrap"
+                    label={wrapLines ? "Stop wrapping long lines" : "Wrap long lines"}
+                    isActive={wrapLines}
+                    onClick={() => {
+                      setWrapLines(!wrapLines);
+                      store(WRAP_KEY, wrapLines ? "false" : "true");
+                    }}
+                  />
+                )}
+                <ModeToggle
+                  mode={mode}
+                  onChange={setMode}
+                  modes={modes}
+                  // Nothing to diff: no fork point, or git says this file is
+                  // the same as it was there.
+                  noDiffReason={
+                    tree.changes.unavailable ??
+                    (change === null
+                      ? "This file is unchanged on this branch."
+                      : null)
+                  }
+                />
                 {resolved === null ? null : (
                   <ToolbarButton
                     icon="ExternalLink"
@@ -451,8 +485,11 @@ export function Browser({
             path={filePath}
             mode={mode}
             diffView={diffView}
+            wrapLines={wrapLines}
             change={change}
             baseCommit={tree.changes.baseCommit}
+            onSaved={reloadTree}
+            onUnsavedChange={onUnsavedChange}
           />
         )}
       </div>
@@ -501,6 +538,12 @@ function ModeToggle({
         title="Show the file as it is now"
         isActive={mode === "source"}
         onClick={() => onChange("source")}
+      />
+      <ModeButton
+        label="Edit"
+        title="Edit this file"
+        isActive={mode === "edit"}
+        onClick={() => onChange("edit")}
       />
       <ModeButton
         label="Diff"

@@ -16,8 +16,8 @@ against the commit the branch forked from.
   beneath it changed, at any depth, so a collapsed tree still shows where the
   work is. The colours are BB's own diff theme tokens, so the tree agrees with
   the diff beside it in light and dark.
-- **A File / Diff toggle** per file, which becomes **Preview / Source / Diff**
-  for markdown. A file arriving in the pane lands on the preview when it is
+- **A File / Edit / Diff toggle** per file, which becomes **Preview / Source /
+  Edit / Diff** for markdown. A file arriving in the pane lands on the preview when it is
   markdown, else on the diff when the branch changed it, else on the source;
   from then on it keeps the view you picked for as long as that view still
   fits. The diff has a second toggle for inline vs side-by-side, and BB's
@@ -28,6 +28,14 @@ against the commit the branch forked from.
   small metadata block above it, so a skill or agent file reads as the document
   it is rather than opening on a horizontal rule. `.md`, `.markdown`, `.mdown`,
   `.mkd`, `.mkdn` and `.mdx` all get the preview.
+- **Edit and save.** The **Edit** view opens a text file in Monaco, the editor
+  inside VS Code, coloured with your BB code theme; **Save** (or ⌘S) writes it to the workspace, on whichever machine
+  holds it, and **Discard** puts back the last saved text. Unsaved text
+  survives a look at the other views. A save is refused
+  when the file changed on disk since you opened it — an agent got there first
+  — and offers to overwrite or to drop your edit, rather than silently
+  replacing the other change. A Windows-style file keeps its line endings.
+  Opening another file with unsaved changes asks before discarding them.
 - **A changed-files filter** in the explorer toolbar, which narrows the tree to
   what the branch touched, folders opened.
 - **Deleted files still appear** in the tree, greyed and struck through, so you
@@ -50,6 +58,24 @@ Two things follow from the preview being the chat renderer: images and links
 that point at other files in the workspace are relative to a chat message, not
 to the file, so they will not resolve; and MDX's JSX shows up as literal text.
 The source view is one click away in both cases.
+
+A file that mixes Windows and Unix line endings cannot be edited — the Edit
+view says so — because saving it would rewrite its line endings.
+
+## The editor
+
+Monaco is several megabytes, so it is not part of the plugin's own frontend
+bundle. `scripts/build-monaco.mjs` bundles it into `monaco-bundle/` (not
+checked in), the server hands those files out through a BB file preview, and
+the page loads them the first time an Edit view opens. The server runs the
+script itself when the bundle is missing, so the first edit after a fresh
+install takes a few seconds longer; `npm run build:monaco` does it ahead of
+time. When Monaco cannot be loaded at all, the Edit view falls back to a plain
+text box, so a file can still be edited and saved.
+
+Monaco's colouring only: its TypeScript, JSON, CSS and HTML language services
+are left out, since they check one file without the project around it and
+would underline every import as an error.
 
 ## What "changed" means
 
@@ -119,8 +145,9 @@ The workspace walk, path resolution, tree model, routing, and the explorer,
 quick-open and workspace-picker components are derived from
 [bb-plugin-files-editor](https://github.com/abdoutelb/bb-plugin-files-editor)
 by AbdElrahman Telb, under the MIT licence. The git comparison, the change
-highlighting, the diff view and the CLI are new here, and the editor is not
-carried over — this is a viewer.
+highlighting, the diff view and the CLI are new here. That plugin's editor is
+not carried over. The way Monaco is bundled, served and themed here follows
+BB's own built-in File Editor plugin (MIT).
 
 ## Install
 

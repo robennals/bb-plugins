@@ -10,7 +10,7 @@ A GitHub CLI-backed BB plugin for keeping ongoing pull requests visible and acti
 - Loads the last saved result immediately, then refreshes it from GitHub when the panel opens, every two minutes while its window is visible, and when Refresh is clicked. A refresh fetches full details only for pull requests that have changed since the last one.
 - Shows one BB project at a time, choosing among the projects whose origin is on GitHub. Each project's list is saved separately, and Refresh fetches only the selected project's PRs.
 - Filters by status, searches by keyword across title, repository, number, branch and status, and sorts by status, creation or last update. The selected project and sort order are remembered between sessions.
-- Asks what the agent should do when you create a thread, and sends that as the thread's first message.
+- Asks what the agent should do when you create a thread, and sends that as the thread's first message. The list stays on screen afterwards, and the PR's row gains an "Open thread" button.
 - Finds existing BB threads by remembered PR links or matching project branches.
 - Fetches a PR-specific Git ref and spawns a managed BB worktree/thread when requested.
 - Provides cached and explicit-refresh commands through `bb pr-manager list [--repo owner/name] [--json]` and `bb pr-manager refresh [--repo owner/name] [--json]`, which act on the selected project unless `--repo` names another.
