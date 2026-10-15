@@ -1510,6 +1510,12 @@ function FindingDetailView({
 // ---------------------------------------------------------------------------
 
 /**
+ * Threads whose review tab has been on screen. Once the user has seen it, the
+ * header stops opening it: they may have moved to another tab on purpose.
+ */
+const reviewTabShown = new Set<string>();
+
+/**
  * A thread's review tab. It carries no params — a review thread holds one
  * review, so the thread says which. Tabs saved by earlier versions do carry
  * the PR in their params; those are ignored, since the thread gives the same
@@ -1521,6 +1527,10 @@ function ReviewTab({ threadId }: { threadId: string }) {
   const subject = review.data;
   const [openFindingId, setOpenFindingId] = useState<string | null>(null);
   const status = useLiveQuery(() => rpc.call("status"), [rpc]);
+
+  useEffect(() => {
+    reviewTabShown.add(threadId);
+  }, [threadId]);
 
   if (subject === null) {
     return review.isLoading ? (
@@ -1574,16 +1584,15 @@ function ReviewThreadHeaderAction({ threadId }: { threadId: string }) {
     [navigate],
   );
 
-  // Open the review tab once each time a review thread opens. BB declines
-  // until the thread's side panel has registered itself, so keep asking as
-  // `navigate` and the lookup change — but stop once it accepts: BB hands out
-  // a new `navigate` on every panel change, and asking again then would drag
-  // the user back from whichever tab they picked.
+  // Open the review tab until it has been on screen once, then never again.
+  // BB's yes from `openThreadPanel` is not enough to stop on: until the
+  // thread's panel state has loaded it says yes but drops the open. So keep
+  // asking as `navigate` and the lookup change — BB hands out a new `navigate`
+  // when that state loads — and stop once the tab itself has rendered, since
+  // asking after that would drag the user back from whichever tab they picked.
   const isReview = review.data !== null;
-  const openedForThread = useRef<string | null>(null);
   useEffect(() => {
-    if (!isReview || openedForThread.current === threadId) return;
-    if (open()) openedForThread.current = threadId;
+    if (isReview && !reviewTabShown.has(threadId)) open();
   }, [isReview, threadId, open]);
 
   if (review.data === null) return null;
