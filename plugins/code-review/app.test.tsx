@@ -1383,12 +1383,11 @@ describe("the review tab opening itself", () => {
     app: Awaited<ReturnType<typeof load>>,
     threadId: string,
     overrides: RpcOverrides = {},
-    openThreadPanel: () => boolean = () => true,
   ) =>
     renderSlot(
       app.threadHeaderActions[0]!,
       { threadId, projectId: "proj_1", isCompactViewport: false },
-      { rpc: rpc(overrides), openThreadPanel },
+      { rpc: rpc(overrides), openThreadPanel: () => true },
     );
 
   const opensOf = (slot: ReturnType<typeof header>) =>
@@ -1405,43 +1404,65 @@ describe("the review tab opening itself", () => {
     });
   };
 
+  /** The review tab itself on screen in `threadId`'s side panel. */
+  const showTab = (app: Awaited<ReturnType<typeof load>>, threadId: string) =>
+    renderSlot(app.threadPanelActions[0]!, { threadId, params: null }, { rpc: rpc() });
+
+  // The tab remembers being shown for the rest of the session, so each test
+  // uses its own thread.
+
   it("opens the review tab when a review thread opens", async () => {
     const app = await load();
-    const slot = header(app, "thr_1");
+    const slot = header(app, "thr_opens");
     await waitFor(() => {
-      expect(opensOf(slot)).toEqual([
+      expect(opensOf(slot)[0]).toEqual(
         // No params, so BB matches the tab the server wrote.
         expect.objectContaining({ options: { actionId: "review" } }),
-      ]);
+      );
     });
     slot.lifecycle.unmount();
   });
 
-  it("opens it once per visit, so switching to another tab is not undone", async () => {
+  it("keeps asking until the tab is on screen, then stops", async () => {
     const app = await load();
-    const slot = header(app, "thr_1");
+    // BB says yes before the thread's panel state has loaded, then drops the
+    // open, so a yes alone must not stop the asking.
+    const slot = header(app, "thr_retries");
     await waitFor(() => expect(opensOf(slot)).toHaveLength(1));
     await rerenderTwice(slot);
-    expect(opensOf(slot)).toHaveLength(1);
-    slot.lifecycle.unmount();
-  });
+    expect(opensOf(slot)).toHaveLength(3);
 
-  it("keeps trying until BB's side panel is ready to take it", async () => {
-    const app = await load();
-    // BB declines until the thread's side panel has registered itself.
-    let ready = false;
-    const slot = header(app, "thr_1", {}, () => ready);
-    await waitFor(() => expect(opensOf(slot).length).toBeGreaterThan(0));
-    ready = true;
-    await rerenderTwice(slot);
-    const accepted = opensOf(slot).length;
+    const tab = showTab(app, "thr_retries");
+    await waitFor(() => {
+      expect(tab.inspection.rpcCalls.some((call) => call.method === "getReviewForThread")).toBe(
+        true,
+      );
+    });
+    // Re-renders, as a tab switch causes in BB, must not drag the user back.
     await slot.behavior.emitRealtime("code-review-changed", {});
     await waitFor(() => {
       expect(
         slot.inspection.rpcCalls.filter((call) => call.method === "getReviewForThread"),
       ).toHaveLength(4);
     });
-    expect(opensOf(slot)).toHaveLength(accepted);
+    expect(opensOf(slot)).toHaveLength(3);
+    tab.lifecycle.unmount();
+    slot.lifecycle.unmount();
+  });
+
+  it("does not open the tab again on a later visit", async () => {
+    const app = await load();
+    const tab = showTab(app, "thr_seen");
+    await waitFor(() => {
+      expect(tab.inspection.rpcCalls.some((call) => call.method === "getReviewForThread")).toBe(
+        true,
+      );
+    });
+    tab.lifecycle.unmount();
+
+    const slot = header(app, "thr_seen");
+    await rerenderTwice(slot);
+    expect(opensOf(slot)).toEqual([]);
     slot.lifecycle.unmount();
   });
 
