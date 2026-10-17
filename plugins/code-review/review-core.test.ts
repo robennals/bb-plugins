@@ -22,6 +22,9 @@ import {
   reviewTabFor,
   resolveCitedPath,
   splitUnifiedDiff,
+  diffFromPrFiles,
+  isDiffTooLarge,
+  parseJsonLines,
   type PullRequest,
 } from "./review-core";
 
@@ -398,6 +401,56 @@ describe("splitUnifiedDiff", () => {
 
   it("returns nothing for an empty diff", () => {
     expect(splitUnifiedDiff("")).toEqual([]);
+  });
+});
+
+describe("isDiffTooLarge", () => {
+  it("recognises GitHub refusing a diff over its size limits", () => {
+    const refused = new Error(
+      "gh pr diff 293 failed: could not find pull request diff: HTTP 406: Sorry, the diff " +
+        "exceeded the maximum number of files (300). PullRequest.diff too_large",
+    );
+    expect(isDiffTooLarge(refused)).toBe(true);
+    expect(isDiffTooLarge("Sorry, the diff exceeded the maximum number of lines (20000)")).toBe(true);
+  });
+
+  it("leaves every other failure alone", () => {
+    expect(isDiffTooLarge(new Error("gh pr diff 7 failed: HTTP 404: Not Found"))).toBe(false);
+    expect(isDiffTooLarge(new Error("network is unreachable"))).toBe(false);
+  });
+});
+
+describe("diffFromPrFiles", () => {
+  it("rebuilds a diff that splits back into the same files", () => {
+    const diff = diffFromPrFiles([
+      { filename: "src/a.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" },
+      { filename: "src/b.ts", status: "added", patch: "@@ -0,0 +1 @@\n+fresh" },
+      { filename: "src/c.ts", status: "removed", patch: "@@ -1 +0,0 @@\n-gone" },
+    ]);
+    const files = splitUnifiedDiff(diff);
+    expect(files.map((file) => file.path)).toEqual(["src/a.ts", "src/b.ts", "src/c.ts"]);
+    expect(files[0]?.patch).toContain("--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@");
+    expect(files[0]?.patch).not.toContain("+fresh");
+    expect(files[1]?.patch).toContain("--- /dev/null\n+++ b/src/b.ts");
+    expect(files[2]?.patch).toContain("--- a/src/c.ts\n+++ /dev/null");
+  });
+
+  it("keeps a rename's old path and a patchless file's header", () => {
+    const files = splitUnifiedDiff(
+      diffFromPrFiles([
+        { filename: "new.ts", previous_filename: "old.ts", status: "renamed", patch: "@@ -1 +1 @@\n-a\n+b" },
+        { filename: "logo.png", status: "modified" },
+      ]),
+    );
+    expect(files.map((file) => file.path)).toEqual(["new.ts", "logo.png"]);
+    expect(files[0]?.patch).toContain("rename from old.ts\nrename to new.ts\n--- a/old.ts");
+    expect(files[1]?.patch).toBe("diff --git a/logo.png b/logo.png");
+  });
+});
+
+describe("parseJsonLines", () => {
+  it("parses one JSON value per line and skips blank lines", () => {
+    expect(parseJsonLines('{"a":1}\n\n{"a":2}\n')).toEqual([{ a: 1 }, { a: 2 }]);
   });
 });
 

@@ -630,6 +630,59 @@ export function splitUnifiedDiff(diff: string): FilePatch[] {
   return files.filter((file) => file.path !== "");
 }
 
+/**
+ * Whether a failed `gh pr diff` is GitHub refusing a diff over its size limits
+ * (300 files or 20,000 lines), which answers HTTP 406 `PullRequest.diff
+ * too_large`. Only that failure is worth retrying file by file.
+ */
+export function isDiffTooLarge(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /too_large|diff exceeded the maximum number of/i.test(message);
+}
+
+/** One row of `GET repos/{o}/{r}/pulls/{n}/files`. */
+export interface GhPrFile {
+  filename: string;
+  status?: string;
+  previous_filename?: string;
+  /** Absent for binary files and for files too large for GitHub to inline. */
+  patch?: string;
+}
+
+/**
+ * Rebuild a unified diff from the pull request files API, for a PR whose diff
+ * GitHub will not serve whole. The output has the `diff --git` headers that
+ * `splitUnifiedDiff` keys on, so everything downstream reads it like
+ * `gh pr diff` output. A file with no `patch` keeps its header, so it still
+ * shows up as changed.
+ */
+export function diffFromPrFiles(files: GhPrFile[]): string {
+  return files
+    .map((file) => {
+      const to = file.filename;
+      const from = file.previous_filename ?? to;
+      const lines = [`diff --git a/${from} b/${to}`];
+      if (file.status === "renamed") lines.push(`rename from ${from}`, `rename to ${to}`);
+      if (file.patch !== undefined && file.patch !== "") {
+        lines.push(
+          file.status === "added" ? "--- /dev/null" : `--- a/${from}`,
+          file.status === "removed" ? "+++ /dev/null" : `+++ b/${to}`,
+          file.patch,
+        );
+      }
+      return lines.join("\n");
+    })
+    .join("\n");
+}
+
+/** Parse newline-delimited JSON, as `gh api --paginate --jq '.[]'` prints it. */
+export function parseJsonLines<T>(raw: string): T[] {
+  return raw
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as T);
+}
+
 /** `owner/name` from any GitHub remote URL (https, ssh, git@), else null. */
 export function parseGithubRemote(url: string): string | null {
   const match = url

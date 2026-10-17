@@ -35,6 +35,7 @@ import {
   githubPrUrl,
   citationCandidates,
   describeGitHubError,
+  diffFromPrFiles,
   diffHunkRanges,
   findBadPaths,
   formatBadPaths,
@@ -42,8 +43,10 @@ import {
   resolveCitedPath,
   resolvePostAnchor,
   filterPullRequests,
+  isDiffTooLarge,
   isRepoName,
   parseGithubRemote,
+  parseJsonLines,
   parsePullRequests,
   parseReport,
   parsePrSnapshot,
@@ -62,6 +65,7 @@ import {
   type FilePatch,
   type FilterContext,
   type FindingLocation,
+  type GhPrFile,
   type PostAnchor,
   type PrSnapshot,
   type PullRequest,
@@ -1155,6 +1159,25 @@ interface ContextRow {
   }
 
   /**
+   * The PR's unified diff. GitHub refuses `gh pr diff` for a PR over 300 files
+   * or 20,000 lines, so that one failure falls back to rebuilding the diff from
+   * the paginated files API, which lists up to 3,000 files.
+   */
+  async function fetchDiff(repo: string, number: number): Promise<string> {
+    try {
+      return await gh(["pr", "diff", String(number), "-R", repo], 120_000);
+    } catch (error) {
+      if (!isDiffTooLarge(error)) throw error;
+      bb.log.info(`diff for ${repo}#${number} is too large for gh pr diff; using the files API`);
+      const raw = await gh(
+        ["api", "--paginate", `repos/${repo}/pulls/${number}/files`, "--jq", ".[]"],
+        120_000,
+      );
+      return diffFromPrFiles(parseJsonLines<GhPrFile>(raw));
+    }
+  }
+
+  /**
    * Fetch the PR once, on the server, and store it. Everything the review
    * agent needs comes from here, so the agent never runs gh: gh is configured
    * and unsandboxed here, and may be neither in the agent's environment.
@@ -1169,7 +1192,7 @@ interface ContextRow {
   ): Promise<StoredContext> {
     const [viewRaw, diffRaw] = await Promise.all([
       gh(["pr", "view", String(number), "-R", repo, "--json", PR_VIEW_JSON_FIELDS], 45_000),
-      gh(["pr", "diff", String(number), "-R", repo], 120_000),
+      fetchDiff(repo, number),
     ]);
     const snapshot = parsePrSnapshot(viewRaw);
     // Inline review comments live on a separate endpoint that some repos
@@ -1256,6 +1279,30 @@ interface ContextRow {
   // -------------------------------------------------------------------------
   // Starting a review
   // -------------------------------------------------------------------------
+  /**
+   * A review that failed before it could spawn still gets a row, so the panel
+   * shows "review failed" with the reason instead of only a passing toast. An
+   * existing review keeps its title, thread and findings; only its status
+   * changes.
+   */
+  function recordFailedStart(repo: string, number: number, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const timestamp = nowIso();
+    db.prepare(
+      `INSERT INTO reviews (id, repo, number, title, status, error, created_at, updated_at)
+       VALUES (@id, @repo, @number, @title, 'failed', @error, @timestamp, @timestamp)
+       ON CONFLICT(id) DO UPDATE SET status = 'failed', error = @error, updated_at = @timestamp`,
+    ).run({
+      id: reviewIdFor(repo, number),
+      repo,
+      number,
+      title: `PR #${number}`,
+      error: message,
+      timestamp,
+    });
+    announce();
+  }
+
   async function startReview(
     repo: string,
     number: number,
@@ -1267,7 +1314,13 @@ interface ContextRow {
     const reviewId = reviewIdFor(repo, number);
     // Fetch the PR up front, on the server. If GitHub is unreachable there is
     // no point spawning an agent that would have nothing to read.
-    const { snapshot } = await fetchContext(repo, number);
+    let snapshot: PrSnapshot;
+    try {
+      ({ snapshot } = await fetchContext(repo, number));
+    } catch (error) {
+      recordFailedStart(repo, number, error);
+      throw error;
+    }
     const title = snapshot.title === "" ? `PR #${number}` : snapshot.title;
     const findingsPath = path.posix.join(
       config.findingsDir === "" ? ".bb/code-review" : config.findingsDir,

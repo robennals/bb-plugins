@@ -617,6 +617,40 @@ describe("startReview", () => {
     ).rejects.toThrow(/No BB project is attached to acme\/app/);
   });
 
+  it("falls back to the files API when GitHub refuses a diff over 300 files", async () => {
+    const host = await makeHost({
+      ghFailures: {
+        "pr diff":
+          "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum " +
+          "number of files (300). PullRequest.diff too_large",
+      },
+      ghOverrides: {
+        "api --paginate repos/acme/app/pulls/7/files": JSON.stringify({
+          filename: "src/a.ts",
+          status: "modified",
+          patch: "@@ -1,20 +1,20 @@\n-a\n+b",
+        }),
+      },
+    });
+    const { review } = await host.call<{ review: ReviewDto }>("startReview", {
+      repo: REPO,
+      number: 7,
+    });
+    expect(review.status).toBe("running");
+    const diff = await host.harness.behavior.runCli(["diff", "--review", REVIEW_ID]);
+    expect(diff.stdout).toContain("diff --git a/src/a.ts b/src/a.ts");
+    expect(diff.stdout).toContain("+b");
+  });
+
+  it("shows a review that could not fetch its PR as failed, with the reason", async () => {
+    const host = await makeHost({ ghFailures: { "pr diff": "HTTP 404: Not Found" } });
+    await expect(host.call("startReview", { repo: REPO, number: 7 })).rejects.toThrow(/404/);
+    expect(host.spawned).toHaveLength(0);
+    const review = await host.review();
+    expect(review.status).toBe("failed");
+    expect(review.error).toContain("HTTP 404");
+  });
+
   it("marks the review failed instead of leaving it stuck when the spawn fails", async () => {
     const host = await makeHost({ spawnError: "no provider available" });
     await expect(host.call("startReview", { repo: REPO, number: 7 })).rejects.toThrow(
