@@ -363,7 +363,28 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "",
     `    bb code-review submit --review ${args.reviewId} --file ${args.findingsPath}`,
     "",
-    "That imports the findings into the Code Review panel and is the last step.",
+    "That imports the findings into the Code Review panel.",
+    "",
+    "## 5. Keep the report up to date",
+    "",
+    "The reviewer reads your findings in the panel and may go on discussing the pull",
+    "request with you in this thread. The report stays editable for as long as that",
+    "conversation goes on: whenever it changes what a finding should say — one turns",
+    "out wrong, narrower, more serious, or a new problem comes up — edit the report",
+    "rather than only saying so in the chat. See the current findings and their ids with:",
+    "",
+    `    bb code-review findings --review ${args.reviewId}`,
+    "",
+    "and apply changes by writing a JSON file and running:",
+    "",
+    `    bb code-review edit --review ${args.reviewId} --file <path>`,
+    "",
+    "```",
+    REPORT_EDIT_SCHEMA_TEXT,
+    "```",
+    "",
+    "Use a new file name for each edit, beside the findings file. The same rules for",
+    "writing comments and paths apply.",
     "",
     "## Rules",
     "",
@@ -384,16 +405,28 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
  * That thread already has the PR, the diff, and its own reasoning in context,
  * so this only re-states which finding is meant — enough to be unambiguous
  * when several were reported — and then asks the user's question.
+ *
+ * The answer comes back through `bb code-review answer`, keyed by the
+ * question's id rather than by order: questions about several findings can be
+ * queued up behind each other, and the id is what puts each answer on the
+ * right issue however the turns interleave.
  */
 export function buildFindingQuestion(args: {
+  reviewId: string;
   finding: {
+    id: string;
     file: string;
     startLine: number | null;
     endLine: number | null;
     title: string;
+    summary: string;
+    suggestedFix: string;
     suggestedComment: string;
   };
   question: string;
+  questionId: string;
+  /** Where the agent should write its answer file. */
+  answerPath: string;
 }): string {
   const { finding } = args;
   const location =
@@ -402,18 +435,163 @@ export function buildFindingQuestion(args: {
       : finding.endLine !== null && finding.endLine !== finding.startLine
         ? `${finding.file}:${finding.startLine}-${finding.endLine}`
         : `${finding.file}:${finding.startLine}`;
+  const quote = (text: string) => "> " + text.split("\n").join("\n> ");
   return [
-    `About the finding on \`${location}\` — **${finding.title}**:`,
+    `About the finding on \`${location}\` — **${finding.title}** (id \`${finding.id}\`):`,
     "",
+    ...(finding.summary === "" ? [] : ["Summary:", "", quote(finding.summary), ""]),
+    ...(finding.suggestedFix === "" ? [] : ["Suggested fix:", "", quote(finding.suggestedFix), ""]),
     "Draft comment:",
     "",
-    "> " + finding.suggestedComment.split("\n").join("\n> "),
+    quote(finding.suggestedComment),
     "",
     `My question: ${args.question}`,
     "",
     "Answer it against the code and the PR diff. Do not post anything to GitHub,",
     "and do not edit the checkout.",
+    "",
+    "Then put the answer on the issue in the Code Review panel, where I am reading it:",
+    "",
+    `1. Write \`${args.answerPath}\`:`,
+    "",
+    "```",
+    ANSWER_SCHEMA_TEXT,
+    "```",
+    "",
+    "2. Run:",
+    "",
+    "```sh",
+    `bb code-review answer --question ${args.questionId} --file ${args.answerPath}`,
+    "```",
+    "",
+    "Include `title`, `summary`, `suggestedFix` or `suggestedComment` only when your",
+    "answer changes what they should say — for example the finding turned out narrower,",
+    "or the comment asks something you have now answered. Each one you include",
+    "replaces the old text, so write it in full and in the same style as before. Leave",
+    "them all out when the finding stands as written.",
+    "",
+    "If the answer bears on other findings, or calls for a new one, edit the report too:",
+    `\`bb code-review edit --review ${args.reviewId} --file <path>\` (\`bb code-review findings\``,
+    `\`--review ${args.reviewId}\` lists them with their ids).`,
   ].join("\n");
+}
+
+/**
+ * A change to a report that has already been submitted, from the review
+ * thread as the discussion moves on. Applied all or nothing: a half-applied
+ * edit leaves the agent guessing what landed.
+ */
+export const findingUpdateSchema = findingSchema.partial().extend({
+  id: z.string().trim().min(1),
+  /** Why it changed, one line, shown on the issue. */
+  note: z.string().trim().optional(),
+});
+export type FindingUpdate = z.infer<typeof findingUpdateSchema>;
+
+export interface ReportEdit {
+  add: Finding[];
+  update: FindingUpdate[];
+  remove: Array<{ id: string; reason: string }>;
+}
+
+const reportEditEnvelopeSchema = z.object({
+  add: z.array(z.unknown()).default([]),
+  update: z.array(findingUpdateSchema).default([]),
+  remove: z
+    .array(z.object({ id: z.string().trim().min(1), reason: z.string().trim().default("") }))
+    .default([]),
+});
+
+export const REPORT_EDIT_SCHEMA_TEXT = `{
+  "add": [ /* new findings, each exactly as in the findings schema */ ],
+  "update": [
+    { "id": "<finding id>",                // from \`bb code-review findings\`
+      "note": "one line on why it changed", // shown on the issue
+      /* then only the fields that change, as in the findings schema:
+         title, summary, suggestedFix, suggestedComment, severity, category,
+         file, startLine, endLine, side, references */ }
+  ],
+  "remove": [ { "id": "<finding id>", "reason": "one line on why it no longer stands" } ]
+}`;
+
+export function parseReportEdit(raw: string): { edit: ReportEdit | null; errors: string[] } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    return {
+      edit: null,
+      errors: [`not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`],
+    };
+  }
+  const envelope = reportEditEnvelopeSchema.safeParse(parsed);
+  if (!envelope.success) {
+    return {
+      edit: null,
+      errors: envelope.error.issues.map(
+        (issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`,
+      ),
+    };
+  }
+  const errors: string[] = [];
+  const add: Finding[] = [];
+  envelope.data.add.forEach((entry, index) => {
+    const result = findingSchema.safeParse(normalizeFinding(entry));
+    if (result.success) {
+      add.push(result.data);
+    } else {
+      errors.push(
+        ...result.error.issues.map(
+          (issue) => `add.${index}.${issue.path.join(".")}: ${issue.message}`,
+        ),
+      );
+    }
+  });
+  const { update, remove } = envelope.data;
+  if (add.length + update.length + remove.length === 0 && errors.length === 0) {
+    errors.push('nothing to do — give at least one of "add", "update" or "remove"');
+  }
+  return errors.length > 0 ? { edit: null, errors } : { edit: { add, update, remove }, errors };
+}
+
+/** What the review thread writes to answer a question about a finding. */
+export const answerSchema = z.object({
+  /** The answer to the question, in Markdown, for the reviewer. */
+  answer: z.string().trim().min(1),
+  /** Replacements for the finding's own fields; absent means unchanged. */
+  title: z.string().trim().min(1).optional(),
+  summary: z.string().trim().optional(),
+  suggestedFix: z.string().trim().optional(),
+  suggestedComment: z.string().trim().min(1).optional(),
+});
+export type Answer = z.infer<typeof answerSchema>;
+
+export const ANSWER_SCHEMA_TEXT = `{
+  "answer": "Your answer to the question, in Markdown. Required.",
+  "title": "Optional: a corrected title for the finding.",
+  "summary": "Optional: a corrected gist, two sentences at most.",
+  "suggestedFix": "Optional: a corrected fix. An empty string removes it.",
+  "suggestedComment": "Optional: a corrected comment to post to the PR author."
+}`;
+
+export function parseAnswer(raw: string): { answer: Answer | null; error: string | null } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    return {
+      answer: null,
+      error: `not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+    };
+  }
+  const result = answerSchema.safeParse(parsed);
+  if (result.success) return { answer: result.data, error: null };
+  return {
+    answer: null,
+    error: result.error.issues
+      .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+      .join("; "),
+  };
 }
 
 // ---------------------------------------------------------------------------

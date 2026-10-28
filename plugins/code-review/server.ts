@@ -20,6 +20,7 @@ import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   awaitsReviewFrom,
+  ANSWER_SCHEMA_TEXT,
   buildFindingQuestion,
   buildPostCommentArgs,
   buildReviewPrompt,
@@ -47,6 +48,9 @@ import {
   parsePullRequests,
   parseReport,
   parsePrSnapshot,
+  parseAnswer,
+  parseReportEdit,
+  REPORT_EDIT_SCHEMA_TEXT,
   parseRepoList,
   parseReviewComments,
   parseSkillList,
@@ -116,6 +120,38 @@ const pullRequestSchema = z.object({
 });
 export type PullRequestDto = z.infer<typeof pullRequestSchema>;
 
+/** The parts of a finding the review thread can revise after submitting it. */
+const revisedFieldSchema = z.enum([
+  "title",
+  "summary",
+  "suggestedFix",
+  "suggestedComment",
+  "severity",
+  "category",
+  "location",
+  "references",
+]);
+type RevisedField = z.infer<typeof revisedFieldSchema>;
+const REVISED_FIELDS: readonly RevisedField[] = revisedFieldSchema.options;
+
+/** A question the reviewer asked about a finding, and the review thread's answer. */
+const questionSchema = z.object({
+  id: z.string(),
+  question: z.string(),
+  /**
+   * "pending" until the thread records an answer. "unanswered" means its turn
+   * ended without one; a late answer still lands.
+   */
+  status: z.enum(["pending", "answered", "unanswered"]),
+  /** Markdown. For "unanswered", the thread's last reply when it can only be this question's. */
+  answer: z.string().nullable(),
+  /** Which of the finding's fields the answer rewrote. */
+  updatedFields: z.array(revisedFieldSchema),
+  askedAt: z.string(),
+  answeredAt: z.string().nullable(),
+});
+export type QuestionDto = z.infer<typeof questionSchema>;
+
 const findingSchemaDto = z.object({
   id: z.string(),
   reviewId: z.string(),
@@ -159,6 +195,19 @@ const findingSchemaDto = z.object({
       note: z.string(),
     }),
   ),
+  /** Questions asked about this finding, oldest first. */
+  questions: z.array(questionSchema),
+  /**
+   * A comment the review thread revised but could not apply, because the
+   * reviewer had edited theirs or already posted it. Theirs to take or leave.
+   */
+  proposedComment: z.string().nullable(),
+  /** The review thread's last change to this finding after submitting it. */
+  revision: z
+    .object({ at: z.string(), note: z.string(), fields: z.array(revisedFieldSchema) })
+    .nullable(),
+  /** Why the review thread withdrew it, when it was the one that dismissed it. */
+  removedReason: z.string().nullable(),
 });
 export type FindingDto = z.infer<typeof findingSchemaDto>;
 
@@ -352,7 +401,12 @@ export const rpcContract = defineRpcContract({
   },
   askAboutFinding: {
     input: z.object({ findingId: z.string(), question: z.string().min(1) }),
-    output: z.object({ threadId: z.string() }),
+    output: z.object({ threadId: z.string(), questionId: z.string() }),
+  },
+  /** Take the review thread's revised comment in place of the reviewer's, or turn it down. */
+  resolveProposedComment: {
+    input: z.object({ findingId: z.string(), use: z.boolean() }),
+    output: z.object({ finding: findingSchemaDto }),
   },
   getFindingCode: {
     input: z.object({
@@ -526,6 +580,38 @@ interface FindingRow {
   posted_at: string | null;
   posted_as: string;
   references_json: string;
+  proposed_comment: string | null;
+  revised_at: string | null;
+  revision_note: string | null;
+  revised_fields: string | null;
+  removed_reason: string | null;
+}
+
+interface QuestionRow {
+  id: string;
+  finding_id: string;
+  review_id: string;
+  question: string;
+  status: string;
+  answer: string | null;
+  updated_fields: string;
+  asked_at: string;
+  answered_at: string | null;
+}
+
+function toQuestionDto(row: QuestionRow): QuestionDto {
+  return {
+    id: row.id,
+    question: row.question,
+    status:
+      row.status === "answered" ? "answered" : row.status === "unanswered" ? "unanswered" : "pending",
+    answer: row.answer,
+    updatedFields: parseJsonArray<string>(row.updated_fields).filter(
+      (field): field is RevisedField => (REVISED_FIELDS as readonly string[]).includes(field),
+    ),
+    askedAt: row.asked_at,
+    answeredAt: row.answered_at,
+  };
 }
 
 function toReviewDto(row: ReviewRow): ReviewDto {
@@ -547,7 +633,7 @@ function toReviewDto(row: ReviewRow): ReviewDto {
   };
 }
 
-function toFindingDto(row: FindingRow): FindingDto {
+function toFindingDto(row: FindingRow, questions: QuestionDto[] = []): FindingDto {
   return {
     id: row.id,
     reviewId: row.review_id,
@@ -571,6 +657,19 @@ function toFindingDto(row: FindingRow): FindingDto {
     references: parseJsonArray(row.references_json),
     // Replaced by listFindings, which has the diff to hand.
     postAnchor: { kind: "file" as const, line: null, startLine: null, adjusted: false },
+    questions,
+    proposedComment: row.proposed_comment ?? null,
+    revision:
+      row.revised_at == null
+        ? null
+        : {
+            at: row.revised_at,
+            note: row.revision_note ?? "",
+            fields: parseJsonArray<string>(row.revised_fields).filter(
+              (field): field is RevisedField => (REVISED_FIELDS as readonly string[]).includes(field),
+            ),
+          },
+    removedReason: row.removed_reason ?? null,
   };
 }
 
@@ -600,10 +699,16 @@ export interface PluginDependencies {
     timeoutMs?: number,
     stdin?: string,
   ) => Promise<{ stdout: string; stderr: string }>;
+  /**
+   * How long to wait after a review thread goes idle before deciding its
+   * questions went unanswered, so a queued question has time to start.
+   */
+  idleSettleMs?: number;
 }
 
 export default async function plugin(bb: BbPluginApi, deps: PluginDependencies = {}) {
   const runCommand = deps.runCommand ?? run;
+  const idleSettleMs = deps.idleSettleMs ?? 3_000;
   const settings = bb.settings.define({
     repos: {
       type: "string",
@@ -755,6 +860,20 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
        model TEXT NOT NULL,
        updated_at TEXT NOT NULL
      )`,
+    // Questions about a finding and the review thread's answers, so they show
+    // on the issue instead of only in the chat.
+    `CREATE TABLE IF NOT EXISTS finding_questions (
+       id TEXT PRIMARY KEY,
+       finding_id TEXT NOT NULL,
+       review_id TEXT NOT NULL,
+       question TEXT NOT NULL,
+       status TEXT NOT NULL DEFAULT 'pending',
+       answer TEXT,
+       updated_fields TEXT NOT NULL DEFAULT '[]',
+       asked_at TEXT NOT NULL,
+       answered_at TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS finding_questions_by_finding ON finding_questions (finding_id)`,
   ]);
 
   /**
@@ -785,6 +904,12 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   ensureColumn("panel_state", "side_pane", `TEXT`);
   ensureColumn("panel_state", "diff_file", `TEXT`);
   ensureColumn("panel_state", "diff_url", `TEXT`);
+  // The review thread keeps editing the report after it submits it.
+  ensureColumn("findings", "proposed_comment", `TEXT`);
+  ensureColumn("findings", "revised_at", `TEXT`);
+  ensureColumn("findings", "revision_note", `TEXT`);
+  ensureColumn("findings", "revised_fields", `TEXT`);
+  ensureColumn("findings", "removed_reason", `TEXT`);
 
   function getReview(reviewId: string): ReviewRow | null {
     return (db.prepare(`SELECT * FROM reviews WHERE id = ?`).get(reviewId) as
@@ -805,8 +930,16 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     // Parsing the diff once per list keeps this off the per-finding path.
     const stored = getContext(reviewId);
     const patches = stored === null ? [] : splitUnifiedDiff(stored.diff);
+    const questions = new Map<string, QuestionDto[]>();
+    for (const row of db
+      .prepare(`SELECT * FROM finding_questions WHERE review_id = ? ORDER BY asked_at ASC, rowid ASC`)
+      .all(reviewId) as QuestionRow[]) {
+      const list = questions.get(row.finding_id) ?? [];
+      list.push(toQuestionDto(row));
+      questions.set(row.finding_id, list);
+    }
     return rows.map((row) => {
-      const finding = toFindingDto(row);
+      const finding = toFindingDto(row, questions.get(row.id) ?? []);
       const patch = patches.find((file) => file.path === finding.file);
       return {
         ...finding,
@@ -831,6 +964,28 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
     const row = getFinding(findingId);
     if (row === null) throw new Error(`No finding with id ${findingId}.`);
     return row;
+  }
+
+  /** A finding with its questions, for an RPC that hands one back. */
+  function findingDto(row: FindingRow): FindingDto {
+    const questions = db
+      .prepare(`SELECT * FROM finding_questions WHERE finding_id = ? ORDER BY asked_at ASC, rowid ASC`)
+      .all(row.id) as QuestionRow[];
+    return toFindingDto(row, questions.map(toQuestionDto));
+  }
+
+  /** Questions about findings a re-run replaced go with them. */
+  function dropOrphanedQuestions(reviewId: string): void {
+    db.prepare(
+      `DELETE FROM finding_questions
+       WHERE review_id = ? AND finding_id NOT IN (SELECT id FROM findings)`,
+    ).run(reviewId);
+  }
+
+  function getQuestion(questionId: string): QuestionRow | null {
+    return (db.prepare(`SELECT * FROM finding_questions WHERE id = ?`).get(questionId) as
+      | QuestionRow
+      | undefined) ?? null;
   }
 
   function touchReview(reviewId: string, patch: Partial<ReviewRow>): void {
@@ -1278,6 +1433,12 @@ interface ContextRow {
     // has: posted comments are history, and dismissals are a decision the user
     // should not have to make twice.
     db.prepare(`DELETE FROM findings WHERE review_id = ? AND state = 'open'`).run(reviewId);
+    dropOrphanedQuestions(reviewId);
+    // The thread these were asked in is about to be replaced, so no answer is
+    // coming for them.
+    db.prepare(
+      `UPDATE finding_questions SET status = 'unanswered' WHERE review_id = ? AND status = 'pending'`,
+    ).run(reviewId);
     // Cached file bodies belong to the commit that was reviewed; a re-run may
     // be on a newer one.
     db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
@@ -1454,41 +1615,61 @@ interface ContextRow {
     }
   }
 
-  function importFindings(reviewId: string, findings: Finding[], summary: string): number {
-    const existingPosted = db
-      .prepare(`SELECT COUNT(*) AS n FROM findings WHERE review_id = ? AND state != 'open'`)
-      .get(reviewId) as { n: number };
-    const insert = db.prepare(
+  function insertFinding(reviewId: string, ord: number, finding: Finding): void {
+    db.prepare(
       `INSERT INTO findings (id, review_id, ord, file, start_line, end_line, side, severity,
                              category, title, summary, suggested_fix,
                              suggested_comment, references_json, draft_comment, state)
        VALUES (@id, @review_id, @ord, @file, @start_line, @end_line, @side, @severity,
                @category, @title, @summary, @suggested_fix,
                @suggested_comment, @references_json, NULL, 'open')`,
-    );
+    ).run({
+      id: randomUUID(),
+      review_id: reviewId,
+      ord,
+      file: finding.file,
+      start_line: finding.startLine,
+      end_line: finding.endLine,
+      side: finding.side,
+      severity: finding.severity,
+      category: finding.category,
+      title: finding.title,
+      summary: finding.summary,
+      suggested_fix: finding.suggestedFix,
+      suggested_comment: finding.suggestedComment,
+      references_json: JSON.stringify(finding.references),
+    });
+  }
+
+  /** A stored finding back in the shape the agent writes. */
+  function findingFromRow(row: FindingRow): Finding {
+    const dto = toFindingDto(row);
+    return {
+      file: dto.file,
+      startLine: dto.startLine,
+      endLine: dto.endLine,
+      side: dto.side,
+      severity: dto.severity,
+      category: dto.category,
+      title: dto.title,
+      summary: dto.summary,
+      suggestedFix: dto.suggestedFix,
+      suggestedComment: dto.suggestedComment,
+      references: dto.references,
+    };
+  }
+
+  function importFindings(reviewId: string, findings: Finding[], summary: string): number {
+    const existingPosted = db
+      .prepare(`SELECT COUNT(*) AS n FROM findings WHERE review_id = ? AND state != 'open'`)
+      .get(reviewId) as { n: number };
     const write = db.transaction((rows: Finding[]) => {
       db.prepare(`DELETE FROM findings WHERE review_id = ? AND state = 'open'`).run(reviewId);
-    // Cached file bodies belong to the commit that was reviewed; a re-run may
-    // be on a newer one.
-    db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
-      rows.forEach((finding, index) => {
-        insert.run({
-          id: randomUUID(),
-          review_id: reviewId,
-          ord: existingPosted.n + index,
-          file: finding.file,
-          start_line: finding.startLine,
-          end_line: finding.endLine,
-          side: finding.side,
-          severity: finding.severity,
-          category: finding.category,
-          title: finding.title,
-          summary: finding.summary,
-          suggested_fix: finding.suggestedFix,
-          suggested_comment: finding.suggestedComment,
-          references_json: JSON.stringify(finding.references),
-        });
-      });
+      dropOrphanedQuestions(reviewId);
+      // Cached file bodies belong to the commit that was reviewed; a re-run may
+      // be on a newer one.
+      db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
+      rows.forEach((finding, index) => insertFinding(reviewId, existingPosted.n + index, finding));
     });
     const sorted = [...findings].sort(
       (a, b) =>
@@ -1771,7 +1952,7 @@ interface ContextRow {
        WHERE id = ?`,
     ).run(url === "" ? null : url, nowIso(), postedAs, findingId);
     announce();
-    return toFindingDto(requireFinding(findingId));
+    return findingDto(requireFinding(findingId));
   }
 
   // -------------------------------------------------------------------------
@@ -1785,7 +1966,10 @@ interface ContextRow {
    * Re-running a review starts a new thread, so the conversation always
    * belongs to the run whose findings are on screen.
    */
-  async function askAboutFinding(findingId: string, question: string): Promise<string> {
+  async function askAboutFinding(
+    findingId: string,
+    question: string,
+  ): Promise<{ threadId: string; questionId: string }> {
     const row = requireFinding(findingId);
     const finding = toFindingDto(row);
     const review = getReview(finding.reviewId);
@@ -1799,35 +1983,328 @@ interface ContextRow {
     } catch {
       throw new Error("The review thread is gone. Re-run the review to start a new one.");
     }
-    await bb.sdk.threads.send({
-      threadId,
-      mode: "auto",
-      input: [
-        {
-          type: "text",
-          mentions: [],
-          text: buildFindingQuestion({
-            finding: {
-              file: finding.file,
-              startLine: finding.startLine,
-              endLine: finding.endLine,
-              title: finding.title,
-              suggestedComment: effectiveComment(finding),
-            },
-            question,
-          }),
-        },
-      ],
+    const questionId = randomUUID();
+    // Beside the findings file, which the agent already writes into.
+    const answerPath = path.join(
+      path.dirname(review.findings_path ?? ".bb/code-review/findings.json"),
+      "answers",
+      `${questionId}.json`,
+    );
+    // Recorded before sending, so a fast answer always finds its question.
+    db.prepare(
+      `INSERT INTO finding_questions (id, finding_id, review_id, question, status, asked_at)
+       VALUES (?, ?, ?, ?, 'pending', ?)`,
+    ).run(questionId, findingId, review.id, question, nowIso());
+    try {
+      await bb.sdk.threads.send({
+        threadId,
+        // Queued, not steered: questions asked in quick succession then get a
+        // turn each, instead of being folded into whichever answer is being
+        // written.
+        mode: "queue-if-active",
+        input: [
+          {
+            type: "text",
+            mentions: [],
+            text: buildFindingQuestion({
+              reviewId: review.id,
+              finding: {
+                id: finding.id,
+                file: finding.file,
+                startLine: finding.startLine,
+                endLine: finding.endLine,
+                title: finding.title,
+                summary: finding.summary,
+                suggestedFix: finding.suggestedFix,
+                suggestedComment: effectiveComment(finding),
+              },
+              question,
+              questionId,
+              answerPath,
+            }),
+          },
+        ],
+      });
+    } catch (error) {
+      db.prepare(`DELETE FROM finding_questions WHERE id = ?`).run(questionId);
+      throw error;
+    }
+    announce();
+    return { threadId, questionId };
+  }
+
+  /**
+   * The row changes that revise a finding, from the review thread as the
+   * discussion moves on.
+   *
+   * The comment is rewritten only while it is still the agent's own: an edit
+   * of the reviewer's is theirs, and a posted comment is history. A revision
+   * that cannot be applied is offered beside the comment instead. A posted
+   * comment also stays where it was posted, so its location cannot move.
+   */
+  function reviseFinding(
+    row: FindingRow,
+    changes: Partial<Finding>,
+  ): { patch: Partial<FindingRow>; fields: RevisedField[] } {
+    const patch: Partial<FindingRow> = {};
+    const fields: RevisedField[] = [];
+    const set = <K extends keyof FindingRow>(
+      field: RevisedField,
+      column: K,
+      value: FindingRow[K] | undefined,
+    ) => {
+      if (value === undefined || value === row[column]) return;
+      patch[column] = value;
+      if (!fields.includes(field)) fields.push(field);
+    };
+    set("title", "title", changes.title);
+    set("summary", "summary", changes.summary);
+    set("suggestedFix", "suggested_fix", changes.suggestedFix);
+    set("severity", "severity", changes.severity);
+    set("category", "category", changes.category);
+    if (changes.references !== undefined) {
+      set("references", "references_json", JSON.stringify(changes.references));
+    }
+    const movesLocation =
+      (changes.file !== undefined && changes.file !== row.file) ||
+      (changes.startLine !== undefined && changes.startLine !== row.start_line) ||
+      (changes.endLine !== undefined && changes.endLine !== row.end_line) ||
+      (changes.side !== undefined && changes.side !== row.side);
+    if (movesLocation) {
+      if (row.state === "posted") {
+        throw new Error(
+          `"${row.title}" is already posted, so it cannot move. Add a new finding instead.`,
+        );
+      }
+      set("location", "file", changes.file);
+      set("location", "start_line", changes.startLine);
+      set("location", "end_line", changes.endLine);
+      set("location", "side", changes.side);
+    }
+    const comment = changes.suggestedComment;
+    if (comment !== undefined && comment !== (row.draft_comment ?? row.suggested_comment)) {
+      if (row.state !== "posted" && row.draft_comment === null) {
+        set("suggestedComment", "suggested_comment", comment);
+        patch.proposed_comment = null;
+      } else {
+        patch.proposed_comment = comment;
+      }
+    }
+    return { patch, fields };
+  }
+
+  function writeFindingPatch(findingId: string, patch: Partial<FindingRow>): void {
+    const columns = Object.keys(patch);
+    if (columns.length === 0) return;
+    db.prepare(
+      `UPDATE findings SET ${columns.map((column) => `${column} = @${column}`).join(", ")}
+       WHERE id = @id`,
+    ).run({ ...patch, id: findingId });
+  }
+
+  /** What the thread is told about a revision, so it knows what landed. */
+  function describeRevision(row: FindingRow, fields: RevisedField[], patch: Partial<FindingRow>) {
+    const labels = fields.map((field) =>
+      field === "suggestedFix" ? "suggested fix" : field === "suggestedComment" ? "comment" : field,
+    );
+    return [
+      labels.length === 0 ? null : `Updated "${patch.title ?? row.title}": ${labels.join(", ")}.`,
+      patch.proposed_comment == null
+        ? null
+        : row.state === "posted"
+          ? `"${row.title}" is already posted, so the revised comment is shown beside it instead.`
+          : `The reviewer has edited the comment on "${row.title}", so the revised one is offered beside theirs instead of replacing it.`,
+    ].filter((line): line is string => line !== null);
+  }
+
+  /** Put the review thread's answer on the issue, revising the finding as it says. */
+  function recordAnswer(questionId: string, raw: string): string {
+    const question = getQuestion(questionId);
+    if (question === null) {
+      throw new Error(`No question with id ${questionId}. Use the id from the message that asked it.`);
+    }
+    const row = getFinding(question.finding_id);
+    if (row === null) {
+      throw new Error("That issue was replaced by a re-run of the review, so there is nowhere to put the answer.");
+    }
+    const { answer, error } = parseAnswer(raw);
+    if (answer === null) {
+      throw new Error(`Not a valid answer file — ${error}\n\nExpected shape:\n${ANSWER_SCHEMA_TEXT}`);
+    }
+    const { answer: text, ...changes } = answer;
+    const { patch, fields } = reviseFinding(row, changes);
+    db.transaction(() => {
+      writeFindingPatch(row.id, patch);
+      db.prepare(
+        `UPDATE finding_questions
+         SET status = 'answered', answer = ?, updated_fields = ?, answered_at = ?
+         WHERE id = ?`,
+      ).run(text, JSON.stringify(fields), nowIso(), questionId);
+    })();
+    announce();
+    return [`Answer recorded on "${patch.title ?? row.title}".`, ...describeRevision(row, fields, patch)].join(
+      "\n",
+    );
+  }
+
+  /**
+   * Apply the review thread's edit to a report it has already submitted: add
+   * findings, revise them, or withdraw them. All or nothing, so the thread
+   * never has to work out which half landed.
+   *
+   * Withdrawing dismisses rather than deletes. The reviewer may have edited
+   * the comment or asked about it, and a dismissal keeps all of that, says
+   * why, and is one click to undo.
+   */
+  async function editReport(reviewId: string, raw: string): Promise<string> {
+    const review = getReview(reviewId);
+    if (review === null) throw new Error(unknownReview(reviewId));
+    const { edit, errors } = parseReportEdit(raw);
+    if (edit === null) {
+      throw new Error(
+        `Not a valid edit file — ${errors.join("; ")}\n\nExpected shape:\n${REPORT_EDIT_SCHEMA_TEXT}`,
+      );
+    }
+
+    const rowFor = (id: string, verb: string): FindingRow => {
+      const row = getFinding(id);
+      if (row === null || row.review_id !== reviewId) {
+        throw new Error(
+          `Cannot ${verb} ${id}: no finding with that id in ${reviewId}. ` +
+            `\`bb code-review findings --review ${reviewId}\` lists them.`,
+        );
+      }
+      return row;
+    };
+    const updates = edit.update.map(({ id, note, ...changes }) => {
+      const row = rowFor(id, "update");
+      return { row, note: note ?? "", changes, ...reviseFinding(row, changes) };
     });
-    return threadId;
+    const removals = edit.remove.map(({ id, reason }) => {
+      const row = rowFor(id, "remove");
+      if (row.state === "posted") {
+        throw new Error(`Cannot remove "${row.title}": it is already posted to GitHub.`);
+      }
+      return { row, reason };
+    });
+
+    // The same check `submit` makes, on everything this edit would leave in
+    // the report, while the thread can still fix it.
+    const snapshot = getContext(reviewId)?.snapshot ?? null;
+    if (snapshot !== null) {
+      const repoPaths = await repoTree(reviewId, review.repo, snapshot.headSha);
+      const updated = updates
+        .filter(({ changes }) => changes.file !== undefined || changes.references !== undefined)
+        .map(({ row, changes }) => ({
+          ...findingFromRow(row),
+          ...changes,
+        }));
+      const problems = [
+        { label: '"add"', bad: findBadPaths(edit.add, repoPaths) },
+        { label: '"update"', bad: findBadPaths(updated, repoPaths) },
+      ].filter(({ bad }) => bad.length > 0);
+      if (problems.length > 0) {
+        throw new Error(
+          problems.map(({ label, bad }) => `In ${label}: ${formatBadPaths(bad)}`).join("\n\n"),
+        );
+      }
+    }
+
+    const at = nowIso();
+    db.transaction(() => {
+      const { next } = db
+        .prepare(`SELECT COALESCE(MAX(ord), -1) + 1 AS next FROM findings WHERE review_id = ?`)
+        .get(reviewId) as { next: number };
+      edit.add.forEach((finding, index) => insertFinding(reviewId, next + index, finding));
+      for (const { row, note, patch, fields } of updates) {
+        writeFindingPatch(row.id, {
+          ...patch,
+          revised_at: at,
+          revision_note: note,
+          revised_fields: JSON.stringify(fields),
+        });
+      }
+      for (const { row, reason } of removals) {
+        writeFindingPatch(row.id, { state: "dismissed", removed_reason: reason });
+      }
+    })();
+    announce();
+
+    return [
+      edit.add.length === 0 ? null : `Added ${edit.add.map((finding) => `"${finding.title}"`).join(", ")}.`,
+      ...updates.flatMap(({ row, fields, patch }) =>
+        fields.length === 0 && patch.proposed_comment == null
+          ? [`"${row.title}" was already as given; nothing changed.`]
+          : describeRevision(row, fields, patch),
+      ),
+      removals.length === 0
+        ? null
+        : `Removed ${removals.map(({ row }) => `"${row.title}"`).join(", ")} — dismissed, so the reviewer can restore them.`,
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n");
+  }
+
+  /** The findings as the review thread should see them, to edit them by id. */
+  function formatFindingsForAgent(reviewId: string): string {
+    const findings = listFindings(reviewId);
+    if (findings.length === 0) return `${reviewId} has no findings.`;
+    return findings
+      .map((finding) =>
+        [
+          `${finding.id}  [${finding.state}${finding.draftComment === null ? "" : ", comment edited by the reviewer"}]  ${finding.severity}  ${locationOf(finding)}`,
+          `  ${finding.title}`,
+          `  comment: ${(finding.draftComment ?? finding.suggestedComment).split("\n").join("\n           ")}`,
+        ].join("\n"),
+      )
+      .join("\n\n");
+  }
+
+  /**
+   * Once the review thread has nothing left to do, a question still waiting
+   * was not answered through `bb code-review answer` — usually because the
+   * agent replied in the chat instead. Saying so beats a spinner that never
+   * stops. When only one question was outstanding, the thread's last reply
+   * can only be about it, so that is shown in its place.
+   *
+   * Checked after a pause, and against the queue and the thread's status,
+   * because a thread goes idle between one queued question and the next.
+   */
+  async function settleQuestions(reviewId: string, threadId: string, lastReply: string | null) {
+    const pendingFor = () =>
+      db
+        .prepare(`SELECT * FROM finding_questions WHERE review_id = ? AND status = 'pending'`)
+        .all(reviewId) as QuestionRow[];
+    if (pendingFor().length === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, idleSettleMs));
+    const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
+    if (queued.length > 0) return;
+    const thread = await bb.sdk.threads.get({ threadId });
+    if (thread.status !== "idle") return;
+    // The review may have been re-run meanwhile, onto another thread.
+    if (getReview(reviewId)?.thread_id !== threadId) return;
+    const pending = pendingFor();
+    if (pending.length === 0) return;
+    const reply = pending.length === 1 && lastReply !== null && lastReply.trim() !== "" ? lastReply : null;
+    const mark = db.prepare(
+      `UPDATE finding_questions SET status = 'unanswered', answer = ? WHERE id = ? AND status = 'pending'`,
+    );
+    for (const question of pending) mark.run(reply, question.id);
+    announce();
   }
 
   // -------------------------------------------------------------------------
   // Review threads that end without submitting
   // -------------------------------------------------------------------------
-  bb.events.on("thread.idle", ({ thread }) => {
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     const review = getReviewByThread(thread.id);
-    if (review === null || review.status !== "running") return;
+    if (review === null) return;
+    if (review.status !== "running") {
+      void settleQuestions(review.id, thread.id, lastAssistantText).catch((error) => {
+        bb.log.warn(`could not settle questions for ${review.id}: ${String(error)}`);
+      });
+      return;
+    }
     touchReview(review.id, {
       status: "failed",
       error:
@@ -1839,7 +2316,17 @@ interface ContextRow {
 
   bb.events.on("thread.failed", ({ thread, error }) => {
     const review = getReviewByThread(thread.id);
-    if (review === null || review.status !== "running") return;
+    if (review === null) return;
+    if (review.status !== "running") {
+      // Nothing more will come from a failed turn; asking again retries it.
+      const settled = db
+        .prepare(
+          `UPDATE finding_questions SET status = 'unanswered' WHERE review_id = ? AND status = 'pending'`,
+        )
+        .run(review.id);
+      if (settled.changes > 0) announce();
+      return;
+    }
     touchReview(review.id, { status: "failed", error: error ?? "The review thread failed." });
     announce();
   });
@@ -2193,15 +2680,19 @@ interface ContextRow {
       const draft = comment === row.suggested_comment ? null : comment;
       db.prepare(`UPDATE findings SET draft_comment = ? WHERE id = ?`).run(draft, findingId);
       announce();
-      return { finding: toFindingDto(requireFinding(findingId)) };
+      return { finding: findingDto(requireFinding(findingId)) };
     },
 
     setFindingState({ findingId, state }) {
       const row = requireFinding(findingId);
       if (row.state === "posted") throw new Error("That comment has already been posted.");
-      db.prepare(`UPDATE findings SET state = ? WHERE id = ?`).run(state, findingId);
+      // The reviewer's own decision replaces the thread's reason for it.
+      db.prepare(`UPDATE findings SET state = ?, removed_reason = NULL WHERE id = ?`).run(
+        state,
+        findingId,
+      );
       announce();
-      return { finding: toFindingDto(requireFinding(findingId)) };
+      return { finding: findingDto(requireFinding(findingId)) };
     },
 
     async postFinding({ findingId, mode }) {
@@ -2210,7 +2701,21 @@ interface ContextRow {
     },
 
     async askAboutFinding({ findingId, question }) {
-      return { threadId: await askAboutFinding(findingId, question) };
+      return askAboutFinding(findingId, question);
+    },
+
+    resolveProposedComment({ findingId, use }) {
+      const row = requireFinding(findingId);
+      if (row.proposed_comment === null) throw new Error("There is no revised comment to use.");
+      if (use && row.state === "posted") throw new Error("That comment has already been posted.");
+      writeFindingPatch(
+        findingId,
+        use
+          ? { suggested_comment: row.proposed_comment, draft_comment: null, proposed_comment: null }
+          : { proposed_comment: null },
+      );
+      announce();
+      return { finding: findingDto(requireFinding(findingId)) };
     },
 
     async openReview({ repo, number }) {
@@ -2284,6 +2789,9 @@ interface ContextRow {
     "  bb code-review files   --review <review-id>",
     "  bb code-review schema",
     "  bb code-review submit  --review <review-id> --file <path-to-findings.json>",
+    "  bb code-review findings --review <review-id>",
+    "  bb code-review edit    --review <review-id> --file <path-to-edit.json>",
+    "  bb code-review answer  --question <question-id> --file <path-to-answer.json>",
     "",
     'A review id looks like "owner/repo#123". The PR is fetched when the review',
     "starts and served from here, so reviewing needs no network access of its own.",
@@ -2316,6 +2824,28 @@ interface ContextRow {
     return inline === undefined ? null : inline.slice(name.length + 3);
   }
 
+  /** A file the agent wrote, read on the machine its thread runs on. */
+  async function readAgentFile(
+    file: string,
+    ctx: { threadId?: string; cwd?: string },
+  ): Promise<{ ok: true; raw: string; absolute: string } | { ok: false; error: string }> {
+    const hostId = await resolveInvokingHostId(ctx.threadId);
+    const absolute = path.isAbsolute(file) ? file : path.resolve(ctx.cwd ?? ".", file);
+    try {
+      const result = await bb.sdk.files.read({ hostId, path: absolute });
+      const raw =
+        result.contentEncoding === "base64"
+          ? Buffer.from(result.content, "base64").toString("utf8")
+          : result.content;
+      return { ok: true, raw, absolute };
+    } catch (error) {
+      return {
+        ok: false,
+        error: `Could not read ${absolute}: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
   bb.cli.register({
     name: "code-review",
     summary: "Report pull request review findings back to the Code Review panel",
@@ -2345,6 +2875,21 @@ interface ContextRow {
         name: "submit",
         summary: "Submit a findings JSON file for a review",
         usage: "bb code-review submit --review <owner/repo#123> --file <path>",
+      },
+      {
+        name: "findings",
+        summary: "List a review's current findings with their ids, to edit them",
+        usage: "bb code-review findings --review <owner/repo#123>",
+      },
+      {
+        name: "edit",
+        summary: "Add, change or remove findings in a review already submitted",
+        usage: "bb code-review edit --review <owner/repo#123> --file <path>",
+      },
+      {
+        name: "answer",
+        summary: "Put the answer to a question about a finding on that issue in the panel",
+        usage: "bb code-review answer --question <question-id> --file <path>",
       },
     ],
     async run(argv, ctx) {
@@ -2424,25 +2969,9 @@ interface ContextRow {
           if (review === null) {
             return { exitCode: 1, stderr: unknownReview(reviewId) };
           }
-          const hostId = await resolveInvokingHostId(ctx.threadId);
-          const absolute = path.isAbsolute(file)
-            ? file
-            : path.resolve(ctx.cwd ?? ".", file);
-          let raw: string;
-          try {
-            const result = await bb.sdk.files.read({ hostId, path: absolute });
-            raw =
-              result.contentEncoding === "base64"
-                ? Buffer.from(result.content, "base64").toString("utf8")
-                : result.content;
-          } catch (error) {
-            return {
-              exitCode: 1,
-              stderr: `Could not read ${absolute}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            };
-          }
+          const read = await readAgentFile(file, ctx);
+          if (!read.ok) return { exitCode: 1, stderr: read.error };
+          const { raw, absolute } = read;
           const { report, errors } = parseReport(raw);
           if (report === null) {
             return {
@@ -2470,6 +2999,39 @@ interface ContextRow {
           ];
           // Dropped findings are a warning, not a failure: the rest are in.
           return { exitCode: 0, stdout: lines.join("\n") };
+        }
+
+        case "findings": {
+          const reviewId = readFlag(argv, "review");
+          if (reviewId === null) return { exitCode: 1, stderr: usage };
+          if (getReview(reviewId) === null) return { exitCode: 1, stderr: unknownReview(reviewId) };
+          return { exitCode: 0, stdout: formatFindingsForAgent(reviewId) };
+        }
+
+        case "edit": {
+          const reviewId = readFlag(argv, "review");
+          const file = readFlag(argv, "file");
+          if (reviewId === null || file === null) return { exitCode: 1, stderr: usage };
+          const read = await readAgentFile(file, ctx);
+          if (!read.ok) return { exitCode: 1, stderr: read.error };
+          try {
+            return { exitCode: 0, stdout: await editReport(reviewId, read.raw) };
+          } catch (error) {
+            return { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) };
+          }
+        }
+
+        case "answer": {
+          const questionId = readFlag(argv, "question");
+          const file = readFlag(argv, "file");
+          if (questionId === null || file === null) return { exitCode: 1, stderr: usage };
+          const read = await readAgentFile(file, ctx);
+          if (!read.ok) return { exitCode: 1, stderr: read.error };
+          try {
+            return { exitCode: 0, stdout: recordAnswer(questionId, read.raw) };
+          } catch (error) {
+            return { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) };
+          }
         }
       }
       return { exitCode: 1, stderr: usage };

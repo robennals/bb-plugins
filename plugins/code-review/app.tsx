@@ -23,7 +23,7 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { FindingDto, PullRequestDto, ReviewDto, rpcContract } from "./server";
+import type { FindingDto, PullRequestDto, QuestionDto, ReviewDto, rpcContract } from "./server";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
@@ -668,6 +668,7 @@ function FindingRow({ finding, onOpen }: { finding: FindingDto; onOpen: () => vo
       <div className="flex items-start gap-2">
         <SeverityBadge severity={finding.severity} />
         <span className="min-w-0 flex-1 text-sm font-medium leading-snug">{finding.title}</span>
+        <QuestionsBadge questions={finding.questions} />
         {finding.state === "posted" ? (
           <Badge variant="outline" className="shrink-0 gap-1 border-border">
             <Icon name="Check" className="size-3" />
@@ -680,6 +681,29 @@ function FindingRow({ finding, onOpen }: { finding: FindingDto; onOpen: () => vo
       <p className="line-clamp-3 text-xs leading-relaxed text-muted-foreground">{finding.gist}</p>
       <p className="font-mono text-[11px] text-muted-foreground/80">{locationLabel(finding)}</p>
     </button>
+  );
+}
+
+/**
+ * Whether a question about this issue is still being answered, or how many
+ * have been — so several can be asked in a row and their answers found from
+ * the list.
+ */
+function QuestionsBadge({ questions }: { questions: QuestionDto[] }) {
+  if (questions.length === 0) return null;
+  const waiting = questions.filter((question) => question.status === "pending").length;
+  return (
+    <Badge
+      variant="outline"
+      className="shrink-0 gap-1 border-border"
+      title={waiting > 0 ? "Waiting for the review thread to answer" : "Questions answered"}
+    >
+      <Icon
+        name={waiting > 0 ? "Spinner" : "SideChat"}
+        className={cn("size-3", waiting > 0 && "animate-spin")}
+      />
+      {waiting > 0 ? "answering" : questions.length}
+    </Badge>
   );
 }
 
@@ -1065,13 +1089,15 @@ function FindingActions({
   // unprompted message in it is noise the reviewer did not ask for.
   const [question, setQuestion] = useState<string | null>(null);
   const [isAsking, setIsAsking] = useState(false);
-  // Adopt server-side changes (a re-run, another window) without clobbering an
-  // edit in progress: the stored value is the identity of the draft.
+  // Adopt server-side changes (a re-run, an answer that rewrote the comment,
+  // another window) without clobbering an edit in progress: only a box still
+  // showing the previous stored value follows the new one.
   const lastStored = useRef(stored);
   useEffect(() => {
-    if (lastStored.current !== stored) {
+    const previous = lastStored.current;
+    if (previous !== stored) {
       lastStored.current = stored;
-      setComment(stored);
+      setComment((current) => (current === previous ? stored : current));
     }
   }, [stored]);
 
@@ -1111,8 +1137,8 @@ function FindingActions({
     setIsAsking(true);
     try {
       await onAsk(text);
-      // Closing on success keeps the box a one-question affair; the
-      // conversation itself continues in the discussion pane.
+      // Closing on success keeps the box a one-question affair; the answer
+      // turns up under it, so there is nothing to wait for here.
       setQuestion(null);
     } catch (cause) {
       reportError(cause);
@@ -1208,6 +1234,7 @@ function FindingActions({
           aria-label={`Comment for ${finding.title}`}
         />
       )}
+      <ProposedComment rpc={rpc} finding={finding} />
 
       <div className="flex flex-wrap items-center gap-2">
         {isPosted ? (
@@ -1338,6 +1365,132 @@ function FindingActions({
   );
 }
 
+const FIELD_LABELS: Record<QuestionDto["updatedFields"][number], string> = {
+  title: "title",
+  summary: "summary",
+  suggestedFix: "suggested fix",
+  suggestedComment: "comment",
+  severity: "severity",
+  category: "category",
+  location: "location",
+  references: "references",
+};
+
+/** "a", "a and b", "a, b and c". */
+function listOf(items: string[]): string {
+  return items.length <= 1
+    ? (items[0] ?? "")
+    : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/**
+ * The questions asked about an issue and the review thread's answers, so they
+ * are read beside the issue rather than dug out of the chat.
+ */
+function FindingQuestions({ finding }: { finding: FindingDto }) {
+  if (finding.questions.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Questions
+      </p>
+      {finding.questions.map((question) => (
+        <QuestionCard key={question.id} question={question} />
+      ))}
+    </div>
+  );
+}
+
+function QuestionCard({ question }: { question: QuestionDto }) {
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/30 p-2">
+      <p className="whitespace-pre-wrap text-sm font-medium">{question.question}</p>
+      {question.status === "pending" ? (
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Icon name="Spinner" className="size-3.5 animate-spin" />
+          Waiting for the review thread to answer…
+        </p>
+      ) : question.status === "unanswered" ? (
+        <>
+          <p className="text-xs text-muted-foreground">
+            {question.answer === null
+              ? "The review thread did not put an answer here. Its reply, if any, is in the chat."
+              : "The review thread replied in the chat without putting an answer here. Its reply:"}
+          </p>
+          {question.answer === null ? null : <Markdown content={question.answer} />}
+        </>
+      ) : (
+        <>
+          <Markdown content={question.answer ?? ""} />
+          {question.updatedFields.length === 0 ? null : (
+            <p className="text-xs text-muted-foreground">
+              Updated this issue&apos;s{" "}
+              {listOf(question.updatedFields.map((field) => FIELD_LABELS[field]))}.
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A comment the review thread revised but could not apply, because the
+ * reviewer had edited theirs or posted it.
+ */
+function ProposedComment({ rpc, finding }: { rpc: Rpc; finding: FindingDto }) {
+  const [isBusy, setIsBusy] = useState(false);
+  const resolve = useCallback(
+    async (use: boolean) => {
+      setIsBusy(true);
+      try {
+        await rpc.call("resolveProposedComment", { findingId: finding.id, use });
+      } catch (cause) {
+        reportError(cause);
+      } finally {
+        setIsBusy(false);
+      }
+    },
+    [rpc, finding.id],
+  );
+  if (finding.proposedComment === null) return null;
+  const isPosted = finding.state === "posted";
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-border bg-muted/30 p-2">
+      <p className="text-xs text-muted-foreground">
+        {isPosted
+          ? "The review thread revised this comment after you posted it:"
+          : "The review thread revised this comment, but you had edited yours:"}
+      </p>
+      <div className="whitespace-pre-wrap rounded-md border border-border bg-background p-2 text-sm">
+        {finding.proposedComment}
+      </div>
+      <div className="flex items-center gap-2">
+        {isPosted ? null : (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 text-xs"
+            disabled={isBusy}
+            onClick={() => void resolve(true)}
+          >
+            Use this comment
+          </Button>
+        )}
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-8 text-xs text-muted-foreground"
+          disabled={isBusy}
+          onClick={() => void resolve(false)}
+        >
+          {isPosted ? "Dismiss" : "Keep mine"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function FindingDetailView({
   rpc,
   repo,
@@ -1368,9 +1521,9 @@ function FindingDetailView({
   const ask = useCallback(
     async (target: FindingDto, question: string) => {
       await rpc.call("askAboutFinding", { findingId: target.id, question });
-      // The answer arrives in the review's own thread, which is the chat
-      // beside this tab, so there is nowhere to send the reader.
-      toast.success("Asked in the review thread");
+      // The answer is put on the issue when it arrives, so the reader can go
+      // on to the next issue meanwhile.
+      toast.success("Asked — the answer will appear on this issue");
     },
     [rpc],
   );
@@ -1439,6 +1592,23 @@ function FindingDetailView({
           ) : null}
         </div>
 
+        {finding.state === "dismissed" && finding.removedReason !== null ? (
+          <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            The review thread withdrew this issue
+            {finding.removedReason === "" ? "." : `: ${finding.removedReason}`} Restore it if you
+            disagree.
+          </p>
+        ) : finding.revision === null ? null : (
+          <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            The review thread revised this issue
+            {finding.revision.fields.length === 0
+              ? ""
+              : ` (${listOf(finding.revision.fields.map((field) => FIELD_LABELS[field]))})`}{" "}
+            {relativeTime(finding.revision.at)}
+            {finding.revision.note === "" ? "." : `: ${finding.revision.note}`}
+          </p>
+        )}
+
         {/* For the reviewer, not the author: the comment below is what the
             author sees, and this is what you would do about it. */}
         {finding.suggestedFix === "" ? null : (
@@ -1487,6 +1657,8 @@ function FindingDetailView({
           hasPendingReview={pr.data?.hasPendingReview ?? false}
           onAsk={(question) => ask(finding, question)}
         />
+
+        <FindingQuestions finding={finding} />
       </div>
 
       {others.length === 0 ? null : (
