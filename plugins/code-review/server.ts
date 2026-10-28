@@ -27,6 +27,7 @@ import {
   FINDINGS_SCHEMA_TEXT,
   findingGist,
   findingLocations,
+  highlightLocations,
   formatContext,
   formatFileList,
   buildFileContextBlock,
@@ -59,6 +60,7 @@ import {
   patchLineChanges,
   splitUnifiedDiff,
   type Finding,
+  type Report,
   type FilePatch,
   type FilterContext,
   type FindingLocation,
@@ -116,6 +118,14 @@ const pullRequestSchema = z.object({
 });
 export type PullRequestDto = z.infer<typeof pullRequestSchema>;
 
+/** A place in the repository, with one line on what to look at there. */
+const referenceDto = z.object({
+  file: z.string(),
+  startLine: z.number().nullable(),
+  endLine: z.number().nullable(),
+  note: z.string(),
+});
+
 const findingSchemaDto = z.object({
   id: z.string(),
   reviewId: z.string(),
@@ -151,16 +161,18 @@ const findingSchemaDto = z.object({
     /** The finding's range had to be narrowed to fit the diff. */
     adjusted: z.boolean(),
   }),
-  references: z.array(
-    z.object({
-      file: z.string(),
-      startLine: z.number().nullable(),
-      endLine: z.number().nullable(),
-      note: z.string(),
-    }),
-  ),
+  references: z.array(referenceDto),
 });
 export type FindingDto = z.infer<typeof findingSchemaDto>;
+
+const highlightSchemaDto = z.object({
+  id: z.string(),
+  reviewId: z.string(),
+  title: z.string(),
+  summary: z.string(),
+  locations: z.array(referenceDto),
+});
+export type HighlightDto = z.infer<typeof highlightSchemaDto>;
 
 const reviewSchema = z.object({
   id: z.string(),
@@ -254,6 +266,15 @@ const codeLocationSchema = z.object({
   error: z.string().nullable(),
 });
 
+/** The code a finding or highlight points at. */
+const pointedAtCodeSchema = z.object({
+  prUrl: z.string(),
+  headSha: z.string(),
+  /** False when the code was fetched after the review, so lines may have moved. */
+  isReviewedCommit: z.boolean(),
+  locations: z.array(codeLocationSchema),
+});
+
 /** Which view of the side pane the reviewer last had open. */
 const sidePaneSchema = z.enum(["github", "diff", "files", "discussion"]);
 
@@ -300,6 +321,8 @@ export const rpcContract = defineRpcContract({
       pullRequest: pullRequestSchema.nullable(),
       review: reviewSchema.nullable(),
       findings: z.array(findingSchemaDto),
+      /** What the review pointed out as worth a look, in the agent's order. */
+      highlights: z.array(highlightSchemaDto),
       /** You already have an unsubmitted review open on this PR. */
       hasPendingReview: z.boolean(),
     }),
@@ -360,13 +383,14 @@ export const rpcContract = defineRpcContract({
       /** Lines of surrounding context above and below each cited range. */
       context: z.number().int().min(0).max(200).optional(),
     }),
-    output: z.object({
-      prUrl: z.string(),
-      headSha: z.string(),
-      /** False when the code was fetched after the review, so lines may have moved. */
-      isReviewedCommit: z.boolean(),
-      locations: z.array(codeLocationSchema),
+    output: pointedAtCodeSchema,
+  },
+  getHighlightCode: {
+    input: z.object({
+      highlightId: z.string(),
+      context: z.number().int().min(0).max(200).optional(),
     }),
+    output: pointedAtCodeSchema,
   },
   /**
    * The model the next review will run with: the one chosen in the panel, or
@@ -526,6 +550,25 @@ interface FindingRow {
   posted_at: string | null;
   posted_as: string;
   references_json: string;
+}
+
+interface HighlightRow {
+  id: string;
+  review_id: string;
+  ord: number;
+  title: string;
+  summary: string;
+  locations_json: string;
+}
+
+function toHighlightDto(row: HighlightRow): HighlightDto {
+  return {
+    id: row.id,
+    reviewId: row.review_id,
+    title: row.title,
+    summary: row.summary,
+    locations: parseJsonArray(row.locations_json),
+  };
 }
 
 function toReviewDto(row: ReviewRow): ReviewDto {
@@ -786,6 +829,21 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   ensureColumn("panel_state", "diff_file", `TEXT`);
   ensureColumn("panel_state", "diff_url", `TEXT`);
 
+  // What a review points out as worth a look. Nothing about one is ever acted
+  // on, so every run replaces the lot. Created here rather than appended to
+  // the migration list: `migrate` keys statements by index, so two branches
+  // that each append one cannot both be installed, and an idempotent CREATE
+  // needs no index at all.
+  db.exec(`CREATE TABLE IF NOT EXISTS highlights (
+    id TEXT PRIMARY KEY,
+    review_id TEXT NOT NULL,
+    ord INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    locations_json TEXT NOT NULL DEFAULT '[]'
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS highlights_by_review ON highlights (review_id)`);
+
   function getReview(reviewId: string): ReviewRow | null {
     return (db.prepare(`SELECT * FROM reviews WHERE id = ?`).get(reviewId) as
       | ReviewRow
@@ -819,6 +877,21 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
         ),
       };
     });
+  }
+
+  function listHighlights(reviewId: string): HighlightDto[] {
+    const rows = db
+      .prepare(`SELECT * FROM highlights WHERE review_id = ? ORDER BY ord ASC`)
+      .all(reviewId) as HighlightRow[];
+    return rows.map(toHighlightDto);
+  }
+
+  function requireHighlight(highlightId: string): HighlightDto {
+    const row = db.prepare(`SELECT * FROM highlights WHERE id = ?`).get(highlightId) as
+      | HighlightRow
+      | undefined;
+    if (row === undefined) throw new Error(`No highlight with id ${highlightId}.`);
+    return toHighlightDto(row);
   }
 
   function getFinding(findingId: string): FindingRow | null {
@@ -1278,6 +1351,7 @@ interface ContextRow {
     // has: posted comments are history, and dismissals are a decision the user
     // should not have to make twice.
     db.prepare(`DELETE FROM findings WHERE review_id = ? AND state = 'open'`).run(reviewId);
+    db.prepare(`DELETE FROM highlights WHERE review_id = ?`).run(reviewId);
     // Cached file bodies belong to the commit that was reviewed; a re-run may
     // be on a newer one.
     db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
@@ -1454,7 +1528,8 @@ interface ContextRow {
     }
   }
 
-  function importFindings(reviewId: string, findings: Finding[], summary: string): number {
+  function importReport(reviewId: string, report: Report): number {
+    const { findings, highlights, summary } = report;
     const existingPosted = db
       .prepare(`SELECT COUNT(*) AS n FROM findings WHERE review_id = ? AND state != 'open'`)
       .get(reviewId) as { n: number };
@@ -1466,8 +1541,23 @@ interface ContextRow {
                @category, @title, @summary, @suggested_fix,
                @suggested_comment, @references_json, NULL, 'open')`,
     );
+    const insertHighlight = db.prepare(
+      `INSERT INTO highlights (id, review_id, ord, title, summary, locations_json)
+       VALUES (@id, @review_id, @ord, @title, @summary, @locations_json)`,
+    );
     const write = db.transaction((rows: Finding[]) => {
       db.prepare(`DELETE FROM findings WHERE review_id = ? AND state = 'open'`).run(reviewId);
+      db.prepare(`DELETE FROM highlights WHERE review_id = ?`).run(reviewId);
+      highlights.forEach((highlight, index) => {
+        insertHighlight.run({
+          id: randomUUID(),
+          review_id: reviewId,
+          ord: index,
+          title: highlight.title,
+          summary: highlight.summary,
+          locations_json: JSON.stringify(highlight.locations),
+        });
+      });
     // Cached file bodies belong to the commit that was reviewed; a re-run may
     // be on a newer one.
     db.prepare(`DELETE FROM review_files WHERE review_id = ?`).run(reviewId);
@@ -1943,46 +2033,78 @@ interface ContextRow {
     const finding = toFindingDto(row);
     const review = getReview(finding.reviewId);
     if (review === null) throw new Error(`No review for finding ${findingId}.`);
+    return locationsCode({
+      review,
+      side: finding.side,
+      nearTo: finding.file,
+      contextLines,
+      pointsAt: (resolvePath) =>
+        findingLocations(
+          {
+            file: finding.file,
+            startLine: finding.startLine,
+            endLine: finding.endLine,
+            summary: finding.summary,
+            suggestedComment: finding.suggestedComment,
+            references: finding.references,
+          },
+          resolvePath,
+        ),
+    });
+  }
+
+  async function highlightCode(highlightId: string, contextLines: number) {
+    const highlight = requireHighlight(highlightId);
+    const review = getReview(highlight.reviewId);
+    if (review === null) throw new Error(`No review for highlight ${highlightId}.`);
+    return locationsCode({
+      review,
+      // Highlights point at the code as it now is.
+      side: "RIGHT",
+      nearTo: highlight.locations[0]?.file ?? "",
+      contextLines,
+      pointsAt: (resolvePath) => highlightLocations(highlight, resolvePath),
+    });
+  }
+
+  /**
+   * The code at each place a finding or highlight points at, at the reviewed
+   * commit, with what the pull request did to it.
+   */
+  async function locationsCode(args: {
+    review: ReviewRow;
+    /** Which side of the diff a link into it should land on. */
+    side: "LEFT" | "RIGHT";
+    /** A bare cited filename resolves to the candidate nearest this path. */
+    nearTo: string;
+    contextLines: number;
+    /** The locations to show, given a way to turn a cited path into a real one. */
+    pointsAt: (resolvePath: (file: string) => string) => FindingLocation[];
+  }) {
+    const { review, side, nearTo, contextLines, pointsAt } = args;
     // A review from before snapshots existed, or one whose fetch failed, has
     // no stored commit. Fetching it is two gh calls — far cheaper than telling
     // the user to re-run an agent review just to look at code.
-    let stored = getContext(finding.reviewId);
+    let stored = getContext(review.id);
     if (stored === null || stored.snapshot.headSha === "") {
       await fetchContext(review.repo, review.number, false);
-      stored = getContext(finding.reviewId);
+      stored = getContext(review.id);
     }
     const snapshot = stored?.snapshot ?? null;
     const sha = snapshot?.headSha ?? "";
-    // Parsed once for the whole finding: several locations often sit in the
+    // Parsed once for the whole request: several locations often sit in the
     // same file, and every one of them needs the same answer.
     const patches = stored === null ? [] : splitUnifiedDiff(stored.diff);
 
     const prPaths = (snapshot?.files ?? []).map((entry) => entry.path);
     // Resolve against the PR's files first; only if something still looks
     // unresolved is the repo-wide tree worth a call.
-    const firstPass = findingLocations(
-      {
-        file: finding.file,
-        startLine: finding.startLine,
-        endLine: finding.endLine,
-        summary: finding.summary,
-        suggestedComment: finding.suggestedComment,
-        references: finding.references,
-      },
-      (file) => resolveCitedPath(file, prPaths, [], finding.file),
-    );
+    const firstPass = pointsAt((file) => resolveCitedPath(file, prPaths, [], nearTo));
     const treePaths = firstPass.some((location) => needsPathResolution(location.file, prPaths))
-      ? await repoTree(finding.reviewId, review.repo, sha)
+      ? await repoTree(review.id, review.repo, sha)
       : [];
 
-    const locations: FindingLocation[] = findingLocations({
-      file: finding.file,
-      startLine: finding.startLine,
-      endLine: finding.endLine,
-      summary: finding.summary,
-      suggestedComment: finding.suggestedComment,
-      references: finding.references,
-    }, (file) => resolveCitedPath(file, prPaths, treePaths, finding.file));
+    const locations = pointsAt((file) => resolveCitedPath(file, prPaths, treePaths, nearTo));
 
     const resolved = await Promise.all(
       locations.map(async (location) => {
@@ -1991,7 +2113,7 @@ interface ContextRow {
           number: review.number,
           pathDigest: pathDigest(location.file),
           line: location.startLine,
-          side: finding.side,
+          side,
         });
         const blobUrl = githubBlobUrl({
           repo: review.repo,
@@ -2020,7 +2142,7 @@ interface ContextRow {
           };
         }
         const { content, error } = await fileContent(
-          finding.reviewId,
+          review.id,
           review.repo,
           sha,
           location.file,
@@ -2173,6 +2295,7 @@ interface ContextRow {
         pullRequest: pr === null ? null : withReviewState(pr, archivedThreadIds),
         review: review === null ? null : toReviewDto(review),
         findings: review === null ? [] : listFindings(review.id),
+        highlights: review === null ? [] : listHighlights(review.id),
         hasPendingReview: (await cachedPendingReviewId(repo, number)) !== null,
       };
     },
@@ -2226,6 +2349,11 @@ interface ContextRow {
     async getFindingCode({ findingId, context }) {
       await checkAuth();
       return findingCode(findingId, context ?? 3);
+    },
+
+    async getHighlightCode({ highlightId, context }) {
+      await checkAuth();
+      return highlightCode(highlightId, context ?? 3);
     },
 
     async getReviewModel({ repo }) {
@@ -2455,17 +2583,20 @@ interface ContextRow {
           // Enforce full repo-relative paths here, where the agent can still
           // fix them, rather than leaving the panel to resolve them later.
           const snapshot = getContext(reviewId)?.snapshot ?? null;
-          if (snapshot !== null && report.findings.length > 0) {
+          const citesPaths = report.findings.length > 0 || report.highlights.length > 0;
+          if (snapshot !== null && citesPaths) {
             const repoPaths = await repoTree(reviewId, review.repo, snapshot.headSha);
-            const bad = findBadPaths(report.findings, repoPaths);
+            const bad = findBadPaths(report, repoPaths);
             if (bad.length > 0) {
               return { exitCode: 1, stderr: formatBadPaths(bad) };
             }
           }
           touchReview(reviewId, { findings_path: absolute });
-          const count = importFindings(reviewId, report.findings, report.summary);
+          const count = importReport(reviewId, report);
+          const highlightCount = report.highlights.length;
           const lines = [
-            `Submitted ${count} finding${count === 1 ? "" : "s"} for ${reviewId}.`,
+            `Submitted ${count} finding${count === 1 ? "" : "s"} and ${highlightCount} ` +
+              `highlight${highlightCount === 1 ? "" : "s"} for ${reviewId}.`,
             ...errors.map((problem) => `Warning: ${problem}`),
           ];
           // Dropped findings are a warning, not a failure: the rest are in.

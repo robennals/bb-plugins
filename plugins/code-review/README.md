@@ -19,8 +19,14 @@ yourself — one comment at a time, edited how you want it.
    straight to the review's thread and spends nothing; a **Code review** tab
    opens beside the thread, and **Re-run review** inside it asks for a fresh
    pass.
-3. **Skim the issues.** The tab is a plain list: severity, title, and a
-   three-line gist. Nothing else, plus one link through to the PR on GitHub.
+3. **See where to look, then skim the issues.** The tab opens with **Worth a
+   look**: the parts of the change the review thinks deserve a careful read —
+   the heart of it, a design decision, a behaviour that shifts — each a title,
+   a short summary and the files involved. Opening one shows that summary over
+   the code doing it, as the same snippets an issue gets (below). These are
+   never posted; they are a map for the reviewer. Under them, the issues are a
+   plain list: severity, title, and a three-line gist, plus one link through to
+   the PR on GitHub.
 4. **Open an issue** and the comment is the first thing there, under the
    suggested fix, with every file it points at below, stacked, each showing
    just the cited lines with their real line numbers. There is no write-up
@@ -219,8 +225,15 @@ Context goes in `references`, not prose: a place in the repository and one line
 on what to look at there. The panel puts that code on screen beside the issue,
 which is both cheaper to write and more use than a paragraph describing it.
 
-A single malformed finding is dropped with a warning and the rest are imported;
-`submit` reports the warnings but still succeeds.
+Alongside `findings`, the file carries `highlights`: what a reviewer should
+look at, as opposed to what is wrong. Each is a `title`, a one- or two-sentence
+`summary`, and `locations` — the code doing it, in the same shape as
+`references` and checked against the repository the same way. They are
+optional, so a report without them is still whole, and a re-run replaces all
+of them, since nothing about one is ever acted on.
+
+A single malformed finding or highlight is dropped with a warning and the rest
+are imported; `submit` reports the warnings but still succeeds.
 
 Re-running a review replaces the findings you have not acted on and keeps the
 ones you have — posted comments are history, and a dismissal is a decision you
