@@ -2,7 +2,7 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { expect, describe, it } from "vitest";
-import type { PullRequest, SavedState } from "./server";
+import { rpcContract, type PullRequest, type SavedState } from "./server";
 
 /**
  * The thunk matters: app.tsx binds the plugin runtime at module load, so
@@ -20,7 +20,7 @@ const PR: PullRequest = {
 function savedState(...prs: PullRequest[]): SavedState {
   return {
     repositories: [{ repository: "acme/app", projectName: "App" }], selectedRepository: "acme/app", sortOrder: "STATUS",
-    list: { repository: "acme/app", prs, refreshedAt: "2026-01-02T00:00:00Z" },
+    list: { repository: "acme/app", prs, refreshedAt: "2026-01-02T00:00:00Z" }, collapsedStacks: [],
   };
 }
 
@@ -115,9 +115,21 @@ describe("stacked pull requests", () => {
     slot.lifecycle.unmount();
   });
 
-  it("shows a stack as one unit that collapses to its header", async () => {
+  it("shows a stack as one unit that collapses to its header, and saves that", async () => {
     const app = await load();
-    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: { prs_list: () => state, prs_refresh: () => state } });
+    let current = state;
+    const saves: unknown[] = [];
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        prs_list: () => current, prs_refresh: () => current,
+        prs_set_stack_collapsed: (raw: unknown) => {
+          const input = rpcContract.prs_set_stack_collapsed.input.parse(raw);
+          saves.push(input);
+          current = { ...current, collapsedStacks: input.collapsed ? [input.stack] : [] };
+          return current;
+        },
+      },
+    });
     const stack = await slot.findByRole("region", { name: "Stack of 3 pull requests: Change 1" });
     expect(Array.from(stack.querySelectorAll("h2")).map((title) => title.textContent)).toEqual(["Change 3", "Change 2", "Change 1"]);
     expect(slot.getByText("Change 9").closest("section")).toBeNull();
@@ -125,6 +137,17 @@ describe("stacked pull requests", () => {
     fireEvent.click(slot.getByRole("button", { name: /Change 1 · Stack of 3/ }));
     expect(stack.querySelectorAll("h2")).toHaveLength(0);
     expect(stack.textContent).toBe("Change 1· Stack of 3");
+    await waitFor(() => expect(saves).toEqual([{ repository: "acme/app", stack: "acme/app#1", collapsed: true }]));
+    slot.lifecycle.unmount();
+  });
+
+  it("opens with the stacks that were collapsed last time still collapsed", async () => {
+    const app = await load();
+    const collapsed = { ...state, collapsedStacks: ["acme/app#1"] };
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: { prs_list: () => collapsed, prs_refresh: () => collapsed } });
+    const stack = await slot.findByRole("region", { name: "Stack of 3 pull requests: Change 1" });
+    expect(stack.querySelectorAll("h2")).toHaveLength(0);
+    expect(slot.getByRole("button", { name: /Change 1 · Stack of 3/ }).getAttribute("aria-expanded")).toBe("false");
     slot.lifecycle.unmount();
   });
 
