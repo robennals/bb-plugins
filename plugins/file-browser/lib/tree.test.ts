@@ -3,7 +3,6 @@ import {
   ancestorsOf,
   basename,
   buildTree,
-  filterTree,
   fuzzyMatch,
   rankEntries,
   visibleRows,
@@ -132,34 +131,6 @@ describe("rankEntries", () => {
     const ranked = rankEntries(entries, "ts", 2);
     expect(ranked.matches).toHaveLength(2);
     expect(ranked.truncated).toBe(true);
-  });
-});
-
-describe("filterTree", () => {
-  it("keeps matching files with their parent directories", () => {
-    const filtered = filterTree(buildTree(ENTRIES), "auth");
-    const paths = visibleRows(filtered.nodes, filtered.expand).map(
-      (row) => row.node.path,
-    );
-    expect(paths).toContain("config/auth.php");
-    expect(paths).toContain("app/Http/Controllers/AuthController.php");
-    expect(paths).not.toContain("README.md");
-  });
-
-  it("expands every surviving directory so matches are on screen", () => {
-    const filtered = filterTree(buildTree(ENTRIES), "auth");
-    expect(filtered.expand.has("config")).toBe(true);
-    expect(filtered.matchCount).toBe(2);
-  });
-
-  it("drops a directory whose files all failed to match", () => {
-    const filtered = filterTree(buildTree(ENTRIES), "readme");
-    expect(filtered.nodes.map((node) => node.path)).toEqual(["README.md"]);
-  });
-
-  it("returns the tree untouched for an empty query", () => {
-    const tree = buildTree(ENTRIES);
-    expect(filterTree(tree, "").nodes).toHaveLength(tree.length);
   });
 });
 

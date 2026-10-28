@@ -255,3 +255,80 @@ describe("the edit view", () => {
     slot.lifecycle.unmount();
   });
 });
+
+describe("searching inside files", () => {
+  const GUIDE = "# Guide\nfirst todo\nnothing\nnothing\nsecond TODO\n";
+  const FOUND = {
+    files: [
+      {
+        path: "guide.md",
+        matchCount: 2,
+        lines: [
+          { line: 2, text: "first todo" },
+          { line: 5, text: "second TODO" },
+        ],
+      },
+      { path: "notes.txt", matchCount: 1, lines: [{ line: 1, text: "todo: buy milk" }] },
+    ],
+    truncated: false,
+  };
+
+  async function searchFor(query: string) {
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "project/p1/guide.md" },
+      {
+        rpc: {
+          tree: () => ({
+            ...TREE,
+            entries: [...TREE.entries, { path: "guide.md", kind: "file" as const }],
+          }),
+          read: () => ({ ...textFile(GUIDE, "sha-guide"), absolutePath: "/work/app/guide.md" }),
+          search: () => FOUND,
+        },
+      },
+    );
+    await slot.findByRole("treeitem", { name: /guide\.md/ });
+    fireEvent.change(slot.getByRole("searchbox", { name: "Search in files" }), {
+      target: { value: query },
+    });
+    await slot.findByRole("list", { name: "Search results" });
+    return slot;
+  }
+
+  it("asks the workspace for files containing the text, and previews the lines", async () => {
+    const slot = await searchFor("todo");
+
+    expect(
+      slot.inspection.rpcCalls.filter((call) => call.method === "search").map((call) => call.input),
+    ).toEqual([{ scope: SCOPE, query: "todo", includeHidden: true }]);
+    // Only the files the search found: the tree is gone while it is shown.
+    expect(slot.queryByRole("tree", { name: "Workspace files" })).toBeNull();
+    expect(slot.getByText("second TODO", { exact: false })).toBeTruthy();
+    expect(slot.getByText("3 lines in 2 files")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("opens a clicked line on the source view, highlighted, and steps through the matches", async () => {
+    const slot = await searchFor("todo");
+
+    // Markdown would land on its preview; a search result lands on its source.
+    fireEvent.click(slot.getByTitle("guide.md:5"));
+    const source = await slot.findByTestId("bb-source-code");
+    expect(source.dataset.highlightedLines).toBe("5-5");
+    expect(slot.getByText("Line 5 · match 2 of 2 for “todo”")).toBeTruthy();
+
+    fireEvent.click(slot.getByRole("button", { name: "Next match" }));
+    expect(slot.getByTestId("bb-source-code").dataset.highlightedLines).toBe("2-2");
+    slot.lifecycle.unmount();
+  });
+
+  it("opens another file from its result", async () => {
+    const slot = await searchFor("todo");
+    fireEvent.click(slot.getByTitle("notes.txt:1"));
+    expect(slot.inspection.navigateCalls).toHaveLength(1);
+    expect(JSON.stringify(slot.inspection.navigateCalls[0])).toContain("notes.txt");
+    slot.lifecycle.unmount();
+  });
+});

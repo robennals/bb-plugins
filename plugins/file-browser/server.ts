@@ -11,6 +11,7 @@ import {
   branchChangesSchema,
   changeStatusSchema,
   hostContract,
+  searchResultSchema,
 } from "./contract.js";
 import type { FlatEntry } from "./lib/tree.js";
 import { resolveWithinRoot } from "./lib/paths.js";
@@ -115,6 +116,17 @@ export const rpcContract = defineRpcContract({
         reason: z.string(),
       }),
     ]),
+  },
+  /** Files whose text contains `query`, ignoring case, with the matching lines. */
+  search: {
+    input: z
+      .object({
+        scope: scopeSchema,
+        query: z.string().min(1),
+        includeHidden: z.boolean(),
+      })
+      .strict(),
+    output: searchResultSchema,
   },
   /** Where the page can load the Monaco editor's files from. */
   monacoAssets: {
@@ -517,6 +529,24 @@ export default function plugin(bb: BbPluginApi) {
         excluded: [...excluded].sort(),
         changes,
       };
+    },
+
+    async search({ scope, query, includeHidden }) {
+      const resolved = await resolveScope(scope);
+      if (!resolved.ok) throw new Error(resolved.reason);
+      // On the workspace's own machine, which is not always this one.
+      return host.call(
+        "searchContent",
+        {
+          root: resolved.scope.root,
+          query,
+          excludedNames: [...(await excludedNames())],
+          // A remote listing has no dotfiles in it; finding matches in files
+          // the tree cannot show would leave nowhere to click through to.
+          includeHidden: resolved.scope.isLocal && includeHidden,
+        },
+        { hostId: resolved.scope.hostId },
+      );
     },
 
     async read({ scope, path: relativePath }) {

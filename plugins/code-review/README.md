@@ -84,8 +84,50 @@ review's own thread is both simpler and already what BB does well.
 
 Questions about a finding go to the thread that produced the review, which
 already holds the pull request, the diff and its own reasoning. **Ask** puts
-the question to it rather than firing a bare prompt, and the answer arrives in
-the chat beside the tab you are reading.
+the question to it rather than firing a bare prompt.
+
+**The answer lands on the issue.** The thread records it with
+`bb code-review answer`, and it appears under the comment in a **Questions**
+box — the conversation in the chat is still there, but you do not have to read
+it. While an answer is on its way the box says so, and the issue's row in the
+list shows *answering*.
+
+- **An answer can correct the issue.** When it changes what the title,
+  summary, suggested fix or comment should say, the issue is rewritten in
+  place, and the answer says which parts changed.
+- **Ask about several issues at once.** Each question is queued behind any
+  answer already being written rather than steered into it, so each gets a
+  turn of its own, and carries an id, so its answer reaches the right issue
+  whatever order they finish in.
+- **An agent that only answers in the chat** still shows up: once the thread
+  has nothing left to do, a question left without an answer is marked so, with
+  the thread's last reply when it can only have been about that question. An
+  answer recorded after that still lands.
+
+## The report stays editable
+
+The review thread is told, when it starts, that submitting is not the end:
+whatever you discuss with it afterwards — through **Ask**, or by typing in the
+thread — it should keep the report in step. It can add findings, revise them
+(any field, including severity and location), and withdraw them:
+
+```sh
+bb code-review findings --review owner/repo#123          # current findings, with ids
+bb code-review edit     --review owner/repo#123 --file <path>
+```
+
+An edit file holds `add`, `update` and `remove` lists, and is applied all or
+nothing, with the same path checks as `submit`.
+
+- **Every change says so on the issue.** A revised issue shows what changed,
+  when, and the thread's one-line reason. A withdrawn one is dismissed rather
+  than deleted, with the reason, so your edits and questions on it survive and
+  **Restore** undoes it.
+- **Your edits win.** The comment is only rewritten while it is still the
+  agent's own. Once you have edited or posted it, the revised comment is shown
+  under yours instead, with **Use this comment** and **Keep mine**.
+- **Posted comments are history.** The thread cannot move or withdraw one; it
+  can add a new finding instead.
 
 Asking is refused while a review is still running. A review thread that goes
 idle without submitting findings is marked failed, so a question asked mid-run
@@ -190,6 +232,9 @@ bb code-review diff    --review owner/repo#123 [--file <path>]
 bb code-review files   --review owner/repo#123
 bb code-review schema                                    # the findings schema
 bb code-review submit  --review owner/repo#123 --file <path>
+bb code-review findings --review owner/repo#123          # the current findings, with ids
+bb code-review edit    --review owner/repo#123 --file <path>  # add, revise, withdraw
+bb code-review answer  --question <id> --file <path>       # an answer to a question
 ```
 
 A diff too large for one CLI response (the host caps a result at 1 MiB and
@@ -237,7 +282,7 @@ are imported; `submit` reports the warnings but still succeeds.
 
 Re-running a review replaces the findings you have not acted on and keeps the
 ones you have — posted comments are history, and a dismissal is a decision you
-should not have to make twice.
+should not have to make twice. Questions about a replaced finding go with it.
 
 ## Development
 

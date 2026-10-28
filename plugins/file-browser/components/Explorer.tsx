@@ -1,10 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import {
   ancestorsOf,
   buildTree,
-  filterTree,
   visibleRows,
   type FlatEntry,
   type TreeRow,
@@ -18,6 +17,7 @@ import {
   type ChangeIndex,
 } from "@/lib/changes";
 import { FileGlyph } from "./FileGlyph";
+import { SearchResults, type ContentSearch, type SearchHit } from "./SearchResults";
 
 export interface ExplorerProps {
   entries: readonly FlatEntry[];
@@ -42,6 +42,13 @@ export interface ExplorerProps {
   includeHidden: boolean;
   onToggleHidden: (next: boolean) => void;
   onOpenFile: (path: string) => void;
+  /** What is typed in the search box. Text in it swaps the tree for results. */
+  query: string;
+  onQueryChange: (query: string) => void;
+  search: ContentSearch;
+  /** The search result open in the viewer, if one is. */
+  activeHit: SearchHit | null;
+  onOpenHit: (hit: SearchHit) => void;
   onRefresh: () => void;
   onQuickOpen: () => void;
   header: React.ReactNode;
@@ -67,11 +74,16 @@ export function Explorer({
   includeHidden,
   onToggleHidden,
   onOpenFile,
+  query,
+  onQueryChange,
+  search,
+  activeHit,
+  onOpenHit,
   onRefresh,
   onQuickOpen,
   header,
 }: ExplorerProps) {
-  const [query, setQuery] = useState("");
+  const isSearching = query.trim() !== "";
   const activeRowRef = useRef<HTMLButtonElement | null>(null);
 
   // Deleted files are not on disk, so the listing cannot contain them. Add them
@@ -95,7 +107,13 @@ export function Explorer({
   }, [changedOnly, changes.byPath, withDeletions]);
 
   const tree = useMemo(() => buildTree(shown), [shown]);
-  const filtered = useMemo(() => filterTree(tree, query), [tree, query]);
+
+  // Changed-only narrows the search the same way it narrows the tree.
+  const foundFiles = useMemo(() => {
+    const files = search.result?.files ?? [];
+    return changedOnly ? files.filter((file) => changes.byPath.has(file.path)) : files;
+  }, [changedOnly, changes.byPath, search.result]);
+  const foundLines = foundFiles.reduce((total, file) => total + file.matchCount, 0);
 
   // Reveal the active file by opening every directory above it.
   useEffect(() => {
@@ -119,16 +137,15 @@ export function Explorer({
     if (changedOnly) {
       return new Set(shown.flatMap((entry) => ancestorsOf(entry.path)));
     }
-    if (filtered.expand.size === 0) return expanded;
-    return new Set([...expanded, ...filtered.expand]);
-  }, [changedOnly, expanded, filtered.expand, shown]);
+    return expanded;
+  }, [changedOnly, expanded, shown]);
 
   const allRows = useMemo(
-    () => visibleRows(filtered.nodes, effectiveExpanded),
-    [filtered.nodes, effectiveExpanded],
+    () => visibleRows(tree, effectiveExpanded),
+    [tree, effectiveExpanded],
   );
-  // A one-letter query matches nearly every path in a large checkout. Cap what
-  // is mounted rather than synchronously building tens of thousands of rows.
+  // A large checkout with its directories unfolded is tens of thousands of
+  // rows. Cap what is mounted rather than building them all synchronously.
   const rows = useMemo(() => {
     if (allRows.length <= ROW_LIMIT) return allRows;
     const capped = allRows.slice(0, ROW_LIMIT);
@@ -168,15 +185,15 @@ export function Explorer({
           <input
             type="search"
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => onQueryChange(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Escape" && query !== "") {
                 event.stopPropagation();
-                setQuery("");
+                onQueryChange("");
               }
             }}
-            placeholder="Search files"
-            aria-label="Search files"
+            placeholder="Search in files"
+            aria-label="Search in files"
             spellCheck={false}
             className={cn(
               "h-7 w-full min-w-0 rounded-md border border-border bg-background pr-2 pl-7 text-sm",
@@ -219,15 +236,34 @@ export function Explorer({
       <div className="min-h-0 flex-1 overflow-auto pb-2">
         {error !== null ? (
           <p className="px-3 py-2 text-xs text-destructive">{error}</p>
+        ) : isSearching ? (
+          search.error !== null ? (
+            <p className="px-3 py-2 text-xs text-destructive">{search.error}</p>
+          ) : search.result === null ? (
+            <p className="px-3 py-2 text-xs text-muted-foreground">Searching…</p>
+          ) : foundFiles.length === 0 ? (
+            <p className="px-3 py-2 text-xs text-muted-foreground">
+              {search.isSearching
+                ? "Searching…"
+                : changedOnly
+                  ? `No changed file contains “${search.query}”.`
+                  : `No file contains “${search.query}”.`}
+            </p>
+          ) : (
+            <SearchResults
+              files={foundFiles}
+              query={search.query}
+              activeHit={activeHit}
+              onOpenHit={onOpenHit}
+            />
+          )
         ) : isLoading && shown.length === 0 ? (
           <p className="px-3 py-2 text-xs text-muted-foreground">Reading the workspace…</p>
         ) : rows.length === 0 ? (
           <p className="px-3 py-2 text-xs text-muted-foreground">
             {changedOnly
               ? "This branch has not changed any file yet."
-              : query === ""
-              ? "This workspace has no files yet."
-              : `No file matches “${query}”.`}
+              : "This workspace has no files yet."}
           </p>
         ) : (
           <ul role="tree" aria-label="Workspace files" className="min-w-max">
@@ -235,7 +271,6 @@ export function Explorer({
               <ExplorerRow
                 key={row.node.path}
                 row={row}
-                query={query}
                 status={statusForRow(changes, row.node.path, row.node.kind)}
                 isActive={row.node.path === activePath}
                 activeRef={row.node.path === activePath ? activeRowRef : undefined}
@@ -248,10 +283,12 @@ export function Explorer({
       </div>
 
       <div className="shrink-0 border-t border-border px-3 py-1.5 text-[11px] text-muted-foreground">
-        {query === ""
+        {!isSearching
           ? `${fileCount.toLocaleString()} files`
-          : `${filtered.matchCount.toLocaleString()} of ${fileCount.toLocaleString()} files`}
-        {allRows.length > rows.length
+          : search.result === null
+            ? "Searching…"
+            : `${foundLines.toLocaleString()} ${foundLines === 1 ? "line" : "lines"} in ${foundFiles.length.toLocaleString()} ${foundFiles.length === 1 ? "file" : "files"}${search.result.truncated ? " · stopped at the first matches" : ""}`}
+        {!isSearching && allRows.length > rows.length
           ? ` · showing first ${ROW_LIMIT.toLocaleString()}`
           : ""}
         {truncated ? " · listing truncated" : ""}
@@ -265,7 +302,6 @@ export function Explorer({
 
 function ExplorerRow({
   row,
-  query,
   status,
   isActive,
   activeRef,
@@ -273,7 +309,6 @@ function ExplorerRow({
   onOpenFile,
 }: {
   row: TreeRow;
-  query: string;
   status: ChangeStatus | null;
   isActive: boolean;
   activeRef?: React.RefObject<HTMLButtonElement | null>;
@@ -322,7 +357,7 @@ function ExplorerRow({
             status === "deleted" && "line-through",
           )}
         >
-          <HighlightedText text={node.name} query={query} />
+          {node.name}
         </span>
         {status === null ? null : (
           <span
@@ -381,79 +416,4 @@ function ExplorerAction({
       />
     </button>
   );
-}
-
-/**
- * Marks the query's characters inside a name. The explorer filter is a
- * subsequence match, so matched characters can be scattered — but they are
- * emitted as contiguous runs rather than one element per character, which is
- * what keeps a filtered list of a large checkout cheap to mount.
- */
-export function HighlightedText({
-  text,
-  query,
-}: {
-  text: string;
-  query: string;
-}) {
-  const chunks = useMemo(() => highlightChunks(text, query), [text, query]);
-  if (chunks === null) return <>{text}</>;
-
-  return (
-    <>
-      {chunks.map((chunk, index) =>
-        chunk.isMatch ? (
-          <mark
-            // eslint-disable-next-line react/no-array-index-key -- position IS the chunk's identity
-            key={index}
-            className="bg-transparent font-semibold text-primary"
-          >
-            {chunk.text}
-          </mark>
-        ) : (
-          // eslint-disable-next-line react/no-array-index-key -- same
-          <span key={index}>{chunk.text}</span>
-        ),
-      )}
-    </>
-  );
-}
-
-interface HighlightChunk {
-  text: string;
-  isMatch: boolean;
-}
-
-/** Null when the query is empty or does not match, so the caller can bail. */
-export function highlightChunks(
-  text: string,
-  query: string,
-): HighlightChunk[] | null {
-  const trimmed = query.trim().toLowerCase();
-  if (trimmed === "") return null;
-
-  // Compare and slice by code point: indexing the raw string would put the
-  // mark on the wrong character in any name containing an emoji or other
-  // astral character.
-  const characters = [...text];
-  const lowered = characters.map((character) => character.toLowerCase());
-  const matched = new Set<number>();
-  let cursor = 0;
-
-  for (const needle of trimmed) {
-    if (needle === " ") continue;
-    const index = lowered.indexOf(needle, cursor);
-    if (index === -1) return null;
-    matched.add(index);
-    cursor = index + 1;
-  }
-
-  const chunks: HighlightChunk[] = [];
-  for (const [index, character] of characters.entries()) {
-    const isMatch = matched.has(index);
-    const last = chunks.at(-1);
-    if (last !== undefined && last.isMatch === isMatch) last.text += character;
-    else chunks.push({ text: character, isMatch });
-  }
-  return chunks;
 }

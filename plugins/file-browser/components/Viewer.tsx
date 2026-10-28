@@ -7,9 +7,11 @@ import {
   type DiffViewMode,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
+import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { ChangedPath } from "../contract.js";
 import type { ScopeRef } from "@/lib/route";
+import { matchingLines } from "@/lib/content-search";
 import { lineEndingOf, withLineEnding, type LineEnding } from "@/lib/line-endings";
 import { splitFrontmatter } from "@/lib/markdown";
 import type { ViewMode } from "@/lib/view-mode";
@@ -73,6 +75,11 @@ export interface ViewerProps {
   onSaved: () => void;
   /** Whether the pane holds an edit that has not been saved. */
   onUnsavedChange: (hasUnsaved: boolean) => void;
+  /** The explorer's search, whose matches the source view marks; null when none. */
+  searchQuery: string | null;
+  /** The match to show, from the result clicked; null for the file's first. */
+  searchLine: number | null;
+  onSearchLine: (line: number) => void;
 }
 
 /**
@@ -91,6 +98,9 @@ export function Viewer({
   baseCommit,
   onSaved,
   onUnsavedChange,
+  searchQuery,
+  searchLine,
+  onSearchLine,
 }: ViewerProps) {
   const rpc = useRpc<typeof rpcContract>();
   const { file, setSavedText, reload } = useFileContents(
@@ -119,6 +129,16 @@ export function Viewer({
   }, [hasUnsaved]);
 
   const lineEnding = file.status === "text" ? lineEndingOf(file.content) : null;
+
+  const fileText = file.status === "text" ? file.content : null;
+  const matchLines = useMemo(
+    () =>
+      fileText === null || searchQuery === null || searchQuery === ""
+        ? []
+        : matchingLines(fileText, searchQuery),
+    [fileText, searchQuery],
+  );
+  const activeMatch = currentMatch(matchLines, searchLine);
 
   // The edit view starts from the file as read. A draft with nothing unsaved
   // follows the file when a re-read finds it changed; one with unsaved changes
@@ -298,14 +318,100 @@ export function Viewer({
         // preview shows that rather than the copy on disk.
         <MarkdownPreview content={draft?.text ?? file.content} />
       ) : (
-        <BbSourceCode
-          content={file.content}
-          path={path}
-          overflow={wrapLines ? "wrap" : "scroll"}
-          className="min-h-full text-[13px]"
-        />
+        <>
+          {matchLines.length === 0 || searchQuery === null ? null : (
+            <MatchBar
+              query={searchQuery}
+              lines={matchLines}
+              current={searchLine}
+              onSelect={onSearchLine}
+            />
+          )}
+          <BbSourceCode
+            content={file.content}
+            path={path}
+            overflow={wrapLines ? "wrap" : "scroll"}
+            highlightedLines={
+              activeMatch === null ? null : { start: activeMatch, end: activeMatch }
+            }
+            className="min-h-full text-[13px]"
+          />
+        </>
       )}
     </Scroll>
+  );
+}
+
+/**
+ * The match being shown: the one asked for when it is still a match — the file
+ * may have changed since the search ran — otherwise the file's first.
+ */
+function currentMatch(lines: readonly number[], requested: number | null): number | null {
+  if (requested !== null && lines.includes(requested)) return requested;
+  return lines[0] ?? null;
+}
+
+/**
+ * Which match of the search is highlighted, and buttons to step through the
+ * rest. BB's source viewer highlights one stretch of lines at a time, so the
+ * matches are visited in turn rather than all marked at once.
+ */
+function MatchBar({
+  query,
+  lines,
+  current,
+  onSelect,
+}: {
+  query: string;
+  lines: readonly number[];
+  current: number | null;
+  onSelect: (line: number) => void;
+}) {
+  const line = currentMatch(lines, current);
+  const index = line === null ? 0 : lines.indexOf(line);
+  const step = (offset: number) =>
+    onSelect(lines[(index + offset + lines.length) % lines.length]!);
+
+  return (
+    <div className="sticky top-0 z-10 flex h-8 items-center gap-2 border-b border-border bg-background px-3 text-xs">
+      <span className="min-w-0 flex-1 truncate text-muted-foreground">
+        {lines.length === 1
+          ? `1 line contains “${query}”`
+          : `Line ${line} · match ${index + 1} of ${lines.length} for “${query}”`}
+      </span>
+      {lines.length > 1 ? (
+        <>
+          <MatchStep icon="ArrowUp" label="Previous match" onClick={() => step(-1)} />
+          <MatchStep icon="ArrowDown" label="Next match" onClick={() => step(1)} />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function MatchStep({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: React.ComponentProps<typeof Icon>["name"];
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      className={cn(
+        "flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md",
+        "text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground",
+        "focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+      )}
+    >
+      <Icon name={icon} aria-hidden className="size-3.5" />
+    </button>
   );
 }
 

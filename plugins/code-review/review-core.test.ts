@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   buildFileContextBlock,
+  buildFindingQuestion,
+  parseAnswer,
+  parseReportEdit,
   buildPostCommentArgs,
   githubBlobUrl,
   formatContext,
@@ -1133,5 +1136,80 @@ describe("reviewTabFor", () => {
       title: "Code review",
       paramsJson: null,
     });
+  });
+});
+
+describe("parseAnswer", () => {
+  it("takes an answer with optional revisions", () => {
+    expect(parseAnswer(JSON.stringify({ answer: " Yes. ", suggestedFix: "" }))).toEqual({
+      answer: { answer: "Yes.", suggestedFix: "" },
+      error: null,
+    });
+  });
+
+  it("requires the answer itself", () => {
+    expect(parseAnswer(JSON.stringify({ summary: "x" })).error).toContain("answer");
+  });
+
+  it("refuses an empty replacement comment, which could never be posted", () => {
+    expect(parseAnswer(JSON.stringify({ answer: "a", suggestedComment: "  " })).answer).toBeNull();
+  });
+
+  it("says when the file is not JSON", () => {
+    expect(parseAnswer("{").error).toMatch(/not valid JSON/);
+  });
+});
+
+describe("buildFindingQuestion", () => {
+  const finding = {
+    id: "f1",
+    file: "src/a.ts",
+    startLine: 10,
+    endLine: 12,
+    title: "Off by one",
+    summary: "",
+    suggestedFix: "Use <.",
+    suggestedComment: "Line one\nLine two",
+  };
+
+  it("names the question and where to write the answer", () => {
+    const text = buildFindingQuestion({
+      reviewId: "acme/app#7",
+      finding,
+      question: "Why?",
+      questionId: "q1",
+      answerPath: ".bb/code-review/answers/q1.json",
+    });
+    expect(text).toContain("bb code-review answer --question q1 --file .bb/code-review/answers/q1.json");
+    expect(text).toContain("> Line one\n> Line two");
+    expect(text).toContain("> Use <.");
+    expect(text).toContain("(id `f1`)");
+    expect(text).toContain("bb code-review edit --review acme/app#7");
+    // An empty summary is not quoted as an empty block.
+    expect(text).not.toContain("Summary:");
+  });
+});
+
+describe("parseReportEdit", () => {
+  it("normalises added findings the way a report's are", () => {
+    const { edit } = parseReportEdit(
+      JSON.stringify({ add: [{ path: "src/a.ts", line: 3, title: "T", comment: "C" }] }),
+    );
+    expect(edit?.add[0]).toMatchObject({ file: "src/a.ts", startLine: 3, suggestedComment: "C" });
+    expect(edit?.update).toEqual([]);
+  });
+
+  it("rejects the whole edit when one added finding is malformed", () => {
+    const { edit, errors } = parseReportEdit(
+      JSON.stringify({ add: [{ file: "src/a.ts", title: "no comment" }] }),
+    );
+    expect(edit).toBeNull();
+    expect(errors[0]).toMatch(/^add\.0\.suggestedComment/);
+  });
+
+  it("requires an id on every update", () => {
+    expect(parseReportEdit(JSON.stringify({ update: [{ title: "x" }] })).errors[0]).toContain(
+      "update.0.id",
+    );
   });
 });

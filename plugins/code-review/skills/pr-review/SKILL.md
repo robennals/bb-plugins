@@ -127,6 +127,52 @@ This matters because the panel shows the code at each path next to the finding.
 A bare filename is ambiguous — a real repo has dozens of `index.ts` — so the
 reviewer either sees the wrong file or none.
 
+## Keeping the report up to date
+
+Submitting is not the end. The reviewer reads the findings in the panel and may
+go on discussing the pull request with you in this thread. Whenever that
+discussion changes what a finding should say — it is wrong, narrower, more or
+less serious, or a new problem turns up — edit the report instead of only
+saying so in the chat:
+
+```sh
+bb code-review findings --review <owner/repo#123>        # current findings and their ids
+bb code-review edit     --review <owner/repo#123> --file <path>
+```
+
+The edit file is:
+
+```json
+{
+  "add":    [ /* new findings, exactly as in the findings schema */ ],
+  "update": [ { "id": "<id>", "note": "one line on why", /* only the fields that change */ } ],
+  "remove": [ { "id": "<id>", "reason": "one line on why it no longer stands" } ]
+}
+```
+
+It is applied all or nothing, and checks paths like `submit`. A removed finding
+is dismissed, not deleted, so the reviewer can restore it. A comment the
+reviewer has edited is not overwritten — your version is offered beside theirs —
+and a posted one cannot be moved or removed. Do not re-run `submit` to change a
+report: that replaces every open finding, along with the reviewer's edits and
+questions on them.
+
+## Answering questions about a finding
+
+After the review, the reviewer may ask about a finding from the panel. The
+question arrives in this thread with a question id and an answer path. Answer
+it, then write that file and run the command the message gives:
+
+```sh
+bb code-review answer --question <question-id> --file <path>
+```
+
+The file is `{ "answer": "..." }` in Markdown, plus `title`, `summary`,
+`suggestedFix` or `suggestedComment` only when your answer changes what they
+should say. Each one replaces the old text in full, so write it in the same
+style as before. The panel shows the answer on the issue, so always record it
+this way — a reply only in the chat is easy to miss.
+
 ## Rules
 
 - **Do not run `gh`.** Everything about the PR is available from

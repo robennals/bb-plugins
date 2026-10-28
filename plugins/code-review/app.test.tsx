@@ -2,7 +2,7 @@
 import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { describe, expect, it, vi } from "vitest";
-import type { FindingDto, HighlightDto, PullRequestDto, ReviewDto } from "./server";
+import type { FindingDto, HighlightDto, PullRequestDto, QuestionDto, ReviewDto } from "./server";
 
 /**
  * BB rebuilds `useBbNavigate()`'s object whenever anything it closes over
@@ -92,7 +92,31 @@ const FINDING: FindingDto = {
   postedAs: "comment",
   postAnchor: { kind: "line" as const, line: 12, startLine: 10, adjusted: false },
   references: [],
+  questions: [],
+  proposedComment: null,
+  revision: null,
+  removedReason: null,
 };
+
+const QUESTION: QuestionDto = {
+  id: "q1",
+  question: "Is line 12 really wrong?",
+  status: "answered",
+  answer: "Yes — the loop reads **one past** the end.",
+  updatedFields: [],
+  askedAt: "2026-01-02T00:00:00Z",
+  answeredAt: "2026-01-02T00:01:00Z",
+};
+
+/** The review with FINDING replaced by `finding`. */
+const withFinding = (finding: FindingDto) => ({
+  getPullRequest: () => ({
+    pullRequest: PR,
+    review: REVIEW,
+    findings: [finding],
+    hasPendingReview: false,
+  }),
+});
 
 const CODE = {
   prUrl: "https://github.com/acme/app/pull/7",
@@ -574,6 +598,121 @@ describe("an issue and its code", () => {
     fireEvent.click(await slot.findByText("Cancel"));
     await waitFor(() => expect(slot.queryByLabelText("Question about Off by one")).toBeNull());
     expect(slot.inspection.rpcCalls.filter((e) => e.method === "askAboutFinding")).toHaveLength(1);
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the answer on the issue, and what it changed", async () => {
+    const slot = await openedIssue(
+      withFinding({
+        ...FINDING,
+        questions: [{ ...QUESTION, updatedFields: ["summary", "suggestedComment"] }],
+      }),
+    );
+    await slot.findByText("Is line 12 really wrong?");
+    await slot.findByText(/one past/);
+    await slot.findByText("Updated this issue's summary and comment.");
+    slot.lifecycle.unmount();
+  });
+
+  it("says when an answer is still coming", async () => {
+    const slot = await openedIssue(
+      withFinding({ ...FINDING, questions: [{ ...QUESTION, status: "pending", answer: null }] }),
+    );
+    await slot.findByText("Waiting for the review thread to answer…");
+    slot.lifecycle.unmount();
+  });
+
+  it("marks an issue whose answer is still coming in the list", async () => {
+    const app = await load();
+    const slot = reviewTab(
+      app,
+      withFinding({ ...FINDING, questions: [{ ...QUESTION, status: "pending", answer: null }] }),
+    );
+    await slot.findByText("answering");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the thread's reply when it answered in the chat instead", async () => {
+    const slot = await openedIssue(
+      withFinding({
+        ...FINDING,
+        questions: [{ ...QUESTION, status: "unanswered", answer: "It is fine." }],
+      }),
+    );
+    await slot.findByText(/replied in the chat without putting an answer here/);
+    await slot.findByText("It is fine.");
+    slot.lifecycle.unmount();
+  });
+
+  it("offers a revised comment the reviewer's edit kept out", async () => {
+    const slot = await openedIssue({
+      ...withFinding({ ...FINDING, draftComment: "My wording.", proposedComment: "Better wording." }),
+      resolveProposedComment: () => ({ finding: FINDING }),
+    });
+    await slot.findByText("Better wording.");
+    fireEvent.click(await slot.findByText("Use this comment"));
+    fireEvent.click(await slot.findByText("Keep mine"));
+    await waitFor(() => {
+      const calls = slot.inspection.rpcCalls.filter((e) => e.method === "resolveProposedComment");
+      expect(calls.map((call) => call.input)).toEqual([
+        { findingId: "f1", use: true },
+        { findingId: "f1", use: false },
+      ]);
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("says what the review thread revised, and why", async () => {
+    const slot = await openedIssue(
+      withFinding({
+        ...FINDING,
+        revision: {
+          at: new Date().toISOString(),
+          note: "only the last iteration is off",
+          fields: ["severity", "location"],
+        },
+      }),
+    );
+    await slot.findByText(
+      "The review thread revised this issue (severity and location) just now: only the last iteration is off",
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("says why the review thread withdrew an issue", async () => {
+    const slot = await openedIssue(
+      withFinding({ ...FINDING, state: "dismissed", removedReason: "the caller already checks it" }),
+    );
+    await slot.findByText(/withdrew this issue: the caller already checks it/);
+    await slot.findByText("Restore");
+    slot.lifecycle.unmount();
+  });
+
+  // An answer can rewrite the comment while the reviewer is looking at it.
+  it("follows a rewritten comment, but never over an unsaved edit", async () => {
+    let suggestedComment = FINDING.suggestedComment;
+    const slot = await openedIssue({
+      getPullRequest: () => ({
+        pullRequest: PR,
+        review: REVIEW,
+        findings: [{ ...FINDING, suggestedComment }],
+        hasPendingReview: false,
+      }),
+    });
+    const box = (await slot.findByLabelText("Comment for Off by one")) as HTMLTextAreaElement;
+    suggestedComment = "Rewritten by an answer.";
+    await slot.behavior.emitRealtime("code-review-changed", {});
+    await waitFor(() => expect(box.value).toBe("Rewritten by an answer."));
+
+    fireEvent.change(box, { target: { value: "Typing…" } });
+    suggestedComment = "Rewritten again.";
+    await slot.behavior.emitRealtime("code-review-changed", {});
+    await waitFor(() => {
+      expect(
+        slot.inspection.rpcCalls.filter((e) => e.method === "getPullRequest").length,
+      ).toBeGreaterThanOrEqual(3);
+    });
+    expect(box.value).toBe("Typing…");
     slot.lifecycle.unmount();
   });
 
