@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import plugin, { type FindingDto, type ReviewDto } from "./server";
 
 const REPO = "acme/app";
@@ -92,7 +92,11 @@ async function makeHost(
 ) {
   const calls: ShellCall[] = [];
   const spawned: SpawnRecord[] = [];
-  const sent: Array<{ threadId: string; text: string }> = [];
+  const sent: Array<{ threadId: string; text: string; mode: string }> = [];
+  /** Messages waiting in each thread's queue, as `queuedMessages.list` reports them. */
+  const queued = new Map<string, unknown[]>();
+  /** What `threads.get` reports as each thread's status; idle unless set. */
+  const threadStatus = new Map<string, "idle" | "active">();
   const archived: string[] = [];
   const files = options.files ?? {};
   /** Mutable, so a test can break a gh call after the review has already run. */
@@ -199,6 +203,7 @@ async function makeHost(
             environmentId: null,
             // An archived thread is a normal successful get, with archivedAt set.
             archivedAt: options.archivedThreadIds?.includes(threadId) === true ? 1 : null,
+            status: threadStatus.get(threadId) ?? "idle",
           });
         },
         tabs: {
@@ -226,9 +231,13 @@ async function makeHost(
           archived.push(threadId);
           return { archivedThreadIds: [threadId] };
         },
+        queuedMessages: {
+          list: async ({ threadId }: { threadId: string }) => queued.get(threadId) ?? [],
+        },
         send: async (args) => {
           sent.push({
             threadId: args.threadId,
+            mode: args.mode,
             text: (args.input ?? [])
               .map((part) => ("text" in part ? part.text : ""))
               .join(""),
@@ -247,6 +256,7 @@ async function makeHost(
   });
 
   await plugin(bb, {
+    idleSettleMs: 0,
     async runCommand(file, args, _timeoutMs, stdin) {
       calls.push({ file, args, stdin });
       if (options.ghMissing === true) throw new Error("spawn gh ENOENT");
@@ -298,9 +308,36 @@ async function makeHost(
     tabs.set(threadId, { revision: current.revision, tabs: [...extra, ...current.tabs] });
   };
 
+  /** Answer a question the way the review thread does. */
+  const answer = (questionId: string, body: unknown) => {
+    const file = `/w/answer-${questionId}.json`;
+    files[file] = JSON.stringify(body);
+    return harness.behavior.runCli(["answer", "--question", questionId, "--file", file], {
+      cwd: "/w",
+    });
+  };
+
+  /** Edit the submitted report the way the review thread does. */
+  const edit = (body: unknown, file = "/w/edit.json") => {
+    files[file] = JSON.stringify(body);
+    return harness.behavior.runCli(["edit", "--review", REVIEW_ID, "--file", file], { cwd: "/w" });
+  };
+
+  /** End a turn of the review thread. */
+  const idle = (threadId: string, lastAssistantText: string | null = null) =>
+    harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: threadId }),
+      lastAssistantText,
+    });
+
   return {
     bb,
     harness,
+    answer,
+    edit,
+    idle,
+    queued,
+    threadStatus,
     tabsOf,
     seedTabs,
     calls,
@@ -767,6 +804,36 @@ describe("paths in a submitted report", () => {
 });
 
 describe("re-running a review", () => {
+  // The repo's file list used to be cached per review, so a re-run on a newer
+  // head checked paths against the first run's commit and rejected every file
+  // the PR had added since.
+  it("checks paths against the commit the re-run reviews, not the first run's", async () => {
+    const added = { ...FINDING, file: "src/new.ts", title: "In a new file" };
+    const host = await makeHost({ files: { "/w/f.json": report(), "/w/g.json": report([added]) } });
+    await runReview(host);
+
+    host.setGh(
+      "pr view",
+      JSON.stringify({
+        title: "Add a thing",
+        body: "",
+        author: { login: "dan" },
+        state: "OPEN",
+        isDraft: false,
+        baseRefName: "main",
+        headRefName: "feature",
+        headRefOid: "sha8",
+        comments: [],
+        files: [{ path: "src/new.ts", additions: 1, deletions: 0 }],
+      }),
+    );
+    host.setGh("api repos/acme/app/git/trees", "src/a.ts\nsrc/new.ts");
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit("/w/g.json");
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect((await host.findings()).map((entry) => entry.file)).toContain("src/new.ts");
+  });
+
   it("replaces untouched findings and keeps the ones already posted", async () => {
     const host = await makeHost({
       files: { "/w/f.json": report([FINDING, { ...FINDING, title: "Second", startLine: 20 }]) },
@@ -1147,6 +1214,337 @@ describe("asking about a finding", () => {
     expect(text).toContain(FINDING.suggestedComment);
     expect(text).toContain("My question: Is line 12 really wrong?");
     expect(text).toContain("Do not post anything to GitHub");
+  });
+
+  // Each question waits its turn rather than being steered into whatever the
+  // thread is answering, so rapid-fire questions get an answer each.
+  it("queues the question behind any turn already running", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("askAboutFinding", { findingId: finding?.id, question: "Why?" });
+    expect(host.sent[0]?.mode).toBe("queue-if-active");
+  });
+
+  it("tells the thread how to put its answer on the issue", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    const { questionId } = await host.call<{ questionId: string }>("askAboutFinding", {
+      findingId: finding?.id,
+      question: "Why?",
+    });
+    const text = host.sent[0]?.text ?? "";
+    expect(text).toContain(`bb code-review answer --question ${questionId} --file /w/answers/${questionId}.json`);
+    expect(text).toContain(FINDING.suggestedFix);
+  });
+
+  it("shows the question on the issue while it waits for an answer", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("askAboutFinding", { findingId: finding?.id, question: "Why?" });
+    const [after] = await host.findings();
+    expect(after?.questions).toMatchObject([{ question: "Why?", status: "pending", answer: null }]);
+  });
+
+  it("forgets the question when it could not be sent", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": report() },
+      missingThreadIds: ["thr_1"],
+    });
+    const [finding] = await runReview(host);
+    await expect(
+      host.call("askAboutFinding", { findingId: finding?.id, question: "Fair?" }),
+    ).rejects.toThrow();
+    expect((await host.findings())[0]?.questions).toEqual([]);
+  });
+});
+
+describe("the review thread editing its report", () => {
+  it("tells the review thread the report stays editable", async () => {
+    const host = await makeHost();
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(host.spawned[0]?.prompt).toContain(`bb code-review edit --review ${REVIEW_ID}`);
+    expect(host.spawned[0]?.prompt).toContain(`bb code-review findings --review ${REVIEW_ID}`);
+  });
+
+  it("lists the findings with their ids and whether the reviewer edited them", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("setFindingComment", { findingId: finding?.id, comment: "Mine." });
+    const result = await host.harness.behavior.runCli(["findings", "--review", REVIEW_ID]);
+    expect(result.stdout).toContain(`${finding?.id}  [open, comment edited by the reviewer]  high  src/a.ts:10-12`);
+    expect(result.stdout).toContain("comment: Mine.");
+  });
+
+  it("adds, revises and withdraws findings in one edit", async () => {
+    const second = { ...FINDING, title: "Second", startLine: 14, endLine: 14 };
+    const host = await makeHost({ files: { "/w/f.json": report([FINDING, second]) } });
+    const [first, other] = await runReview(host);
+    const result = await host.edit({
+      add: [{ ...FINDING, title: "New problem", severity: "low", startLine: 3, endLine: 3 }],
+      update: [
+        {
+          id: first?.id,
+          note: "only the last iteration",
+          severity: "nit",
+          startLine: 12,
+          suggestedComment: "Is the last pass intended?",
+        },
+      ],
+      remove: [{ id: other?.id, reason: "the caller checks it" }],
+    });
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stdout).toContain('Added "New problem"');
+    expect(result.stdout).toContain('Updated "Off by one": severity, location, comment.');
+    expect(result.stdout).toContain('Removed "Second"');
+
+    const byTitle = new Map((await host.findings()).map((entry) => [entry.title, entry]));
+    const revised = byTitle.get("Off by one");
+    expect(revised).toMatchObject({
+      severity: "nit",
+      startLine: 12,
+      suggestedComment: "Is the last pass intended?",
+      revision: { note: "only the last iteration", fields: ["severity", "location", "suggestedComment"] },
+    });
+    expect(byTitle.get("Second")).toMatchObject({
+      state: "dismissed",
+      removedReason: "the caller checks it",
+    });
+    expect(byTitle.get("New problem")?.state).toBe("open");
+    // New findings go to the end of the list rather than reshuffling it.
+    expect((await host.findings()).at(-1)?.title).toBe("New problem");
+  });
+
+  it("clears the thread's reason when the reviewer restores a withdrawn finding", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.edit({ remove: [{ id: finding?.id, reason: "wrong" }] });
+    const restored = await host.call<{ finding: FindingDto }>("setFindingState", {
+      findingId: finding?.id,
+      state: "open",
+    });
+    expect(restored.finding.removedReason).toBeNull();
+  });
+
+  it("offers a revised comment rather than overwriting the reviewer's edit", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("setFindingComment", { findingId: finding?.id, comment: "Mine." });
+    const result = await host.edit({ update: [{ id: finding?.id, suggestedComment: "Theirs." }] });
+    expect(result.stdout).toContain("offered beside theirs");
+    const [after] = await host.findings();
+    expect(after?.draftComment).toBe("Mine.");
+    expect(after?.proposedComment).toBe("Theirs.");
+  });
+
+  it("refuses to move or remove a posted finding, and applies nothing", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const [finding] = await runReview(host);
+    await host.call("postFinding", { findingId: finding?.id, mode: "inline" });
+    const moved = await host.edit({
+      add: [{ ...FINDING, title: "Should not land" }],
+      update: [{ id: finding?.id, startLine: 3 }],
+    });
+    expect(moved.exitCode).toBe(1);
+    expect(moved.stderr).toContain("already posted");
+    const removed = await host.edit({ remove: [{ id: finding?.id, reason: "x" }] });
+    expect(removed.stderr).toContain("already posted");
+    expect((await host.findings()).map((entry) => entry.title)).toEqual(["Off by one"]);
+  });
+
+  it("rejects an unknown id, a bad path, or an empty edit, applying nothing", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await runReview(host);
+    const unknown = await host.edit({ update: [{ id: "nope", title: "x" }] });
+    expect(unknown.stderr).toContain("no finding with that id");
+    const badPath = await host.edit({ add: [{ ...FINDING, file: "a.ts", title: "Bad" }] });
+    expect(badPath.exitCode).toBe(1);
+    expect(badPath.stderr).toContain('In "add"');
+    expect(badPath.stderr).toContain("did you mean src/a.ts?");
+    const empty = await host.edit({});
+    expect(empty.stderr).toContain("nothing to do");
+    expect((await host.findings()).map((entry) => entry.title)).toEqual(["Off by one"]);
+  });
+});
+
+describe("answers to questions", () => {
+  async function asked(host: Host, question = "Why?") {
+    const [finding] = await runReview(host);
+    const { questionId } = await host.call<{ questionId: string }>("askAboutFinding", {
+      findingId: finding?.id,
+      question,
+    });
+    return { finding: finding as FindingDto, questionId };
+  }
+
+  it("puts the answer on the issue", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const { questionId } = await asked(host);
+    const result = await host.answer(questionId, { answer: "Because **10** is inclusive." });
+    expect(result.exitCode, result.stderr).toBe(0);
+    const [after] = await host.findings();
+    expect(after?.questions).toMatchObject([
+      { status: "answered", answer: "Because **10** is inclusive.", updatedFields: [] },
+    ]);
+    expect(after?.suggestedComment).toBe(FINDING.suggestedComment);
+  });
+
+  it("rewrites the issue's text and its unedited comment", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const { questionId } = await asked(host);
+    const result = await host.answer(questionId, {
+      answer: "It is narrower than I said.",
+      summary: "Only the last iteration is off.",
+      suggestedFix: "Use < on line 12 only.",
+      suggestedComment: "Is the last iteration meant to run?",
+    });
+    expect(result.stdout).toContain("summary, suggested fix, comment");
+    const [after] = await host.findings();
+    expect(after?.summary).toBe("Only the last iteration is off.");
+    expect(after?.suggestedFix).toBe("Use < on line 12 only.");
+    expect(after?.suggestedComment).toBe("Is the last iteration meant to run?");
+    expect(after?.draftComment).toBeNull();
+    expect(after?.questions[0]?.updatedFields).toEqual(["summary", "suggestedFix", "suggestedComment"]);
+    expect(after?.proposedComment).toBeNull();
+  });
+
+  it("offers a revised comment instead of overwriting the reviewer's edit", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const { finding, questionId } = await asked(host);
+    await host.call("setFindingComment", { findingId: finding.id, comment: "My wording." });
+    await host.answer(questionId, { answer: "Yes.", suggestedComment: "Better wording." });
+    const [after] = await host.findings();
+    expect(after?.draftComment).toBe("My wording.");
+    expect(after?.suggestedComment).toBe(FINDING.suggestedComment);
+    expect(after?.proposedComment).toBe("Better wording.");
+
+    const used = await host.call<{ finding: FindingDto }>("resolveProposedComment", {
+      findingId: finding.id,
+      use: true,
+    });
+    expect(used.finding.draftComment).toBeNull();
+    expect(used.finding.suggestedComment).toBe("Better wording.");
+    expect(used.finding.proposedComment).toBeNull();
+  });
+
+  it("never rewrites a comment that is already posted", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const { finding, questionId } = await asked(host);
+    await host.call("postFinding", { findingId: finding.id, mode: "inline" });
+    await host.answer(questionId, { answer: "Yes.", suggestedComment: "Better wording." });
+    const [after] = await host.findings();
+    expect(after?.suggestedComment).toBe(FINDING.suggestedComment);
+    expect(after?.proposedComment).toBe("Better wording.");
+    await expect(
+      host.call("resolveProposedComment", { findingId: finding.id, use: true }),
+    ).rejects.toThrow(/already been posted/);
+    const declined = await host.call<{ finding: FindingDto }>("resolveProposedComment", {
+      findingId: finding.id,
+      use: false,
+    });
+    expect(declined.finding.proposedComment).toBeNull();
+  });
+
+  it("lands each answer on its own issue when several are asked at once", async () => {
+    const second = { ...FINDING, file: "src/a.ts", startLine: 14, endLine: 14, title: "Second" };
+    const host = await makeHost({ files: { "/w/f.json": report([FINDING, second]) } });
+    const [first, other] = await runReview(host);
+    const a = await host.call<{ questionId: string }>("askAboutFinding", {
+      findingId: first?.id,
+      question: "A?",
+    });
+    const b = await host.call<{ questionId: string }>("askAboutFinding", {
+      findingId: other?.id,
+      question: "B?",
+    });
+    // Answered out of order, as queued turns and a user's own messages allow.
+    await host.answer(b.questionId, { answer: "Answer B" });
+    await host.answer(a.questionId, { answer: "Answer A" });
+    const byTitle = new Map((await host.findings()).map((entry) => [entry.title, entry]));
+    expect(byTitle.get(FINDING.title)?.questions.map((q) => [q.question, q.answer])).toEqual([
+      ["A?", "Answer A"],
+    ]);
+    expect(byTitle.get("Second")?.questions.map((q) => [q.question, q.answer])).toEqual([
+      ["B?", "Answer B"],
+    ]);
+  });
+
+  it("rejects an answer file without an answer, saying what it should look like", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const { questionId } = await asked(host);
+    const result = await host.answer(questionId, { summary: "x" });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('"answer"');
+    expect((await host.findings())[0]?.questions[0]?.status).toBe("pending");
+  });
+
+  it("rejects an unknown question id", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    await asked(host);
+    const result = await host.answer("nope", { answer: "x" });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("No question with id nope");
+  });
+
+  it("drops questions about issues a re-run replaced", async () => {
+    const host = await makeHost({ files: { "/w/f.json": report() } });
+    const { questionId } = await asked(host);
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.answer(questionId, { answer: "late" });
+    expect(result.exitCode).toBe(1);
+  });
+
+  describe("when the thread stops without answering", () => {
+    it("says so, with the thread's reply when only one question was waiting", async () => {
+      const host = await makeHost({ files: { "/w/f.json": report() } });
+      await asked(host);
+      await host.idle("thr_1", "It is fine, actually.");
+      await vi.waitFor(async () => {
+        expect((await host.findings())[0]?.questions[0]).toMatchObject({
+          status: "unanswered",
+          answer: "It is fine, actually.",
+        });
+      });
+    });
+
+    it("leaves the reply out when it could belong to either of two questions", async () => {
+      const host = await makeHost({ files: { "/w/f.json": report() } });
+      const { finding } = await asked(host);
+      await host.call("askAboutFinding", { findingId: finding.id, question: "And?" });
+      await host.idle("thr_1", "Some reply.");
+      await vi.waitFor(async () => {
+        const questions = (await host.findings())[0]?.questions ?? [];
+        expect(questions.map((q) => [q.status, q.answer])).toEqual([
+          ["unanswered", null],
+          ["unanswered", null],
+        ]);
+      });
+    });
+
+    it("keeps waiting while another question is queued or the thread is busy", async () => {
+      const host = await makeHost({ files: { "/w/f.json": report() } });
+      await asked(host);
+      host.queued.set("thr_1", [{ id: "q1" }]);
+      await host.idle("thr_1", "reply");
+      host.queued.set("thr_1", []);
+      host.threadStatus.set("thr_1", "active");
+      await host.idle("thr_1", "reply");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect((await host.findings())[0]?.questions[0]?.status).toBe("pending");
+    });
+
+    it("still takes an answer that arrives afterwards", async () => {
+      const host = await makeHost({ files: { "/w/f.json": report() } });
+      const { questionId } = await asked(host);
+      await host.idle("thr_1", null);
+      await vi.waitFor(async () => {
+        expect((await host.findings())[0]?.questions[0]?.status).toBe("unanswered");
+      });
+      await host.answer(questionId, { answer: "Late but here." });
+      expect((await host.findings())[0]?.questions[0]).toMatchObject({
+        status: "answered",
+        answer: "Late but here.",
+      });
+    });
   });
 
   it("quotes the user's edit when there is one", async () => {
@@ -2131,6 +2529,7 @@ describe("registrations", () => {
       "setFindingState",
       "postFinding",
       "askAboutFinding",
+      "resolveProposedComment",
       "openReview",
       "getReviewForThread",
     ]) {
@@ -2143,6 +2542,9 @@ describe("registrations", () => {
       "files",
       "schema",
       "submit",
+      "findings",
+      "edit",
+      "answer",
     ]);
     for (const method of ["getFindingCode", "getPanelState", "setPanelState"]) {
       expect(harness.registrations.rpcMethods).toContain(method);
