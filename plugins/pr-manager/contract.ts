@@ -12,6 +12,11 @@ export const hostPullRequestSchema = z.object({
   // Changes whenever anything the status or summary is built from does, so an equal
   // marker on the next refresh means the saved entry is still right.
   changeMarker: z.string(),
+  // The GitHub stack the pull request is in, by its number within the repository, and
+  // where in it: position 1 is based on the stack's base branch, 2 on 1, and so on. Read
+  // on every refresh, since joining or leaving a stack need not change the pull request.
+  // Missing from entries saved before stacks were read.
+  stack: z.object({ number: z.number().int().positive(), position: z.number().int().positive() }).nullable().default(null),
   // Set while the status is FEEDBACK: when the newest of that feedback arrived, and what
   // the pull request shows instead while feedback up to then is muted.
   unaddressedFeedback: z.object({

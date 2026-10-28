@@ -12,7 +12,10 @@ interface RollupContext extends RollupEntry { __typename: string; checkSuite?: {
 interface CountByState { state: string; count: number }
 interface CheckCounts { checkRunCountsByState: CountByState[] | null; statusContextCountsByState: CountByState[] | null }
 interface HeadCommit<Contexts> { nodes: Array<{ commit: { statusCheckRollup: { contexts: Contexts } | null } }> }
-export interface ListedPullRequest { id: string; number: number; updatedAt: string }
+export interface ListedPullRequest {
+  id: string; number: number; updatedAt: string;
+  stack: { number: number } | null; stackEntry: { position: number } | null;
+}
 // Everything the classifier reads, fetched only for pull requests that have changed.
 export interface PullRequestDetails {
   id: string; number: number; title: string; url: string; state: string; isDraft: boolean; headRefName: string; baseRefName: string;
@@ -32,7 +35,7 @@ interface NodesResponse<Node> { data: { nodes: Array<Partial<Node> | null> } }
 export const PULL_REQUEST_LIST_QUERY = `query($search:String!,$first:Int!,$after:String){
   search(query:$search,type:ISSUE,first:$first,after:$after){
     pageInfo{hasNextPage endCursor}
-    nodes{... on PullRequest{id number updatedAt}}
+    nodes{... on PullRequest{id number updatedAt stack{number} stackEntry{position}}}
   }
 }`;
 const CHECK_COUNTS = "checkRunCountsByState{state count} statusContextCountsByState{state count}";
@@ -135,7 +138,7 @@ const headCommitChecks = <Contexts>(commits: HeadCommit<Contexts>): Contexts | n
 
 const actorName = (actor: Actor | null): string => actor?.login ?? actor?.slug ?? "";
 const isBot = (actor: Actor | null): boolean => actor?.__typename === "Bot";
-function describePullRequest(details: PullRequestDetails): HostPullRequest {
+function describePullRequest(details: PullRequestDetails, stack: HostPullRequest["stack"]): HostPullRequest {
   const requestedReviewers = details.reviewRequests.nodes
     .map((request) => actorName(request.requestedReviewer)).filter((reviewer) => reviewer !== "");
   const checks = headCommitChecks(details.commits);
@@ -151,7 +154,7 @@ function describePullRequest(details: PullRequestDetails): HostPullRequest {
   const statusWhenMuted = classifyWithFeedbackMuted(input);
   return { id: details.id, repository: details.repository.nameWithOwner, number: details.number, title: details.title, url: details.url, status,
     summary: summarizePullRequest(input, status), isDraft: details.isDraft, headRefName: details.headRefName,
-    baseRefName: details.baseRefName, createdAt: details.createdAt, updatedAt: details.updatedAt, mergedAt: details.mergedAt,
+    baseRefName: details.baseRefName, createdAt: details.createdAt, updatedAt: details.updatedAt, mergedAt: details.mergedAt, stack,
     changeMarker: changeMarker(details.updatedAt, status === "MERGED" ? null : checks),
     unaddressedFeedback: latestFeedbackAt === null ? null
       : { latestAt: latestFeedbackAt, statusWhenMuted, summaryWhenMuted: summarizeWithFeedbackMuted(input, statusWhenMuted) } };
@@ -188,12 +191,15 @@ export async function fetchPullRequests(
     ...open.map((pr): [string, HostPullRequest | undefined] => [pr.id, unchanged(pr, false)]),
     ...merged.map((pr): [string, HostPullRequest | undefined] => [pr.id, unchanged(pr, true)]),
   ]);
+  const stackById = new Map([...open, ...merged].map((pr) => [pr.id,
+    pr.stack === null || pr.stackEntry === null ? null : { number: pr.stack.number, position: pr.stackEntry.position }]));
   const changedIds = [...listed].filter(([, saved]) => saved === undefined).map(([id]) => id);
   const details = await pullRequestNodes<PullRequestDetails>(changedIds, DETAILS_BATCH_SIZE, pullRequestDetailsQuery, gh);
   const detailsById = new Map(details.map((pr) => [pr.id, pr]));
   return [...listed].flatMap(([id, saved]) => {
-    if (saved !== undefined) return [saved];
+    const stack = stackById.get(id) ?? null;
+    if (saved !== undefined) return [{ ...saved, stack }];
     const changed = detailsById.get(id);
-    return changed === undefined ? [] : [describePullRequest(changed)];
+    return changed === undefined ? [] : [describePullRequest(changed, stack)];
   });
 }
