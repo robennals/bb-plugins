@@ -804,6 +804,36 @@ describe("paths in a submitted report", () => {
 });
 
 describe("re-running a review", () => {
+  // The repo's file list used to be cached per review, so a re-run on a newer
+  // head checked paths against the first run's commit and rejected every file
+  // the PR had added since.
+  it("checks paths against the commit the re-run reviews, not the first run's", async () => {
+    const added = { ...FINDING, file: "src/new.ts", title: "In a new file" };
+    const host = await makeHost({ files: { "/w/f.json": report(), "/w/g.json": report([added]) } });
+    await runReview(host);
+
+    host.setGh(
+      "pr view",
+      JSON.stringify({
+        title: "Add a thing",
+        body: "",
+        author: { login: "dan" },
+        state: "OPEN",
+        isDraft: false,
+        baseRefName: "main",
+        headRefName: "feature",
+        headRefOid: "sha8",
+        comments: [],
+        files: [{ path: "src/new.ts", additions: 1, deletions: 0 }],
+      }),
+    );
+    host.setGh("api repos/acme/app/git/trees", "src/a.ts\nsrc/new.ts");
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit("/w/g.json");
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect((await host.findings()).map((entry) => entry.file)).toContain("src/new.ts");
+  });
+
   it("replaces untouched findings and keeps the ones already posted", async () => {
     const host = await makeHost({
       files: { "/w/f.json": report([FINDING, { ...FINDING, title: "Second", startLine: 20 }]) },

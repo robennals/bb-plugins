@@ -910,6 +910,9 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
   ensureColumn("findings", "revision_note", `TEXT`);
   ensureColumn("findings", "revised_fields", `TEXT`);
   ensureColumn("findings", "removed_reason", `TEXT`);
+  // Which commit a cached file list is of. Rows from before this are of an
+  // unknown one, so they are never reused.
+  ensureColumn("repo_tree", "sha", `TEXT`);
 
   function getReview(reviewId: string): ReviewRow | null {
     return (db.prepare(`SELECT * FROM reviews WHERE id = ?`).get(reviewId) as
@@ -2393,9 +2396,12 @@ interface ContextRow {
    * the uncommon case.
    */
   async function repoTree(reviewId: string, repo: string, sha: string): Promise<string[]> {
-    const cached = db.prepare(`SELECT paths FROM repo_tree WHERE review_id = ?`).get(reviewId) as
-      | { paths: string }
-      | undefined;
+    // Only a list of the same commit will do: a re-run reviews a newer head,
+    // and checking it against the old one rejects every file the PR has
+    // added since.
+    const cached = db
+      .prepare(`SELECT paths FROM repo_tree WHERE review_id = ? AND sha = ?`)
+      .get(reviewId, sha) as { paths: string } | undefined;
     if (cached !== undefined) return parseJsonArray<string>(cached.paths);
     let paths: string[] = [];
     try {
@@ -2415,9 +2421,10 @@ interface ContextRow {
       bb.log.warn(`could not read the tree of ${repo}@${sha.slice(0, 12)}: ${String(error)}`);
     }
     db.prepare(
-      `INSERT INTO repo_tree (review_id, paths, fetched_at) VALUES (?, ?, ?)
-       ON CONFLICT(review_id) DO UPDATE SET paths = excluded.paths, fetched_at = excluded.fetched_at`,
-    ).run(reviewId, JSON.stringify(paths), nowIso());
+      `INSERT INTO repo_tree (review_id, paths, fetched_at, sha) VALUES (?, ?, ?, ?)
+       ON CONFLICT(review_id) DO UPDATE SET
+         paths = excluded.paths, fetched_at = excluded.fetched_at, sha = excluded.sha`,
+    ).run(reviewId, JSON.stringify(paths), nowIso(), sha);
     return paths;
   }
 
