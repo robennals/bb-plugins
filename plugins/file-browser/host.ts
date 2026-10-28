@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +11,12 @@ import {
   parseUntracked,
   shortenRemoteHead,
 } from "./lib/git-changes.js";
+import {
+  createGrepCollector,
+  matchingLines,
+  type SearchResult,
+} from "./lib/content-search.js";
+import { walkDirectory } from "./lib/walk.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,6 +24,13 @@ const execFileAsync = promisify(execFile);
 const MAX_PATCH_BYTES = 2 * 1024 * 1024;
 /** Full-file context is an optimisation; skip it rather than ship megabytes. */
 const MAX_SIDE_BYTES = 1024 * 1024;
+
+/** Files a content search returns; past this the explorer says it stopped. */
+const SEARCH_MAX_FILES = 200;
+/** Matching lines previewed per file. The viewer steps through all of them. */
+const SEARCH_MAX_LINES_PER_FILE = 10;
+/** Files the scan used outside git will look at. Matches the local listing's cap. */
+const SEARCH_MAX_SCANNED_FILES = 40_000;
 
 interface GitResult {
   stdout: string;
@@ -104,6 +117,24 @@ function assertRelativePath(path: string): void {
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    async searchContent({ root, query, excludedNames, includeHidden }, context) {
+      const options = {
+        query,
+        excludedNames: new Set(excludedNames),
+        includeHidden,
+        maxFiles: SEARCH_MAX_FILES,
+        maxLinesPerFile: SEARCH_MAX_LINES_PER_FILE,
+      };
+      const insideRepo = await git(
+        root,
+        ["rev-parse", "--is-inside-work-tree"],
+        context.signal,
+      ).catch(() => null);
+      return insideRepo?.code === 0 && insideRepo.stdout.trim() === "true"
+        ? gitGrep(root, options, context.signal)
+        : scanFiles(root, options);
+    },
+
     async branchChanges({ root, baseBranch }, context): Promise<BranchChanges> {
       const signal = context.signal;
 
@@ -258,6 +289,82 @@ export default experimental_defineHostEntry({
     },
   },
 });
+
+type SearchOptions = Parameters<typeof createGrepCollector>[0];
+
+/**
+ * `git grep` over the working tree, untracked files included, so the search
+ * sees what is on disk and skips what `.gitignore` hides — the build output and
+ * dependency folders nobody means to search. Its output is read as it arrives,
+ * and git is stopped as soon as enough files have matched.
+ */
+function gitGrep(
+  root: string,
+  options: SearchOptions,
+  signal: AbortSignal,
+): Promise<SearchResult> {
+  const collector = createGrepCollector(options);
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "git",
+      // -I skips binary files; -F reads the query as text, not a pattern; -z
+      // separates the fields with NULs, so a path is never quoted or confused
+      // with a colon in the matched line.
+      ["grep", "--untracked", "--no-color", "-n", "-z", "-I", "-i", "-F", "-e", options.query],
+      {
+        cwd: root,
+        signal,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+      },
+    );
+    let stderr = "";
+    let isFull = false;
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (isFull) return;
+      if (!collector.push(chunk)) {
+        isFull = true;
+        child.kill();
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      // 1 is git grep's "nothing matched", and a kill is us having enough.
+      if (isFull || code === 0 || code === 1) resolve(collector.finish());
+      else reject(new Error(stderr.trim() || `git grep exited with ${code}.`));
+    });
+  });
+}
+
+/**
+ * Outside a repository there is no git to ask, so read the files directly —
+ * the same files the explorer lists, skipping anything large or binary, as
+ * the diff's full-file read does.
+ */
+async function scanFiles(root: string, options: SearchOptions): Promise<SearchResult> {
+  const collector = createGrepCollector(options);
+  const { entries } = await walkDirectory({
+    root,
+    excludedNames: options.excludedNames,
+    includeHidden: options.includeHidden,
+    limit: SEARCH_MAX_SCANNED_FILES,
+  });
+
+  for (const entry of entries) {
+    if (entry.kind !== "file") continue;
+    const content = await readWorktreeFile(root, entry.path);
+    if (content === null) continue;
+    const lines = content.split("\n");
+    for (const line of matchingLines(content, options.query)) {
+      if (!collector.add(entry.path, line, lines[line - 1]!)) return collector.finish();
+    }
+  }
+  return collector.finish();
+}
 
 /** The base side of the diff, or null when it is not usable as text. */
 async function readBlob(
