@@ -81,3 +81,47 @@ describe("write", () => {
     expect(harness.sdk.callsTo("files.write")).toEqual([]);
   });
 });
+
+describe("search", () => {
+  it("searches the workspace on its own machine, skipping the excluded directories", async () => {
+    const found = {
+      files: [{ path: "src/a.ts", matchCount: 1, lines: [{ line: 4, text: "todo" }] }],
+      truncated: false,
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "file-browser",
+      settings: { excludedDirectories: "node_modules\nvendor" },
+      sdk: {
+        projects: {
+          get: async () => ({
+            id: "p1",
+            name: "app",
+            sources: [{ isDefault: true, path: "/work/app", hostId: "h1" }],
+          }),
+        },
+        hosts: { get: async () => ({ name: "laptop" }) },
+        system: { config: async () => ({ dataDir: "/nonexistent" }) },
+      },
+      experimental_callHostRpc: () => found,
+    });
+    plugin(bb);
+
+    await expect(
+      harness.behavior.callRpc("search", { scope: SCOPE, query: "todo", includeHidden: true }),
+    ).resolves.toEqual(found);
+
+    expect(harness.experimental_hostRpcCalls).toMatchObject([
+      {
+        method: "searchContent",
+        hostId: "h1",
+        input: {
+          root: "/work/app",
+          query: "todo",
+          excludedNames: ["node_modules", "vendor"],
+          // Not this machine, so BB lists it — and BB's listing has no dotfiles.
+          includeHidden: false,
+        },
+      },
+    ]);
+  });
+});
