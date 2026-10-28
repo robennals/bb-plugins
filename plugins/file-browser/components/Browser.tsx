@@ -14,6 +14,7 @@ import { readSession, saveSession } from "@/lib/session";
 import type { ResolvedScope, rpcContract } from "../server.js";
 import { Explorer } from "./Explorer";
 import { QuickOpen } from "./QuickOpen";
+import { IDLE_SEARCH, type ContentSearch, type SearchHit } from "./SearchResults";
 import {
   availableModes,
   preferredMode,
@@ -45,6 +46,9 @@ const EMPTY_TREE: TreeState = {
   changes: EMPTY_CHANGE_INDEX,
   error: null,
 };
+
+/** How long typing must pause before the workspace is searched. */
+const SEARCH_DEBOUNCE_MS = 250;
 
 const MIN_EXPLORER_PX = 180;
 const MAX_EXPLORER_PX = 560;
@@ -92,6 +96,11 @@ export function Browser({
   );
 
   const [wrapLines, setWrapLines] = useState(() => readFlag(WRAP_KEY, false));
+
+  const [query, setQuery] = useState("");
+  // The search result open in the viewer. It belongs to one file, so opening
+  // any other file leaves it behind.
+  const [hit, setHit] = useState<SearchHit | null>(null);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const requestRef = useRef(0);
@@ -157,6 +166,12 @@ export function Browser({
   );
   useEffect(reloadTree, [reloadTree]);
 
+  const search = useContentSearch(
+    scopeKind === null || scopeId === null ? null : { kind: scopeKind, id: scopeId },
+    query,
+    includeHidden,
+  );
+
   const change = filePath === null ? null : tree.changes.byPath.get(filePath) ?? null;
   const hasFork = tree.changes.baseCommit !== null;
   const { canPreview, canDiff } = availableModes({
@@ -187,6 +202,10 @@ export function Browser({
   // the view it was in stands rather than being decided afresh. It is still
   // checked for fit, so a remembered diff of a file that is no longer changed
   // falls back like any other.
+  //
+  // A file opened from a search result is the exception: it lands on its source,
+  // the one view that can show the match.
+  const landOnSource = useRef<string | null>(null);
   const defaultedFor = useRef<string | null>(
     restored === null || restored.filePath === null || restored.mode === null
       ? null
@@ -198,7 +217,7 @@ export function Browser({
     if (openKey === null || !areChangesKnown) return;
     if (defaultedFor.current !== openKey) {
       defaultedFor.current = openKey;
-      setMode(preferredMode(modes));
+      setMode(landOnSource.current === openKey ? "source" : preferredMode(modes));
       return;
     }
     setMode((current) => resolveMode(current, modes));
@@ -214,15 +233,27 @@ export function Browser({
     !hasUnsavedEdit.current ||
     window.confirm(`Discard your unsaved changes to ${filePath}?`);
 
+  /** False when the open file had unsaved changes you chose to keep. */
   const openFile = useCallback(
-    (path: string) => {
-      if (path !== filePath && !mayLeaveFile()) return;
+    (path: string): boolean => {
+      if (path !== filePath && !mayLeaveFile()) return false;
       onOpenPath(path);
       requestAnimationFrame(() => rootRef.current?.focus({ preventScroll: true }));
+      return true;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [filePath, onOpenPath],
   );
+
+  const openHit = (next: SearchHit) => {
+    if (next.path === filePath) {
+      setMode("source");
+    } else {
+      if (!openFile(next.path)) return;
+      landOnSource.current = openKeyFor(next.path);
+    }
+    setHit(next);
+  };
 
   // Remember where you were, so leaving and coming back does not land you on a
   // collapsed tree with an empty pane. Written on every change rather than on
@@ -355,6 +386,11 @@ export function Browser({
                 store(HIDDEN_KEY, next ? "true" : "false");
               }}
               onOpenFile={openFile}
+              query={query}
+              onQueryChange={setQuery}
+              search={search}
+              activeHit={hit?.path === filePath ? hit : null}
+              onOpenHit={openHit}
               onRefresh={() => loadTree(scope, includeHidden)}
               onQuickOpen={() => setIsQuickOpen(true)}
               header={explorerHeader}
@@ -490,6 +526,9 @@ export function Browser({
             baseCommit={tree.changes.baseCommit}
             onSaved={reloadTree}
             onUnsavedChange={onUnsavedChange}
+            searchQuery={query.trim() === "" ? null : search.query}
+            searchLine={hit?.path === filePath ? hit.line : null}
+            onSearchLine={(line) => setHit({ path: filePath, line })}
           />
         )}
       </div>
@@ -503,6 +542,55 @@ export function Browser({
       ) : null}
     </div>
   );
+}
+
+/**
+ * Search the workspace's files for `query`, a pause after the typing stops.
+ * Only the newest request's answer is kept, so a slow search for "fo" cannot
+ * land on top of the results for "foo".
+ */
+function useContentSearch(
+  scope: ScopeRef | null,
+  query: string,
+  includeHidden: boolean,
+): ContentSearch {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<ContentSearch>(IDLE_SEARCH);
+  const generation = useRef(0);
+  const trimmed = query.trim();
+
+  useEffect(() => {
+    const mine = (generation.current += 1);
+    if (scope === null || trimmed === "") {
+      setState(IDLE_SEARCH);
+      return;
+    }
+    // Earlier results stay on screen until these replace them, rather than
+    // the list blinking empty on every keystroke.
+    setState((current) => ({ ...current, isSearching: true }));
+    const timer = window.setTimeout(() => {
+      void rpc
+        .call("search", { scope, query: trimmed, includeHidden })
+        .then((result) => {
+          if (generation.current !== mine) return;
+          setState({ query: trimmed, result, isSearching: false, error: null });
+        })
+        .catch((error: unknown) => {
+          if (generation.current !== mine) return;
+          setState({
+            query: trimmed,
+            result: null,
+            isSearching: false,
+            error: error instanceof Error ? error.message : "Could not search this workspace.",
+          });
+        });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+    // `scope` is rebuilt every render by its callers; its VALUE is the identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [includeHidden, rpc, scope?.kind, scope?.id, trimmed]);
+
+  return state;
 }
 
 function ModeToggle({

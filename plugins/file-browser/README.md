@@ -40,7 +40,14 @@ against the commit the branch forked from.
   what the branch touched, folders opened.
 - **Deleted files still appear** in the tree, greyed and struck through, so you
   can read the diff of something the branch removed.
-- **⌘P go-to-file**, a search box that prunes the tree, a dotfile toggle, and a
+- **Search inside files.** Text typed in the explorer's search box is looked
+  for in every file's contents (case ignored, matched as plain text), on the
+  machine that holds the workspace — through `git grep` in a repository, so
+  `.gitignore`d files are skipped, and by reading the files otherwise. The
+  explorer lists the files that contain it, with a preview of each matching
+  line; clicking a line opens the file's source with that line highlighted,
+  and a bar above it steps through every match in the file.
+- **⌘P go-to-file** for finding a file by name, a dotfile toggle, and a
   resizable explorer.
 - **It remembers where you were.** Leaving the Files page or closing the thread
   tab and coming back restores the file you had open, the view you were reading

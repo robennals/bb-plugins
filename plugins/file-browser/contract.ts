@@ -47,7 +47,30 @@ export const branchChangesSchema = z.discriminatedUnion("kind", [
 
 export type BranchChanges = z.infer<typeof branchChangesSchema>;
 
+export const searchResultSchema = z.object({
+  files: z.array(
+    z.object({
+      path: z.string(),
+      matchCount: z.number(),
+      lines: z.array(z.object({ line: z.number(), text: z.string() })),
+    }),
+  ),
+  truncated: z.boolean(),
+});
+
 export const hostContract = defineRpcContract({
+  /** Files whose text contains `query`, ignoring case, with the matching lines. */
+  searchContent: {
+    input: z
+      .object({
+        root: z.string().min(1),
+        query: z.string().min(1),
+        excludedNames: z.array(z.string()),
+        includeHidden: z.boolean(),
+      })
+      .strict(),
+    output: searchResultSchema,
+  },
   branchChanges: {
     input: z
       .object({
