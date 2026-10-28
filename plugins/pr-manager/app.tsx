@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { PullRequest, SavedState, rpcContract } from "./server";
 import { PULL_REQUEST_STATUSES } from "./pr-status";
-import { AUTO_REFRESH_INTERVAL_SECONDS, SORT_ORDERS, SORT_ORDER_LABELS, searchPullRequests, sortPullRequests, type SortOrder } from "./pr-list";
+import {
+  AUTO_REFRESH_INTERVAL_SECONDS, SORT_ORDERS, SORT_ORDER_LABELS, arrangeStacks, groupIntoStacks, searchPullRequests, sortPullRequests,
+  type PullRequestStack, type SortOrder,
+} from "./pr-list";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -177,6 +180,66 @@ function PullRequestRow({ pr, onChanged, onFeedbackMuted }: { pr: PullRequest; o
     </article>
   );
 }
+// Pull requests that build on each other, drawn as one unit. With a filter on, only the
+// matching ones show, and each run of the others folds into a row that brings them back.
+function PullRequestStackGroup({ stack, shown, renderRow }: {
+  stack: PullRequestStack<PullRequest>; shown: Set<string>; renderRow: (pr: PullRequest) => ReactNode;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [showingAll, setShowingAll] = useState(false);
+  if (stack.prs.length === 1) return renderRow(stack.prs[0]!);
+  const hiddenCount = stack.prs.length - shown.size;
+  // Named after the lowest pull request still open, as GitHub's stack shows it once the
+  // bottom ones merge. A stack that has all merged is named after its bottom one.
+  const base = [...stack.prs].reverse().find((pr) => pr.status !== "MERGED") ?? stack.prs[stack.prs.length - 1]!;
+  const runs: ({ kind: "pr"; pr: PullRequest; matched: boolean } | { kind: "hidden"; prs: PullRequest[] })[] = [];
+  for (const pr of stack.prs) {
+    const matched = shown.has(pr.key);
+    const last = runs.at(-1);
+    if (matched || showingAll) runs.push({ kind: "pr", pr, matched });
+    else if (last?.kind === "hidden") last.prs.push(pr);
+    else runs.push({ kind: "hidden", prs: [pr] });
+  }
+  return (
+    <section aria-label={`Stack of ${stack.prs.length} pull requests: ${base.title}`} className="rounded-lg border border-border bg-muted/40">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button
+          type="button"
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed((current) => !current)}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md text-left text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Icon name={collapsed ? "ChevronRight" : "ChevronDown"} className="size-4 shrink-0" />
+          <Icon name="Layers" className="size-4 shrink-0" />
+          <span className="truncate font-medium text-foreground">{base.title}</span>
+          <span className="shrink-0">· Stack of {stack.prs.length}</span>
+        </button>
+        {!collapsed && showingAll && hiddenCount > 0 ? (
+          <button type="button" onClick={() => setShowingAll(false)} className="shrink-0 rounded-md text-xs text-muted-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+            Show only matching
+          </button>
+        ) : null}
+      </div>
+      {collapsed ? null : (
+        <div className="space-y-2 px-2 pb-2">
+          {runs.map((run) => run.kind === "pr" ? (
+            <div key={run.pr.key} className={cn(!run.matched && "opacity-60 transition-opacity hover:opacity-100 focus-within:opacity-100")}>{renderRow(run.pr)}</div>
+          ) : (
+            <button
+              key={run.prs[0]!.key}
+              type="button"
+              onClick={() => setShowingAll(true)}
+              className="flex w-full items-center gap-2 rounded-md border border-dashed border-border px-3 py-1.5 text-left text-xs text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Icon name="MoreHorizontal" className="size-4" />
+              {run.prs.length} more in this stack: {run.prs.map((pr) => `#${pr.number}`).join(", ")}
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
 function PrManagerPage() {
   const rpc = useRpc<typeof rpcContract>();
   const [saved, setSaved] = useState<SavedState | null>(null);
@@ -246,6 +309,11 @@ function PrManagerPage() {
     () => sortPullRequests(statusFilter === null ? searchedPrs : searchedPrs.filter((pr) => pr.status === statusFilter), sortOrder),
     [searchedPrs, sortOrder, statusFilter],
   );
+  // Stacks come from the whole list, so a filter hides part of a stack rather than
+  // splitting it into pieces.
+  const stacks = useMemo(() => groupIntoStacks(prs), [prs]);
+  const arrangedStacks = useMemo(() => arrangeStacks(stacks, filteredPrs), [filteredPrs, stacks]);
+  const renderRow = (pr: PullRequest) => <PullRequestRow key={pr.key} pr={pr} onChanged={() => void loadCached()} onFeedbackMuted={applyResult} />;
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto box-border w-full max-w-4xl px-4 pb-6 pt-3 md:px-5 md:pt-4">
@@ -330,7 +398,7 @@ function PrManagerPage() {
           : list === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No saved pull request list for {selectedRepository} yet. Click Refresh to load it.</div>
           : prs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No open or recently merged pull requests in {selectedRepository}.</div>
           : filteredPrs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No pull requests match these filters.</div>
-          : filteredPrs.map((pr) => <PullRequestRow key={pr.key} pr={pr} onChanged={() => void loadCached()} onFeedbackMuted={applyResult} />)}
+          : arrangedStacks.map(({ stack, shown }) => <PullRequestStackGroup key={stack.key} stack={stack} shown={shown} renderRow={renderRow} />)}
         </div>
       </div>
     </div>

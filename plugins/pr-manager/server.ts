@@ -13,7 +13,7 @@ const sortOrderSchema = z.enum(SORT_ORDERS);
 const pullRequestSchema = z.object({
   key: z.string(), repository: z.string(), number: z.number().int().positive(),
   title: z.string(), url: z.string().url(), status: statusSchema, summary: z.string(),
-  isDraft: z.boolean(), headRefName: z.string(), baseRefName: z.string(),
+  isDraft: z.boolean(), headRefName: z.string(), baseRefName: z.string(), stack: hostPullRequestSchema.shape.stack,
   createdAt: z.string(), updatedAt: z.string(), mergedAt: z.string().nullable(), projectId: z.string().nullable(),
   projectName: z.string().nullable(), threadId: z.string().nullable(), threadTitle: z.string().nullable(),
   // Unarchiving is broken in BB, so an archived thread cannot be worked in. It is

@@ -6,11 +6,17 @@ import {
 } from "./pr-search.js";
 
 // A pull request as GitHub holds it, with how many of its check runs are in each state.
-interface GitHubPullRequest { number: number; updatedAt: string; checkRuns: Record<string, number>; mergedAt: string | null }
+interface GitHubPullRequest {
+  number: number; updatedAt: string; checkRuns: Record<string, number>; mergedAt: string | null;
+  stack: { number: number; position: number } | null;
+}
 const pullRequest = (number: number, overrides: Partial<GitHubPullRequest> = {}): GitHubPullRequest =>
-  ({ number, updatedAt: "2026-09-01T00:00:00Z", checkRuns: {}, mergedAt: null, ...overrides });
+  ({ number, updatedAt: "2026-09-01T00:00:00Z", checkRuns: {}, mergedAt: null, stack: null, ...overrides });
 const id = (pr: GitHubPullRequest) => `id-${pr.number}`;
-const listed = (pr: GitHubPullRequest) => ({ id: id(pr), number: pr.number, updatedAt: pr.updatedAt });
+const listed = (pr: GitHubPullRequest) => ({
+  id: id(pr), number: pr.number, updatedAt: pr.updatedAt,
+  stack: pr.stack === null ? null : { number: pr.stack.number }, stackEntry: pr.stack === null ? null : { position: pr.stack.position },
+});
 const checkCounts = (pr: GitHubPullRequest) => ({
   checkRunCountsByState: Object.entries(pr.checkRuns).map(([state, count]) => ({ state, count })), statusContextCountsByState: [],
 });
@@ -175,7 +181,7 @@ describe("fetchPullRequests", () => {
     const fetched = await fetch(saved);
     expect(detailRequests).toEqual([pullRequestDetailsQuery(["id-4", "id-3", "id-2"])]);
     expect(fetched.map((pr) => [pr.number, pr.status])).toEqual([[4, "OPEN"], [3, "OPEN"], [2, "FAILING"], [1, "OPEN"]]);
-    expect(fetched[3]).toBe(saved[2]);
+    expect(fetched[3]).toEqual(saved[2]);
   });
 
   it("says what a pull request with feedback shows while that feedback is muted", async () => {
@@ -197,6 +203,15 @@ describe("fetchPullRequests", () => {
     const saved = await gitHub([pullRequest(1)]).fetch([]);
     const fetched = await gitHub([pullRequest(1, { updatedAt: "2026-09-05T00:00:00Z", mergedAt: "2026-09-05T00:00:00Z" })]).fetch(saved);
     expect(fetched.map((pr) => [pr.number, pr.status, pr.changeMarker])).toEqual([[1, "MERGED", changeMarker("2026-09-05T00:00:00Z", null)]]);
+  });
+
+  it("reads which GitHub stack each pull request is in on every refresh, changed or not", async () => {
+    const saved = await gitHub([pullRequest(2), pullRequest(1, { stack: { number: 7, position: 1 } })]).fetch([]);
+    expect(saved.map((pr) => pr.stack)).toEqual([null, { number: 7, position: 1 }]);
+    // Joining a stack leaves the pull request otherwise as it was, so its saved entry is reused.
+    const { detailRequests, fetch } = gitHub([pullRequest(2, { stack: { number: 7, position: 2 } }), pullRequest(1)]);
+    expect((await fetch(saved)).map((pr) => pr.stack)).toEqual([{ number: 7, position: 2 }, null]);
+    expect(detailRequests).toEqual([]);
   });
 
   it("drops saved pull requests that the searches no longer find", async () => {

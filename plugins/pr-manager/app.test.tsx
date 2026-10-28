@@ -12,15 +12,15 @@ const load = () => loadPluginApp(() => import("./app"));
 
 const PR: PullRequest = {
   key: "acme/app#7", id: "PR_7", repository: "acme/app", number: 7, title: "Add a thing", url: "https://github.com/acme/app/pull/7",
-  status: "FAILING", summary: "1 check failing", isDraft: false, headRefName: "feature", baseRefName: "main",
+  status: "FAILING", summary: "1 check failing", isDraft: false, headRefName: "feature", baseRefName: "main", stack: null,
   createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-02T00:00:00Z", mergedAt: null, changeMarker: "m1",
   projectId: "prj_1", projectName: "App", threadId: null, threadTitle: null, threadArchived: false, feedbackMuted: false,
 };
 
-function savedState(pr: PullRequest): SavedState {
+function savedState(...prs: PullRequest[]): SavedState {
   return {
     repositories: [{ repository: "acme/app", projectName: "App" }], selectedRepository: "acme/app", sortOrder: "STATUS",
-    list: { repository: "acme/app", prs: [pr], refreshedAt: "2026-01-02T00:00:00Z" },
+    list: { repository: "acme/app", prs, refreshedAt: "2026-01-02T00:00:00Z" },
   };
 }
 
@@ -95,6 +95,52 @@ describe("muting feedback", () => {
     const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: { prs_list: () => savedState(PR), prs_refresh: () => savedState(PR) } });
     await slot.findByText("Add a thing");
     expect(slot.queryByLabelText("More actions for pull request 7")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("stacked pull requests", () => {
+  const stacked = (number: number, headRefName: string, baseRefName: string, status: PullRequest["status"]): PullRequest => ({
+    ...PR, key: `acme/app#${number}`, id: `PR_${number}`, number, title: `Change ${number}`, headRefName, baseRefName, status,
+  });
+  const state = savedState(
+    stacked(1, "a", "main", "FAILING"), stacked(2, "b", "a", "WAITING"), stacked(3, "c", "b", "WAITING"), stacked(9, "z", "main", "WAITING"),
+  );
+
+  it("names a stack after its lowest pull request still open", async () => {
+    const app = await load();
+    const partMerged = savedState(stacked(1, "a", "main", "MERGED"), stacked(2, "b", "a", "WAITING"), stacked(3, "c", "b", "WAITING"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: { prs_list: () => partMerged, prs_refresh: () => partMerged } });
+    await slot.findByRole("region", { name: "Stack of 3 pull requests: Change 2" });
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a stack as one unit that collapses to its header", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: { prs_list: () => state, prs_refresh: () => state } });
+    const stack = await slot.findByRole("region", { name: "Stack of 3 pull requests: Change 1" });
+    expect(Array.from(stack.querySelectorAll("h2")).map((title) => title.textContent)).toEqual(["Change 3", "Change 2", "Change 1"]);
+    expect(slot.getByText("Change 9").closest("section")).toBeNull();
+
+    fireEvent.click(slot.getByRole("button", { name: /Change 1 · Stack of 3/ }));
+    expect(stack.querySelectorAll("h2")).toHaveLength(0);
+    expect(stack.textContent).toBe("Change 1· Stack of 3");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows only a stack's matching pull requests under a filter, with the rest one click away", async () => {
+    const app = await load();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: { prs_list: () => state, prs_refresh: () => state } });
+    fireEvent.click(await slot.findByLabelText(/Filter by failing status/));
+
+    const stack = await slot.findByRole("region", { name: "Stack of 3 pull requests: Change 1" });
+    expect(Array.from(stack.querySelectorAll("h2")).map((title) => title.textContent)).toEqual(["Change 1"]);
+    expect(slot.queryByText("Change 9")).toBeNull();
+
+    fireEvent.click(slot.getByText("2 more in this stack: #3, #2"));
+    expect(Array.from(stack.querySelectorAll("h2")).map((title) => title.textContent)).toEqual(["Change 3", "Change 2", "Change 1"]);
+    fireEvent.click(slot.getByText("Show only matching"));
+    expect(Array.from(stack.querySelectorAll("h2")).map((title) => title.textContent)).toEqual(["Change 1"]);
     slot.lifecycle.unmount();
   });
 });

@@ -6,7 +6,7 @@ import plugin, { rpcContract } from "./server.js";
 const hostPr = (repository: string, number: number, overrides: Partial<HostPullRequest> = {}): HostPullRequest => ({
   id: `id-${number}`, repository, number, title: `PR ${number}`, url: `https://github.com/${repository}/pull/${number}`,
   status: "OPEN", summary: "No review requested yet", isDraft: false, headRefName: `branch-${number}`,
-  baseRefName: "main", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z", mergedAt: null,
+  baseRefName: "main", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z", mergedAt: null, stack: null,
   changeMarker: "2026-09-01T00:00:00Z", unaddressedFeedback: null, ...overrides,
 });
 const withFeedback = (number: number, latestAt: string) => hostPr("acme/web", number, {
