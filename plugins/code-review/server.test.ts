@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
-import plugin, { type FindingDto, type ReviewDto } from "./server";
+import plugin, { type FindingDto, type HighlightDto, type ReviewDto } from "./server";
 
 const REPO = "acme/app";
 const REVIEW_ID = `${REPO}#7`;
@@ -800,6 +800,120 @@ describe("paths in a submitted report", () => {
     await host.call("startReview", { repo: REPO, number: 7 });
     expect((await host.submit()).exitCode).toBe(0);
     expect(host.calls.filter((entry) => entry.args.join(" ").includes("/git/trees/"))).toEqual([]);
+  });
+});
+
+describe("highlights", () => {
+  const HIGHLIGHT = {
+    title: "The retry moved into the client",
+    summary: "Every caller now retries through src/other.ts:3.",
+    locations: [{ file: "src/a.ts", startLine: 10, endLine: 12, note: "the new loop" }],
+  };
+
+  const withHighlights = (highlights: unknown[]) =>
+    JSON.stringify({ summary: "ok", findings: [FINDING], highlights });
+
+  const highlightsOf = async (host: Host) =>
+    (
+      await host.call<{ highlights: HighlightDto[] }>("getPullRequest", {
+        repo: REPO,
+        number: 7,
+      })
+    ).highlights;
+
+  it("imports them beside the findings, in the order written, and counts them", async () => {
+    const host = await makeHost({
+      files: { "/w/f.json": withHighlights([HIGHLIGHT, { ...HIGHLIGHT, title: "Second" }]) },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit();
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stdout).toContain("Submitted 1 finding and 2 highlights");
+
+    const highlights = await highlightsOf(host);
+    expect(highlights.map((entry) => entry.title)).toEqual([
+      "The retry moved into the client",
+      "Second",
+    ]);
+    expect(highlights[0]?.locations).toEqual(HIGHLIGHT.locations);
+  });
+
+  it("replaces every highlight on a re-run, since none is ever acted on", async () => {
+    const host = await makeHost({ files: { "/w/f.json": withHighlights([HIGHLIGHT]) } });
+    await runReview(host);
+    const [first] = await highlightsOf(host);
+
+    // Gone as soon as the re-run starts, so stale ones are not shown beside a
+    // review in progress.
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect(await highlightsOf(host)).toEqual([]);
+
+    expect((await host.submit()).exitCode).toBe(0);
+    const after = await highlightsOf(host);
+    expect(after).toHaveLength(1);
+    expect(after[0]?.id).not.toBe(first?.id);
+  });
+
+  it("rejects a bad path in a highlight, naming the entry", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": withHighlights([
+          { ...HIGHLIGHT, locations: [{ file: "a.ts", startLine: 1, endLine: 1, note: "" }] },
+        ]),
+      },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    const result = await host.submit();
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("highlight 1, locations[0].file: a.ts");
+    expect(result.stderr).toContain("did you mean src/a.ts?");
+  });
+
+  it("checks highlight paths even when there are no findings", async () => {
+    const host = await makeHost({
+      files: {
+        "/w/f.json": JSON.stringify({
+          findings: [],
+          highlights: [
+            { ...HIGHLIGHT, locations: [{ file: "nope.ts", startLine: 1, endLine: 1, note: "" }] },
+          ],
+        }),
+      },
+    });
+    await host.call("startReview", { repo: REPO, number: 7 });
+    expect((await host.submit()).exitCode).toBe(1);
+  });
+
+  it("serves the code each highlight points at, with what the PR did to it", async () => {
+    const host = await makeHost({ files: { "/w/f.json": withHighlights([HIGHLIGHT]) } });
+    await runReview(host);
+    const [highlight] = await highlightsOf(host);
+    const code = await host.call<{
+      prUrl: string;
+      locations: Array<{
+        file: string;
+        firstLine: number;
+        lines: string[];
+        note: string;
+        isPrimary: boolean;
+        inDiff: boolean;
+        error: string | null;
+      }>;
+    }>("getHighlightCode", { highlightId: highlight?.id, context: 1 });
+
+    expect(code.prUrl).toBe("https://github.com/acme/app/pull/7");
+    // Its own location first, then the one its summary cites in prose.
+    expect(code.locations.map((location) => location.file)).toEqual([
+      "src/a.ts",
+      "src/other.ts",
+    ]);
+    const [own, cited] = code.locations;
+    expect(own?.note).toBe("the new loop");
+    expect(own?.firstLine).toBe(9);
+    expect(own?.lines).toEqual(["line 9", "line 10", "line 11", "line 12", "line 13"]);
+    expect(own?.inDiff).toBe(true);
+    expect(cited?.inDiff).toBe(false);
+    expect(code.locations.every((location) => !location.isPrimary)).toBe(true);
   });
 });
 

@@ -83,15 +83,35 @@ Each finding has these parts, and they are not interchangeable:
   numbers only when commenting on a deleted line. A finding with no line
   anchors still works — it posts as a general PR comment instead.
 
+## Pointing out what is worth a look
+
+Beside `findings`, the file has a `highlights` array. Findings say what is
+wrong; highlights tell the reviewer where to spend attention — the parts of the
+change worth reading closely even if nothing there is broken:
+
+- the heart of the change, where the new behaviour actually lives
+- a design decision, a new abstraction, or a contract other code now depends on
+- a behaviour that changes for existing callers, or a deletion that did a job
+- subtle or risky code: concurrency, caching, migrations, auth, error handling
+
+Each is `{ title, summary, locations }`. `summary` is one or two sentences on
+what is happening there and why it deserves a look; `locations` is the code
+doing it, in the same `{ file, startLine, endLine, note }` shape as
+`references`, at least one. The panel shows that code under the summary.
+
+Aim for two to six, in reading order. Skip the routine — renames, boilerplate,
+fixtures — and never repeat a finding as a highlight. Highlights are never
+posted, and are neither praise nor criticism: just a pointer.
+
 Report only what you verified against the code. A finding you cannot point at
 a specific file and line for is not worth the user's time to triage. If you
 find nothing, submit a file with an empty `findings` array — that is a
-meaningful result, not a failure.
+meaningful result, not a failure — and still include the `highlights`.
 
 ## Paths must be full and real
 
-Every path you write — `file`, every `references` entry, and any `path:line`
-you cite in prose — must be the **full repo-relative path**:
+Every path you write — `file`, every `references` and highlight `locations`
+entry, and any `path:line` you cite in prose — must be the **full repo-relative path**:
 
 ```
 e2e-tests/tests/login.spec.ts:28     yes
