@@ -170,6 +170,21 @@ describe("the output tab", () => {
     await vi.waitFor(() => expect(slot.container.querySelector("pre")?.textContent).toBe("one\ntwo\n"));
   });
 
+  it("makes a printed address a link that opens in the side panel", async () => {
+    const openLink = vi.fn(() => null);
+    const slot = await renderOutput({
+      runs: () => ({ runs: [summary()] }),
+      output: () => ({ text: "Local: http://localhost:5173/\n", start: 0, end: 29 }),
+      open_link: openLink,
+    });
+    const link = await slot.findByRole("link", { name: "http://localhost:5173/" });
+    expect(slot.container.querySelector("pre")?.textContent).toBe("Local: http://localhost:5173/\n");
+    fireEvent.click(link);
+    await vi.waitFor(() =>
+      expect(openLink).toHaveBeenCalledWith({ threadId: THREAD, url: "http://localhost:5173/" }),
+    );
+  });
+
   it("says which terminal tab a running command is in, and stops saying so once it ends", async () => {
     let runs = [summary()];
     const slot = await renderOutput({

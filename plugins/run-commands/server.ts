@@ -79,6 +79,11 @@ export const rpcContract = defineRpcContract({
     input: threadInput.extend({ runId: z.string(), from: z.number().int().min(0) }),
     output: z.object({ text: z.string(), start: z.number(), end: z.number() }),
   },
+  /** Open a web address someone clicked in a run's output, as a side-panel browser tab. */
+  open_link: {
+    input: threadInput.extend({ url: z.url({ protocol: /^https?$/ }) }),
+    output: z.null(),
+  },
 });
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -176,18 +181,17 @@ export default function plugin(bb: BbPluginApi) {
     throw new Error(`Could not update the side panel's tabs: ${messageOf(lastError)}`);
   }
 
+  async function openBrowserTab(threadId: string, url: string, title: string): Promise<void> {
+    const thread = await bb.sdk.threads.get({ threadId });
+    await addTab(
+      threadId,
+      browserTabFor({ pluginId: bb.pluginId, environmentId: thread.environmentId, url, title }),
+    );
+  }
+
   async function openAddress(threadId: string, run: Run): Promise<void> {
     try {
-      const thread = await bb.sdk.threads.get({ threadId });
-      await addTab(
-        threadId,
-        browserTabFor({
-          pluginId: bb.pluginId,
-          environmentId: thread.environmentId,
-          url: run.url,
-          title: run.name,
-        }),
-      );
+      await openBrowserTab(threadId, run.url, run.name);
     } catch (cause) {
       bb.log.warn(`could not open ${run.url} for "${run.name}": ${messageOf(cause)}`);
     }
@@ -398,6 +402,11 @@ export default function plugin(bb: BbPluginApi) {
     output: async ({ threadId, runId, from }) => {
       await runOf(threadId, runId);
       return outputAfter(await readOutput(runId), from);
+    },
+
+    open_link: async ({ threadId, url }) => {
+      await openBrowserTab(threadId, url, new URL(url).host);
+      return null;
     },
   });
 }
