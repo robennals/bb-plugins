@@ -307,6 +307,20 @@ describe("a command with an address to open", () => {
   });
 });
 
+describe("a link clicked in the output", () => {
+  it("opens as a browser tab named after its host", async () => {
+    const { store, rpc } = await createHost();
+    await rpc("open_link", { url: "http://localhost:3000" });
+    expect(store.state.tabs).toEqual([infoTab, { ...browserTab, title: "localhost:3000" }]);
+  });
+
+  it("is refused unless it is a web address", async () => {
+    const { store, rpc } = await createHost();
+    await expect(rpc("open_link", { url: "file:///etc/passwd" })).rejects.toThrow();
+    expect(store.state.tabs).toEqual([infoTab]);
+  });
+});
+
 describe("the list of commands", () => {
   it("is saved for its project, and tells that project's open headers to refetch", async () => {
     const { harness } = await createHost([dev]);

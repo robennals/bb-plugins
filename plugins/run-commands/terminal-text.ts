@@ -53,3 +53,40 @@ export function displayText(text: string): string {
     .join("\n")
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
 }
+
+/** A piece of output text; `url` is set when the piece is a web address. */
+export type TextPiece = { text: string; url?: string };
+
+// Runs up to whitespace, quotes or angle brackets; the trailing punctuation a
+// sentence puts after an address is trimmed off afterwards.
+const WEB_ADDRESS = /https?:\/\/[^\s"'<>`]+/g;
+const ENDS_IN_PUNCTUATION = /[.,;:!?)\]}]$/;
+
+/** Trim punctuation off the end, but keep a `)` that closes a `(` in the address. */
+function trimAddress(candidate: string): string {
+  let address = candidate;
+  while (ENDS_IN_PUNCTUATION.test(address)) {
+    if (address.endsWith(")") && count(address, "(") >= count(address, ")")) break;
+    address = address.slice(0, -1);
+  }
+  return address;
+}
+
+function count(text: string, character: string): number {
+  return text.split(character).length - 1;
+}
+
+/** Split text into plain pieces and the web addresses in it, in order. */
+export function splitLinks(text: string): TextPiece[] {
+  const pieces: TextPiece[] = [];
+  let plainFrom = 0;
+  for (const match of text.matchAll(WEB_ADDRESS)) {
+    const url = trimAddress(match[0]);
+    if (!URL.canParse(url)) continue;
+    if (match.index > plainFrom) pieces.push({ text: text.slice(plainFrom, match.index) });
+    pieces.push({ text: url, url });
+    plainFrom = match.index + url.length;
+  }
+  if (plainFrom < text.length) pieces.push({ text: text.slice(plainFrom) });
+  return pieces;
+}
