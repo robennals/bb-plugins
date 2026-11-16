@@ -621,6 +621,18 @@ export interface PullRequest {
   headRefName: string;
   labels: string[];
   reviewRequests: ReviewRequest[];
+  /**
+   * Where GitHub's stacked pull requests feature puts this one: the stack's
+   * number and this pull request's position in it, counting up from 1 at the
+   * bottom. Null when it is in no GitHub stack. `gh pr list` cannot report
+   * it, so it comes from `OPEN_PR_STACKS_QUERY`.
+   */
+  stack: StackEntry | null;
+}
+
+export interface StackEntry {
+  number: number;
+  position: number;
 }
 
 interface GhPullRequest {
@@ -695,7 +707,112 @@ export function parsePullRequests(raw: string, repo: string): PullRequest[] {
           teamSlug: isTeam ? str(request.slug) || str(request.name) || null : null,
         };
       }),
+      stack: null,
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Stacks
+// ---------------------------------------------------------------------------
+
+/**
+ * GitHub's stack membership for a repo's open pull requests, which `gh pr
+ * list --json` has no field for. Takes `owner` and `name` variables. Asks for
+ * as many as `gh pr list` lists, so every listed pull request is covered.
+ */
+export const OPEN_PR_STACKS_QUERY = `query OpenPullRequestStacks($owner:String!,$name:String!){
+  repository(owner:$owner,name:$name){
+    pullRequests(states:OPEN,first:${PR_LIST_LIMIT},orderBy:{field:CREATED_AT,direction:DESC}){
+      nodes{number stack{number} stackEntry{position}}
+    }
+  }
+}`;
+
+const stackNodeSchema = z.object({
+  number: z.number(),
+  stack: z.object({ number: z.number() }).nullable(),
+  stackEntry: z.object({ position: z.number() }).nullable(),
+});
+const openPrStacksResponseSchema = z.object({
+  data: z.object({
+    repository: z.object({
+      // A node GitHub could not resolve comes back null, and is skipped.
+      pullRequests: z.object({ nodes: z.array(stackNodeSchema.nullable()) }),
+    }),
+  }),
+});
+
+/** Each stacked pull request's place in its GitHub stack, by its number. */
+export function parseStackEntries(raw: string): Map<number, StackEntry> {
+  const { nodes } = openPrStacksResponseSchema.parse(JSON.parse(raw)).data.repository.pullRequests;
+  const entries = new Map<number, StackEntry>();
+  for (const node of nodes) {
+    if (node?.stack != null && node.stackEntry !== null) {
+      entries.set(node.number, { number: node.stack.number, position: node.stackEntry.position });
+    }
+  }
+  return entries;
+}
+
+interface StackablePullRequest {
+  number: number;
+  headRefName: string;
+  baseRefName: string;
+  stack: StackEntry | null;
+}
+
+/**
+ * Pull requests that build on each other, as lists of their numbers from the
+ * top of the stack down to the one based on a branch outside it — so each
+ * sits above the one it is based on, the way GitHub draws a stack.
+ *
+ * A stack GitHub knows about is taken as GitHub has it. Otherwise a pull
+ * request is stacked on another when its base branch is the other's head
+ * branch, which is how stacks made by other tools show. A lone pull request
+ * is a stack of one. Mirrors `groupIntoStacks` in the PR manager plugin, minus
+ * merged pull requests, which this list never holds.
+ */
+export function groupIntoStacks(prs: readonly StackablePullRequest[]): number[][] {
+  const gitHubStacks = new Map<number, StackablePullRequest[]>();
+  for (const pr of prs) {
+    if (pr.stack === null) continue;
+    gitHubStacks.set(pr.stack.number, [...(gitHubStacks.get(pr.stack.number) ?? []), pr]);
+  }
+  const stacks = [...gitHubStacks.values()].map((members) =>
+    [...members]
+      .sort((a, b) => (b.stack?.position ?? 0) - (a.stack?.position ?? 0))
+      .map((pr) => pr.number),
+  );
+  return [...stacks, ...groupByBranches(prs.filter((pr) => pr.stack === null))];
+}
+
+function groupByBranches(prs: readonly StackablePullRequest[]): number[][] {
+  const byHead = new Map<string, StackablePullRequest>();
+  for (const pr of prs) if (!byHead.has(pr.headRefName)) byHead.set(pr.headRefName, pr);
+  const children = new Map<number, StackablePullRequest[]>();
+  const roots: StackablePullRequest[] = [];
+  for (const pr of prs) {
+    const parent = byHead.get(pr.baseRefName);
+    if (parent === undefined || parent === pr) roots.push(pr);
+    else children.set(parent.number, [...(children.get(parent.number) ?? []), pr]);
+  }
+  const placed = new Set<number>();
+  const collect = (pr: StackablePullRequest, into: number[]) => {
+    if (placed.has(pr.number)) return;
+    placed.add(pr.number);
+    into.push(pr.number);
+    for (const child of children.get(pr.number) ?? []) collect(child, into);
+  };
+  const stacks: number[][] = [];
+  // Branches based on each other in a loop have no root, so whatever is left
+  // after the roots starts a stack of its own rather than going missing.
+  for (const start of [...roots, ...prs]) {
+    if (placed.has(start.number)) continue;
+    const basedFirst: number[] = [];
+    collect(start, basedFirst);
+    stacks.push(basedFirst.reverse());
+  }
+  return stacks;
 }
 
 export type PrFilter =
