@@ -36,6 +36,9 @@ in the right-hand panel that shows what each run printed.
 - **The output is plain text.** Colour and cursor codes are dropped, and a line
   redrawn with carriage returns (a progress bar) shows only its last state.
   The output tab is read-only.
+- **Web addresses in the output are links.** Clicking one opens it as a
+  browser tab in the side panel, the same kind the "Address to open" field
+  uses, so a `localhost` address reaches the machine the command runs on.
 - **Output outlives the command.** When a command exits, its exit code is
   recorded and its terminal closed. Each run keeps its newest 40,000
   characters; the 20 newest runs per thread are kept, and "Clear finished"

@@ -46,6 +46,8 @@ const savedStateSchema = z.object({
   repositories: z.array(z.object({ repository: z.string(), projectName: z.string() })),
   selectedRepository: z.string().nullable(), sortOrder: sortOrderSchema,
   list: repositoryListSchema.nullable(),
+  // Keys of the selected repository's stacks that are folded to their header.
+  collapsedStacks: z.array(z.string()),
 });
 export type SavedState = z.infer<typeof savedStateSchema>;
 
@@ -60,6 +62,11 @@ export const rpcContract = defineRpcContract({
   // The whole persisted view is sent at once, so there is no partial-update merge.
   prs_set_view: {
     input: z.object({ repository: repositoryNameSchema, sortOrder: sortOrderSchema }),
+    output: savedStateSchema,
+  },
+  // `stack` is the stack's key, which is the key of its bottom pull request.
+  prs_set_stack_collapsed: {
+    input: z.object({ repository: repositoryNameSchema, stack: z.string(), collapsed: z.boolean() }),
     output: savedStateSchema,
   },
   // Returns null when the PR has no live thread, so the caller knows to ask for
@@ -99,6 +106,7 @@ const mutedFeedbackKey = (repository: string, number: number) => `muted-feedback
 const LIST_KEY_PREFIX = "pull-requests:";
 const listKey = (repository: string) => `${LIST_KEY_PREFIX}${repository.toLowerCase()}`;
 const VIEW_KEY = "pull-request-view";
+const collapsedStacksKey = (repository: string) => `collapsed-stacks:${repository.toLowerCase()}`;
 // The single list every repository shared before lists were saved per repository.
 const LEGACY_LIST_KEY = "pull-request-list-v2";
 // How long a new thread's worktree is given to finish setting up before its branch is left alone.
@@ -161,7 +169,18 @@ export default async function plugin(bb: BbPluginApi) {
       : saved?.repository ?? repositories[0]?.repository ?? null;
     const savedList = selectedRepository === null ? null : await readRepositoryList(selectedRepository);
     const list = savedList === null ? null : { ...savedList, prs: await Promise.all(savedList.prs.map(applyMutedFeedback)) };
-    return { repositories, selectedRepository, sortOrder: view.sortOrder, list };
+    const collapsedStacks = selectedRepository === null ? [] : await readCollapsedStacks(selectedRepository);
+    return { repositories, selectedRepository, sortOrder: view.sortOrder, list, collapsedStacks };
+  }
+
+  async function readCollapsedStacks(repository: string): Promise<string[]> {
+    const parsed = z.array(z.string()).safeParse(await bb.storage.kv.get<unknown>(collapsedStacksKey(repository)));
+    return parsed.success ? parsed.data : [];
+  }
+
+  async function saveCollapsedStacks(repository: string, stacks: string[]) {
+    if (stacks.length === 0) await bb.storage.kv.delete(collapsedStacksKey(repository));
+    else await bb.storage.kv.set(collapsedStacksKey(repository), stacks);
   }
 
   // The saved list keeps the status GitHub's data gives, which is what the next refresh
@@ -236,10 +255,19 @@ export default async function plugin(bb: BbPluginApi) {
       repository, prs: await linkProjectsAndThreads(raw.pullRequests, context), refreshedAt: new Date().toISOString(),
     };
     await bb.storage.kv.set(listKey(repository), list);
+    // A stack is keyed by its bottom pull request, so once that one has left the list the
+    // stack is gone too, and so is the reason to remember folding it.
+    const listed = new Set(list.prs.map((pr) => pr.key));
+    const collapsed = await readCollapsedStacks(repository);
+    const stillListed = collapsed.filter((key) => listed.has(key));
+    if (stillListed.length !== collapsed.length) await saveCollapsedStacks(repository, stillListed);
     // Lists of repositories that no project uses any more would never be shown again.
     const kept = new Set(repositories.map((candidate) => listKey(candidate.repository)));
     const stale = (await bb.storage.kv.list(LIST_KEY_PREFIX)).filter((key) => !kept.has(key));
-    await Promise.all(stale.map((key) => bb.storage.kv.delete(key)));
+    await Promise.all(stale.flatMap((key) => {
+      const staleRepository = key.slice(LIST_KEY_PREFIX.length);
+      return [bb.storage.kv.delete(key), bb.storage.kv.delete(collapsedStacksKey(staleRepository))];
+    }));
     return readSavedState(repository);
   }
 
@@ -298,6 +326,12 @@ export default async function plugin(bb: BbPluginApi) {
       const selectedRepository = findRepository(await projectRepositories(), repository);
       await saveView({ selectedRepository, sortOrder });
       return readSavedState();
+    },
+    prs_set_stack_collapsed: async ({ repository, stack, collapsed }) => {
+      const found = findRepository(await projectRepositories(), repository);
+      const others = (await readCollapsedStacks(found)).filter((key) => key !== stack);
+      await saveCollapsedStacks(found, collapsed ? [...others, stack] : others);
+      return readSavedState(found);
     },
     prs_resolve_thread: async ({ repository, number }) => {
       const linked = await resolveLinkedThread(repository, number);

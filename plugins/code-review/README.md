@@ -51,6 +51,24 @@ yourself — one comment at a time, edited how you want it.
 5. **Act on it**: **post the comment verbatim**, **edit it first**, **ask about
    it** (below), or **dismiss it**.
 
+## Stacked pull requests
+
+Pull requests that build on each other show as one stack, drawn the way the
+PR manager plugin draws them: a box named after the bottom pull request, with
+the rows running from the top of the stack down.
+
+- **What counts as a stack.** A stack GitHub's stacked pull requests feature
+  knows about is taken as GitHub has it. Otherwise a pull request is stacked
+  on another when its base branch is the other's head branch, which is how
+  stacks made by other tools show. If GitHub's stack data cannot be read, the
+  list still loads and groups by branch alone.
+- **Filters hide part of a stack, not the stack.** Stacks are worked out from
+  every open pull request, so a filter such as **Asked me** shows only the
+  members it picks. The rest fold into a "*N* more in this stack" row that
+  brings them back, dimmed so the ones you were asked about stand out.
+- **A stack sorts as a unit**, at the place of its most recently updated
+  member, and folds to its header when you click it.
+
 ## One review, one thread, one tab
 
 A review is a BB thread like any other, and its issues live in a **Code

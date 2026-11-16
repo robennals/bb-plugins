@@ -47,6 +47,9 @@ import {
   isRepoName,
   parseGithubRemote,
   parsePullRequests,
+  parseStackEntries,
+  groupIntoStacks,
+  OPEN_PR_STACKS_QUERY,
   parseReport,
   parsePrSnapshot,
   parseAnswer,
@@ -72,6 +75,7 @@ import {
   type PostAnchor,
   type PrSnapshot,
   type PullRequest,
+  type StackEntry,
 } from "./review-core";
 
 const CHANGED = "code-review-changed";
@@ -109,6 +113,8 @@ const pullRequestSchema = z.object({
   headRefName: z.string(),
   labels: z.array(z.string()),
   reviewRequests: z.array(reviewRequestSchema),
+  /** Its place in a GitHub stack, counting up from 1 at the bottom. */
+  stack: z.object({ number: z.number(), position: z.number() }).nullable(),
   /** Status of this plugin's review of the PR, if one has been started. */
   reviewStatus: z.enum(["none", "queued", "running", "reported", "failed"]),
   openFindings: z.number(),
@@ -362,7 +368,16 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       /** When this list was last pulled from GitHub. */
       fetchedAt: z.string(),
+      /** The pull requests the filter picks, most recently updated first. */
       pullRequests: z.array(pullRequestSchema),
+      /**
+       * Every stack of two or more with a pull request in `pullRequests`, as
+       * numbers from the top of the stack down. Stacks come from the whole open
+       * list, so a filter hides part of a stack rather than splitting it.
+       */
+      stacks: z.array(z.array(z.number())),
+      /** The rest of those stacks: the members the filter leaves out. */
+      stackmates: z.array(pullRequestSchema),
     }),
   },
   getPullRequest: {
@@ -1264,7 +1279,9 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       | undefined;
     if (row === undefined) return null;
     try {
-      return { prs: JSON.parse(row.prs) as PullRequest[], fetchedAt: row.fetched_at };
+      // A list stored before stacks were read has no `stack` on its rows.
+      const prs = (JSON.parse(row.prs) as PullRequest[]).map((pr) => ({ ...pr, stack: pr.stack ?? null }));
+      return { prs, fetchedAt: row.fetched_at };
     } catch {
       return null;
     }
@@ -1278,18 +1295,44 @@ export default async function plugin(bb: BbPluginApi, deps: PluginDependencies =
       const stored = storedPullRequests(repo);
       if (stored !== null) return stored;
     }
-    const raw = await gh(
-      ["pr", "list", "-R", repo, "--state", "open",
-       "--limit", `${PR_LIST_LIMIT}`, "--json", PR_JSON_FIELDS],
-      45_000,
-    );
-    const prs = parsePullRequests(raw, repo);
+    const [raw, stackEntries] = await Promise.all([
+      gh(
+        ["pr", "list", "-R", repo, "--state", "open",
+         "--limit", `${PR_LIST_LIMIT}`, "--json", PR_JSON_FIELDS],
+        45_000,
+      ),
+      fetchStackEntries(repo),
+    ]);
+    const prs = parsePullRequests(raw, repo).map((pr) => ({
+      ...pr,
+      stack: stackEntries.get(pr.number) ?? null,
+    }));
     const fetchedAt = nowIso();
     db.prepare(
       `INSERT INTO pr_cache (repo, prs, fetched_at) VALUES (?, ?, ?)
        ON CONFLICT(repo) DO UPDATE SET prs = excluded.prs, fetched_at = excluded.fetched_at`,
     ).run(repo, JSON.stringify(prs), fetchedAt);
     return { prs, fetchedAt };
+  }
+
+  /**
+   * GitHub's stacks, which only group the list. Without them — a GitHub
+   * Enterprise server that has no stacks, say — pull requests still group by
+   * their branches, so a failure here must not fail the list.
+   */
+  async function fetchStackEntries(repo: string): Promise<Map<number, StackEntry>> {
+    const [owner, name] = repo.split("/");
+    try {
+      const raw = await gh(
+        ["api", "graphql", "-f", `query=${OPEN_PR_STACKS_QUERY}`,
+         "-f", `owner=${owner}`, "-f", `name=${name}`],
+        30_000,
+      );
+      return parseStackEntries(raw);
+    } catch (error) {
+      bb.log.warn(`could not read the pull request stacks of ${repo}: ${String(error)}`);
+      return new Map();
+    }
   }
 
   async function filterContext(): Promise<FilterContext> {
@@ -2768,11 +2811,20 @@ interface ContextRow {
       await checkAuth();
       const { prs, fetchedAt } = await fetchPullRequests(repo, refresh === true);
       const filtered = filterPullRequests(prs, filter, await filterContext());
+      const shown = new Set(filtered.map((pr) => pr.number));
+      const stacks = groupIntoStacks(prs).filter(
+        (stack) => stack.length > 1 && stack.some((number) => shown.has(number)),
+      );
+      const stacked = new Set(stacks.flat());
       const archivedThreadIds = await listArchivedThreadIds();
       return {
         fetchedAt,
         pullRequests: filtered
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+          .map((candidate) => withReviewState(candidate, archivedThreadIds)),
+        stacks,
+        stackmates: prs
+          .filter((pr) => stacked.has(pr.number) && !shown.has(pr.number))
           .map((candidate) => withReviewState(candidate, archivedThreadIds)),
       };
     },

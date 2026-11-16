@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { displayText, outputMentions, stripAnsi, stripAnsiStreaming } from "./terminal-text.js";
+import { displayText, outputMentions, splitLinks, stripAnsi, stripAnsiStreaming } from "./terminal-text.js";
 
 describe("stripAnsi", () => {
   it("drops colours, cursor moves and window titles", () => {
@@ -50,5 +50,46 @@ describe("displayText", () => {
 
   it("drops stray control characters but keeps tabs", () => {
     expect(displayText("a\tb\u0007c\u0008")).toBe("a\tbc");
+  });
+});
+
+describe("splitLinks", () => {
+  it("picks out the address a dev server prints", () => {
+    expect(splitLinks("  ➜  Local:   http://localhost:5173/\n")).toEqual([
+      { text: "  ➜  Local:   " },
+      { text: "http://localhost:5173/", url: "http://localhost:5173/" },
+      { text: "\n" },
+    ]);
+  });
+
+  it("leaves sentence punctuation and a closing bracket outside the link", () => {
+    expect(splitLinks("see (https://example.com/a), then https://example.com/b.")).toEqual([
+      { text: "see (" },
+      { text: "https://example.com/a", url: "https://example.com/a" },
+      { text: "), then " },
+      { text: "https://example.com/b", url: "https://example.com/b" },
+      { text: "." },
+    ]);
+  });
+
+  it("keeps a bracket that belongs to the address", () => {
+    const url = "https://en.wikipedia.org/wiki/Foo_(bar)";
+    expect(splitLinks(url)).toEqual([{ text: url, url }]);
+  });
+
+  it("stops at quotes", () => {
+    expect(splitLinks(`url="http://localhost:3000/x"`)).toEqual([
+      { text: `url="` },
+      { text: "http://localhost:3000/x", url: "http://localhost:3000/x" },
+      { text: `"` },
+    ]);
+  });
+
+  it("does not link a scheme with nothing after it, or other schemes", () => {
+    expect(splitLinks("http:// and ftp://example.com")).toEqual([{ text: "http:// and ftp://example.com" }]);
+  });
+
+  it("returns no pieces for no text", () => {
+    expect(splitLinks("")).toEqual([]);
   });
 });

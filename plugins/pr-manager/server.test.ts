@@ -51,7 +51,7 @@ async function loadPlugin(pullRequests: HostPullRequest[]) {
     },
   });
   await plugin(bb);
-  const call = async (method: "prs_list" | "prs_refresh" | "prs_set_view" | "prs_set_feedback_muted", input: unknown) =>
+  const call = async (method: "prs_list" | "prs_refresh" | "prs_set_view" | "prs_set_feedback_muted" | "prs_set_stack_collapsed", input: unknown) =>
     rpcContract[method].output.parse(await harness.callRpc(method, input));
   return { world, harness, listCalls, spawnCalls, renameCalls, call };
 }
@@ -68,7 +68,7 @@ describe("per-project pull request lists", () => {
     world.projects.push(project("project-docs", "docs", "git@gitlab.com:acme/docs.git"), project("project-web-2", "web copy", "git@github.com:acme/web.git"));
     expect(await call("prs_list", null)).toEqual({
       repositories: [{ repository: "Acme/Api", projectName: "API" }, { repository: "acme/web", projectName: "web" }],
-      selectedRepository: "Acme/Api", sortOrder: "STATUS", list: null,
+      selectedRepository: "Acme/Api", sortOrder: "STATUS", list: null, collapsedStacks: [],
     });
     expect(listCalls).toEqual([]);
   });
@@ -159,6 +159,29 @@ describe("per-project pull request lists", () => {
     expect(rpcContract.prs_list.output.parse(JSON.parse(refreshed.stdout)).list?.prs.map((pr) => pr.number)).toEqual([1]);
     expect((await call("prs_list", null)).selectedRepository).toBe("Acme/Api");
     expect((await harness.runCli(["refresh", "--repo"])).exitCode).toBe(1);
+  });
+});
+
+describe("collapsed stacks", () => {
+  it("remembers which stacks are collapsed, per repository", async () => {
+    const { call } = await loadPlugin([hostPr("acme/web", 1), hostPr("Acme/Api", 2)]);
+    await call("prs_set_view", { repository: "acme/web", sortOrder: "STATUS" });
+    expect((await call("prs_set_stack_collapsed", { repository: "acme/web", stack: "acme/web#1", collapsed: true })).collapsedStacks).toEqual(["acme/web#1"]);
+    expect((await call("prs_list", null)).collapsedStacks).toEqual(["acme/web#1"]);
+    expect((await call("prs_set_view", { repository: "Acme/Api", sortOrder: "STATUS" })).collapsedStacks).toEqual([]);
+
+    await call("prs_set_view", { repository: "acme/web", sortOrder: "STATUS" });
+    await call("prs_set_stack_collapsed", { repository: "acme/web", stack: "acme/web#1", collapsed: false });
+    expect((await call("prs_list", null)).collapsedStacks).toEqual([]);
+  });
+
+  it("forgets a collapsed stack once its pull request leaves the list", async () => {
+    const { world, call } = await loadPlugin([hostPr("acme/web", 1), hostPr("acme/web", 2)]);
+    await call("prs_refresh", { repository: "acme/web" });
+    await call("prs_set_stack_collapsed", { repository: "acme/web", stack: "acme/web#1", collapsed: true });
+    await call("prs_set_stack_collapsed", { repository: "acme/web", stack: "acme/web#2", collapsed: true });
+    world.pullRequests = [hostPr("acme/web", 2)];
+    expect((await call("prs_refresh", { repository: "acme/web" })).collapsedStacks).toEqual(["acme/web#2"]);
   });
 });
 

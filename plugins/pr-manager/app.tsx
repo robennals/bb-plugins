@@ -182,10 +182,11 @@ function PullRequestRow({ pr, onChanged, onFeedbackMuted }: { pr: PullRequest; o
 }
 // Pull requests that build on each other, drawn as one unit. With a filter on, only the
 // matching ones show, and each run of the others folds into a row that brings them back.
-function PullRequestStackGroup({ stack, shown, renderRow }: {
-  stack: PullRequestStack<PullRequest>; shown: Set<string>; renderRow: (pr: PullRequest) => ReactNode;
+// Whether it is folded to its header is saved, so it stays that way when the panel reopens.
+function PullRequestStackGroup({ stack, shown, collapsed, onCollapsedChange, renderRow }: {
+  stack: PullRequestStack<PullRequest>; shown: Set<string>; collapsed: boolean;
+  onCollapsedChange: (collapsed: boolean) => void; renderRow: (pr: PullRequest) => ReactNode;
 }) {
-  const [collapsed, setCollapsed] = useState(false);
   const [showingAll, setShowingAll] = useState(false);
   if (stack.prs.length === 1) return renderRow(stack.prs[0]!);
   const hiddenCount = stack.prs.length - shown.size;
@@ -206,7 +207,7 @@ function PullRequestStackGroup({ stack, shown, renderRow }: {
         <button
           type="button"
           aria-expanded={!collapsed}
-          onClick={() => setCollapsed((current) => !current)}
+          onClick={() => onCollapsedChange(!collapsed)}
           className="flex min-w-0 flex-1 items-center gap-2 rounded-md text-left text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <Icon name={collapsed ? "ChevronRight" : "ChevronDown"} className="size-4 shrink-0" />
@@ -289,6 +290,18 @@ function PrManagerPage() {
       void loadCached();
     }
   }, [applyResult, loadCached, rpc]);
+  // Shown folded at once; the server's answer then replaces the guess.
+  const setStackCollapsed = useCallback(async (repository: string, stack: string, collapsed: boolean) => {
+    setSaved((current) => current === null ? null : {
+      ...current, collapsedStacks: [...current.collapsedStacks.filter((key) => key !== stack), ...(collapsed ? [stack] : [])],
+    });
+    try {
+      applyResult(await rpc.call("prs_set_stack_collapsed", { repository, stack, collapsed }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      void loadCached();
+    }
+  }, [applyResult, loadCached, rpc]);
   useEffect(() => {
     void loadCached();
   }, [loadCached]);
@@ -313,6 +326,7 @@ function PrManagerPage() {
   // splitting it into pieces.
   const stacks = useMemo(() => groupIntoStacks(prs), [prs]);
   const arrangedStacks = useMemo(() => arrangeStacks(stacks, filteredPrs), [filteredPrs, stacks]);
+  const collapsedStacks = useMemo(() => new Set(saved?.collapsedStacks ?? []), [saved]);
   const renderRow = (pr: PullRequest) => <PullRequestRow key={pr.key} pr={pr} onChanged={() => void loadCached()} onFeedbackMuted={applyResult} />;
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
@@ -398,7 +412,9 @@ function PrManagerPage() {
           : list === null ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No saved pull request list for {selectedRepository} yet. Click Refresh to load it.</div>
           : prs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No open or recently merged pull requests in {selectedRepository}.</div>
           : filteredPrs.length === 0 ? <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">No pull requests match these filters.</div>
-          : arrangedStacks.map(({ stack, shown }) => <PullRequestStackGroup key={stack.key} stack={stack} shown={shown} renderRow={renderRow} />)}
+          : arrangedStacks.map(({ stack, shown }) => <PullRequestStackGroup key={stack.key} stack={stack} shown={shown}
+            collapsed={collapsedStacks.has(stack.key)} renderRow={renderRow}
+            onCollapsedChange={(collapsed) => { if (selectedRepository !== null) void setStackCollapsed(selectedRepository, stack.key, collapsed); }} />)}
         </div>
       </div>
     </div>

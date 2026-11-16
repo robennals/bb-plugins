@@ -133,6 +133,10 @@ async function makeHost(
     // The pending-review lookup and the add-comment mutation are both
     // `gh api graphql`; key them by the operation so they can differ.
     "api graphql -f query=query": "",
+    // GitHub's stacks for the PR list. None by default, so lists group by branch.
+    "api graphql -f query=query OpenPullRequestStacks": JSON.stringify({
+      data: { repository: { pullRequests: { nodes: [] } } },
+    }),
     "api graphql -f query=mutation": JSON.stringify({
       data: {
         addPullRequestReviewThread: {
@@ -428,6 +432,80 @@ describe("status", () => {
 describe("listPullRequests", () => {
   const teamPr = { ...PR, number: 8, reviewRequests: [{ __typename: "Team", slug: "acme/core" }] };
   const nobodyPr = { ...PR, number: 9, reviewRequests: [] };
+
+  describe("stacks", () => {
+    type StackedList = {
+      pullRequests: Array<{ number: number; stack: unknown }>;
+      stacks: number[][];
+      stackmates: Array<{ number: number }>;
+    };
+    const STACKS_QUERY = "api graphql -f query=query OpenPullRequestStacks";
+    const list = (call: <T>(method: string, input?: unknown) => Promise<T>, filter: unknown) =>
+      call<StackedList>("listPullRequests", { repo: REPO, filter });
+
+    it("groups pull requests based on each other's branches, top first", async () => {
+      const bottom = { ...PR, number: 1, headRefName: "one", baseRefName: "main" };
+      const middle = { ...PR, number: 2, headRefName: "two", baseRefName: "one" };
+      const top = { ...PR, number: 3, headRefName: "three", baseRefName: "two" };
+      const { call } = await makeHost({ prs: [bottom, top, middle, PR] });
+      const result = await list(call, { kind: "all" });
+      expect(result.stacks).toEqual([[3, 2, 1]]);
+      expect(result.stackmates).toEqual([]);
+    });
+
+    it("returns the members a filter leaves out, so the stack can still be drawn whole", async () => {
+      // Only the middle one asks for my review; the others are someone else's.
+      const bottom = { ...PR, number: 1, headRefName: "one", baseRefName: "main", reviewRequests: [] };
+      const middle = { ...PR, number: 2, headRefName: "two", baseRefName: "one" };
+      const top = { ...PR, number: 3, headRefName: "three", baseRefName: "two", reviewRequests: [] };
+      const { call } = await makeHost({ prs: [bottom, middle, top] });
+      const result = await list(call, { kind: "mine" });
+      expect(result.pullRequests.map((pr) => pr.number)).toEqual([2]);
+      expect(result.stacks).toEqual([[3, 2, 1]]);
+      expect(result.stackmates.map((pr) => pr.number).sort()).toEqual([1, 3]);
+    });
+
+    it("leaves out stacks with nothing the filter picks", async () => {
+      const bottom = { ...PR, number: 1, headRefName: "one", reviewRequests: [] };
+      const top = { ...PR, number: 2, headRefName: "two", baseRefName: "one", reviewRequests: [] };
+      const { call } = await makeHost({ prs: [PR, bottom, top] });
+      const result = await list(call, { kind: "mine" });
+      expect(result.stacks).toEqual([]);
+      expect(result.stackmates).toEqual([]);
+    });
+
+    it("takes a GitHub stack as GitHub orders it", async () => {
+      // Unrelated branch names, so only GitHub's stack can tie these together.
+      const lower = { ...PR, number: 4, headRefName: "x" };
+      const upper = { ...PR, number: 5, headRefName: "y" };
+      const { call } = await makeHost({
+        prs: [upper, lower],
+        ghOverrides: {
+          [STACKS_QUERY]: JSON.stringify({
+            data: { repository: { pullRequests: { nodes: [
+              { number: 5, stack: { number: 1 }, stackEntry: { position: 2 } },
+              { number: 4, stack: { number: 1 }, stackEntry: { position: 1 } },
+            ] } } },
+          }),
+        },
+      });
+      const result = await list(call, { kind: "all" });
+      expect(result.stacks).toEqual([[5, 4]]);
+      expect(result.pullRequests.find((pr) => pr.number === 4)?.stack).toEqual({ number: 1, position: 1 });
+    });
+
+    it("still lists pull requests when GitHub's stacks cannot be read", async () => {
+      const bottom = { ...PR, number: 1, headRefName: "one" };
+      const top = { ...PR, number: 2, headRefName: "two", baseRefName: "one" };
+      const { call } = await makeHost({
+        prs: [bottom, top],
+        ghFailures: { [STACKS_QUERY]: "Field 'stack' doesn't exist on type 'PullRequest'" },
+      });
+      const result = await list(call, { kind: "all" });
+      expect(result.pullRequests.map((pr) => pr.number).sort()).toEqual([1, 2]);
+      expect(result.stacks).toEqual([[2, 1]]);
+    });
+  });
 
   it("filters by who was asked to review", async () => {
     const { call } = await makeHost({ prs: [PR, teamPr, nobodyPr] });

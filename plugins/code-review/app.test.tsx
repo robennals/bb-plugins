@@ -54,6 +54,7 @@ const PR: PullRequestDto = {
   postedFindings: 0,
   reviewThreadId: "thr_1",
   reviewThreadArchived: false,
+  stack: null,
 };
 
 const REVIEW: ReviewDto = {
@@ -194,7 +195,7 @@ function clickTab(element: HTMLElement): void {
 function rpc(overrides: Record<string, unknown> = {}) {
   return {
     status: () => READY,
-    listPullRequests: () => ({ pullRequests: [PR] }),
+    listPullRequests: () => ({ stacks: [], stackmates: [], pullRequests: [PR] }),
     getPullRequest: () => ({
       pullRequest: PR,
       review: REVIEW,
@@ -280,6 +281,41 @@ describe("the pull request list", () => {
     slot.lifecycle.unmount();
   });
 
+  it("draws a stack top first, folding away the members the filter left out", async () => {
+    const bottom = { ...PR, number: 1, title: "Bottom change", reviewRequests: [] };
+    const middle = { ...PR, number: 2, title: "Middle change" };
+    const top = { ...PR, number: 3, title: "Top change", reviewRequests: [] };
+    const lone = { ...PR, number: 9, title: "Lone change" };
+    const app = await load();
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: rpc({
+          listPullRequests: () => ({
+            fetchedAt: "",
+            pullRequests: [lone, middle],
+            stacks: [[3, 2, 1]],
+            stackmates: [bottom, top],
+          }),
+        }),
+      },
+    );
+    const stack = await slot.findByRole("region", { name: "Stack of 3 pull requests: Bottom change" });
+    expect(stack.textContent).toContain("Middle change");
+    expect(stack.textContent).not.toContain("Top change");
+    expect(slot.getByText("Lone change").closest("section")).toBeNull();
+
+    fireEvent.click(slot.getByRole("button", { name: /1 more in this stack: #3/ }));
+    const titles = Array.from(stack.querySelectorAll("span.font-medium")).map((node) => node.textContent);
+    // The header names the stack after its bottom pull request, then the rows run top down.
+    expect(titles).toEqual(["Bottom change", "Top change", "Middle change", "Bottom change"]);
+
+    fireEvent.click(slot.getByRole("button", { name: /Stack of 3/ }));
+    expect(stack.textContent).not.toContain("Middle change");
+    slot.lifecycle.unmount();
+  });
+
   it("asks for the direct-request filter first", async () => {
     const app = await load();
     const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc() });
@@ -294,7 +330,7 @@ describe("the pull request list", () => {
     const slot = renderSlot(
       app.navPanels[0]!,
       { subPath: "" },
-      { rpc: rpc({ listPullRequests: () => ({ fetchedAt: "", pullRequests: [] }) }) },
+      { rpc: rpc({ listPullRequests: () => ({ fetchedAt: "", stacks: [], stackmates: [], pullRequests: [] }) }) },
     );
     const allTab = (await slot.findByText("All open")).closest("button") as HTMLElement;
     fireEvent.mouseDown(allTab);
@@ -309,7 +345,7 @@ describe("the pull request list", () => {
     const slot = renderSlot(
       app.navPanels[0]!,
       { subPath: "" },
-      { rpc: rpc({ listPullRequests: () => ({ pullRequests: [] }) }) },
+      { rpc: rpc({ listPullRequests: () => ({ stacks: [], stackmates: [], pullRequests: [] }) }) },
     );
     await slot.findByText("Nothing to review");
     slot.lifecycle.unmount();
@@ -1253,7 +1289,7 @@ describe("the Mine tab", () => {
     const slot = renderSlot(
       app.navPanels[0]!,
       { subPath: "" },
-      { rpc: rpc({ listPullRequests: () => ({ fetchedAt: "", pullRequests: [] }) }) },
+      { rpc: rpc({ listPullRequests: () => ({ fetchedAt: "", stacks: [], stackmates: [], pullRequests: [] }) }) },
     );
     clickTab((await slot.findByText("Mine")).closest("button") as HTMLElement);
     await slot.findByText("You have no open pull requests in this repo.");
@@ -1430,7 +1466,7 @@ describe("starting and opening a review from the home screen", () => {
     // The server records the review and announces it, so every later list has it.
     let pullRequest = { ...PR, reviewStatus: "none", openFindings: 0 };
     const slot = home(app, {
-      listPullRequests: () => ({ pullRequests: [pullRequest] }),
+      listPullRequests: () => ({ stacks: [], stackmates: [], pullRequests: [pullRequest] }),
       startReview: () => {
         pullRequest = { ...PR, reviewStatus: "running", openFindings: 0 };
         return { review: REVIEW };
@@ -1463,7 +1499,7 @@ describe("starting and opening a review from the home screen", () => {
     const app = await load();
     const slot = home(app, {
       listPullRequests: () => ({
-        pullRequests: [{ ...PR, reviewStatus: "none", openFindings: 0 }],
+        stacks: [], stackmates: [], pullRequests: [{ ...PR, reviewStatus: "none", openFindings: 0 }],
       }),
       startReview: () => {
         throw new Error("GitHub is not reachable");
@@ -1499,7 +1535,7 @@ describe("starting and opening a review from the home screen", () => {
     const app = await load();
     const slot = home(app, {
       listPullRequests: () => ({
-        pullRequests: [{ ...PR, reviewThreadId: "thr_old", reviewThreadArchived: true }],
+        stacks: [], stackmates: [], pullRequests: [{ ...PR, reviewThreadId: "thr_old", reviewThreadArchived: true }],
       }),
     });
     await slot.findByText("Start review");

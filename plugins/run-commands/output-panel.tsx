@@ -11,7 +11,7 @@ import { OUTPUT_ADDED, RUNS_CHANGED } from "./channels";
 import { messageOf } from "./errors";
 import type { RunSummary } from "./runs";
 import type { rpcContract } from "./server";
-import { displayText } from "./terminal-text";
+import { displayText, splitLinks } from "./terminal-text";
 
 // Realtime payloads arrive as untyped JSON; these are the fields we filter on.
 const runsChangedSchema = z.object({ threadId: z.string() });
@@ -102,7 +102,33 @@ function RunOutput({ threadId, runId }: { threadId: string; runId: string }) {
       {output.trimmed ? (
         <span className="text-muted-foreground">{"(earlier output was dropped to save space)\n"}</span>
       ) : null}
-      {shown === "" ? <span className="text-muted-foreground">No output yet.</span> : shown}
+      {shown === "" ? (
+        <span className="text-muted-foreground">No output yet.</span>
+      ) : (
+        splitLinks(shown).map(({ text, url }, index) =>
+          url === undefined ? (
+            text
+          ) : (
+            <a
+              key={index}
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-primary underline underline-offset-2 hover:opacity-80"
+              onClick={(event) => {
+                // The side panel's browser can reach the workspace's machine,
+                // so `localhost` means what the command meant by it.
+                event.preventDefault();
+                rpc.call("open_link", { threadId, url }).catch((cause) =>
+                  toast.error(messageOf(cause)),
+                );
+              }}
+            >
+              {text}
+            </a>
+          ),
+        )
+      )}
       {error === null ? null : <span className="text-destructive">{`\n${error}`}</span>}
     </pre>
   );
