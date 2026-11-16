@@ -13,6 +13,8 @@ import {
   buildReviewPrompt,
   awaitsReviewFrom,
   filterPullRequests,
+  groupIntoStacks,
+  parseStackEntries,
   parsePullRequests,
   parseReport,
   parseRepoList,
@@ -45,6 +47,7 @@ function pr(overrides: Partial<PullRequest>): PullRequest {
     headRefName: "feature",
     labels: [],
     reviewRequests: [],
+    stack: null,
     ...overrides,
   };
 }
@@ -230,6 +233,49 @@ describe("buildReviewPrompt", () => {
     const prompt = buildReviewPrompt({ ...base, skills: [] });
     expect(prompt).toContain("correctness bugs");
     expect(prompt).not.toContain("skill`");
+  });
+});
+
+describe("parseStackEntries", () => {
+  it("reads each stacked pull request's stack and position, and skips the rest", () => {
+    const raw = JSON.stringify({
+      data: { repository: { pullRequests: { nodes: [
+        { number: 4, stack: { number: 9 }, stackEntry: { position: 1 } },
+        { number: 5, stack: null, stackEntry: null },
+        null,
+      ] } } },
+    });
+    expect([...parseStackEntries(raw)]).toEqual([[4, { number: 9, position: 1 }]]);
+  });
+});
+
+describe("groupIntoStacks", () => {
+  const branch = (number: number, headRefName: string, baseRefName: string) =>
+    ({ number, headRefName, baseRefName, stack: null });
+
+  it("chains pull requests by base and head branch, top of the stack first", () => {
+    expect(groupIntoStacks([branch(1, "a", "main"), branch(3, "c", "b"), branch(2, "b", "a")]))
+      .toEqual([[3, 2, 1]]);
+  });
+
+  it("makes a lone pull request a stack of one", () => {
+    expect(groupIntoStacks([branch(1, "a", "main"), branch(2, "b", "main")])).toEqual([[1], [2]]);
+  });
+
+  it("puts every branch of a fork in the same stack", () => {
+    expect(groupIntoStacks([branch(1, "a", "main"), branch(2, "b", "a"), branch(3, "c", "a")]))
+      .toEqual([[3, 2, 1]]);
+  });
+
+  it("does not lose branches based on each other in a loop", () => {
+    expect(groupIntoStacks([branch(1, "a", "b"), branch(2, "b", "a")]).flat().sort()).toEqual([1, 2]);
+  });
+
+  it("takes GitHub's stack and its order over the branches", () => {
+    const stacked = (number: number, position: number) =>
+      ({ ...branch(number, `x${number}`, "main"), stack: { number: 7, position } });
+    expect(groupIntoStacks([stacked(5, 1), stacked(6, 3), stacked(4, 2), branch(8, "z", "main")]))
+      .toEqual([[6, 4, 5], [8]]);
   });
 });
 

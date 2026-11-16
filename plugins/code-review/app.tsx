@@ -463,6 +463,122 @@ function PrRow({
   );
 }
 
+/**
+ * Pull requests that build on each other, drawn as one unit from the top of
+ * the stack down, the way the PR manager plugin draws them. Only the ones the
+ * filter picks show; each run of the others folds into a row that brings them
+ * back, dimmed so the ones you were asked about still stand out.
+ */
+function PrStackGroup({
+  prs,
+  shown,
+  renderRow,
+}: {
+  prs: PullRequestDto[];
+  shown: Set<number>;
+  renderRow: (pr: PullRequestDto) => ReactNode;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [showingAll, setShowingAll] = useState(false);
+  const hiddenCount = prs.filter((pr) => !shown.has(pr.number)).length;
+  // Named after its bottom pull request, as GitHub names a stack.
+  const base = prs[prs.length - 1]!;
+  const runs: Array<
+    { kind: "pr"; pr: PullRequestDto; matched: boolean } | { kind: "hidden"; prs: PullRequestDto[] }
+  > = [];
+  for (const pr of prs) {
+    const matched = shown.has(pr.number);
+    const last = runs.at(-1);
+    if (matched || showingAll) runs.push({ kind: "pr", pr, matched });
+    else if (last?.kind === "hidden") last.prs.push(pr);
+    else runs.push({ kind: "hidden", prs: [pr] });
+  }
+  return (
+    <section
+      aria-label={`Stack of ${prs.length} pull requests: ${base.title}`}
+      className="rounded-lg border border-border bg-muted/40"
+    >
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button
+          type="button"
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed(!collapsed)}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md text-left text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Icon name={collapsed ? "ChevronRight" : "ChevronDown"} className="size-4 shrink-0" />
+          <Icon name="Layers" className="size-4 shrink-0" />
+          <span className="truncate font-medium text-foreground">{base.title}</span>
+          <span className="shrink-0">· Stack of {prs.length}</span>
+        </button>
+        {!collapsed && showingAll && hiddenCount > 0 ? (
+          <button
+            type="button"
+            onClick={() => setShowingAll(false)}
+            className="shrink-0 rounded-md text-xs text-muted-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Show only matching
+          </button>
+        ) : null}
+      </div>
+      {collapsed ? null : (
+        <div className="flex flex-col gap-2 px-2 pb-2">
+          {runs.map((run) =>
+            run.kind === "pr" ? (
+              <div
+                key={run.pr.number}
+                className={cn(
+                  !run.matched &&
+                    "opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100",
+                )}
+              >
+                {renderRow(run.pr)}
+              </div>
+            ) : (
+              <button
+                key={run.prs[0]!.number}
+                type="button"
+                onClick={() => setShowingAll(true)}
+                className="flex w-full items-center gap-2 rounded-md border border-dashed border-border px-3 py-1.5 text-left text-xs text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Icon name="MoreHorizontal" className="size-4" />
+                {run.prs.length} more in this stack: {run.prs.map((pr) => `#${pr.number}`).join(", ")}
+              </button>
+            ),
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * The list as it is drawn: each pull request in the server's order, except
+ * that one in a stack brings its whole stack in at its place, so a stack sorts
+ * by its most recently updated member and moves as a unit.
+ */
+type ListItem = { kind: "pr"; pr: PullRequestDto } | { kind: "stack"; prs: PullRequestDto[] };
+
+function arrangeList(
+  pullRequests: PullRequestDto[],
+  stacks: number[][],
+  stackmates: PullRequestDto[],
+): ListItem[] {
+  const byNumber = new Map([...pullRequests, ...stackmates].map((pr) => [pr.number, pr]));
+  const stackOf = new Map<number, number[]>();
+  for (const stack of stacks) for (const number of stack) stackOf.set(number, stack);
+  const placed = new Set<number[]>();
+  const items: ListItem[] = [];
+  for (const pr of pullRequests) {
+    const stack = stackOf.get(pr.number);
+    if (stack === undefined) items.push({ kind: "pr", pr });
+    else if (!placed.has(stack)) {
+      placed.add(stack);
+      items.push({ kind: "stack", prs: stack.flatMap((number) => byNumber.get(number) ?? []) });
+    }
+  }
+  return items;
+}
+
 function PrListView({
   rpc,
   repo,
@@ -493,7 +609,7 @@ function PrListView({
   const { data, error, isLoading, refetch } = useLiveQuery(
     async () =>
       repo === null
-        ? { fetchedAt: "", pullRequests: [] as PullRequestDto[] }
+        ? { fetchedAt: "", pullRequests: [] as PullRequestDto[], stacks: [], stackmates: [] }
         : rpc.call("listPullRequests", { repo, filter }),
     [rpc, repo, filterKey],
   );
@@ -506,6 +622,22 @@ function PrListView({
       .then(() => refetch(), reportError)
       .finally(() => setIsRefreshing(false));
   }, [repo, rpc, filter, refetch]);
+
+  const shownNumbers = useMemo(
+    () => new Set((data?.pullRequests ?? []).map((pr) => pr.number)),
+    [data],
+  );
+  const renderRow = (pr: PullRequestDto) => (
+    <PrRow
+      key={pr.number}
+      pr={pr}
+      onStart={() => onStartReview(pr.repo, pr.number)}
+      onOpen={() => onOpenReview(pr.repo, pr.number)}
+      onOpenArchivedThread={() => {
+        if (pr.reviewThreadId !== null) onOpenArchivedThread(pr.reviewThreadId);
+      }}
+    />
+  );
 
   return (
     <div className="flex flex-col gap-3">
@@ -634,17 +766,18 @@ function PrListView({
         />
       ) : (
         <div className="flex flex-col gap-2">
-          {data.pullRequests.map((pr) => (
-            <PrRow
-              key={pr.number}
-              pr={pr}
-              onStart={() => onStartReview(pr.repo, pr.number)}
-              onOpen={() => onOpenReview(pr.repo, pr.number)}
-              onOpenArchivedThread={() => {
-                if (pr.reviewThreadId !== null) onOpenArchivedThread(pr.reviewThreadId);
-              }}
-            />
-          ))}
+          {arrangeList(data.pullRequests, data.stacks, data.stackmates).map((item) =>
+            item.kind === "pr" ? (
+              renderRow(item.pr)
+            ) : (
+              <PrStackGroup
+                key={`stack-${item.prs[item.prs.length - 1]!.number}`}
+                prs={item.prs}
+                shown={shownNumbers}
+                renderRow={renderRow}
+              />
+            ),
+          )}
         </div>
       )}
     </div>
