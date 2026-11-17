@@ -49,24 +49,15 @@ export const findingSchema = z.object({
 });
 export type Finding = z.infer<typeof findingSchema>;
 
-/**
- * Something in the change worth a reviewer's attention that is not a problem:
- * the heart of the change, a design decision, a behaviour that shifts. It is
- * never posted anywhere — it exists to tell the reviewer where to look.
- */
-export const highlightSchema = z.object({
-  title: z.string().trim().min(1),
-  /** What is happening there and why it deserves a look. */
-  summary: z.string().trim().min(1),
-  /** The code doing it. A highlight with nothing to show is not one. */
-  locations: z.array(referenceSchema).min(1),
-});
-export type Highlight = z.infer<typeof highlightSchema>;
-
 export const reportSchema = z.object({
-  summary: z.string().trim(),
+  /**
+   * Markdown for the reviewer, never posted: the change at a glance, as a few
+   * bold-led bullets. Empty when the agent wrote none.
+   */
+  overview: z.string().trim(),
+  /** The same story in full, each point with the code that makes it. */
+  overviewDetails: z.string().trim(),
   findings: z.array(findingSchema),
-  highlights: z.array(highlightSchema),
 });
 export type Report = z.infer<typeof reportSchema>;
 
@@ -162,28 +153,6 @@ function normalizeReferences(input: unknown): Reference[] {
   return references;
 }
 
-/** Coerce one agent-written highlight, accepting the same spelling slips as findings. */
-export function normalizeHighlight(input: unknown): unknown {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    return input;
-  }
-  const row = input as Record<string, unknown>;
-  return {
-    title: firstString(row, ["title", "headline"]),
-    summary: firstString(row, ["summary", "description", "gist"]),
-    locations: normalizeReferences(
-      row.locations ?? row.references ?? row.snippets ?? row.files,
-    ),
-  };
-}
-
-/** Why an entry failed validation, as one line for the agent to act on. */
-function describeIssues(error: z.ZodError): string {
-  return error.issues
-    .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
-    .join("; ");
-}
-
 export interface ParsedReport {
   report: Report | null;
   /** Human-readable reasons individual findings or the whole file were rejected. */
@@ -225,34 +194,27 @@ export function parseReport(raw: string): ParsedReport {
     if (result.success) {
       findings.push(result.data);
     } else {
-      errors.push(`finding ${index + 1} dropped — ${describeIssues(result.error)}`);
+      const detail = result.error.issues
+        .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+        .join("; ");
+      errors.push(`finding ${index + 1} dropped — ${detail}`);
     }
   });
-  // Highlights are optional: a report written before they existed, or one
-  // with nothing worth pointing at, is still a whole report.
-  const rawHighlights = envelope.highlights ?? envelope.notable ?? [];
-  const highlights: Highlight[] = [];
-  if (!Array.isArray(rawHighlights)) {
-    errors.push('"highlights" dropped — expected an array');
-  } else {
-    rawHighlights.forEach((entry, index) => {
-      const result = highlightSchema.safeParse(normalizeHighlight(entry));
-      if (result.success) {
-        highlights.push(result.data);
-      } else {
-        errors.push(`highlight ${index + 1} dropped — ${describeIssues(result.error)}`);
-      }
-    });
-  }
   return {
-    report: { summary: str(envelope.summary), findings, highlights },
+    // `summary` is what a report written before overviews existed called it.
+    report: {
+      overview: str(envelope.overview ?? envelope.summary),
+      overviewDetails: str(envelope.overviewDetails),
+      findings,
+    },
     errors,
   };
 }
 
 /** The schema text embedded in the prompt and printed by `bb code-review schema`. */
 export const FINDINGS_SCHEMA_TEXT = `{
-  "summary": "one paragraph on the change overall",
+  "overview": "Markdown: 3-5 bold-led bullets, the change at a glance. See below.",
+  "overviewDetails": "Markdown: the same points in full, each with a small code snippet. See below.",
   "findings": [
     {
       "file": "src/server/auth.ts",       // FULL repo-relative path, never a bare filename
@@ -269,17 +231,6 @@ export const FINDINGS_SCHEMA_TEXT = `{
         { "file": "src/server/session.ts",  // full repo-relative path here too
           "startLine": 88, "endLine": 92,
           "note": "the comparison this one should match" }
-      ]
-    }
-  ],
-  "highlights": [                          // what the reviewer should look at; not problems
-    {
-      "title": "Sessions now expire server-side",
-      "summary": "What is happening here and why a reviewer should look at it. Two sentences at most.",
-      "locations": [                       // the code doing it, at least one
-        { "file": "src/server/session.ts", // full repo-relative path
-          "startLine": 40, "endLine": 61,
-          "note": "the new expiry check" }
       ]
     }
   ]
@@ -416,29 +367,67 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "should have caught it. Leave out anything the reader would not open.",
     "",
     "**Every path must be the full repo-relative path** — `e2e-tests/tests/login.spec.ts`,",
-    "never `login.spec.ts`. That applies to `file`, to every `references` and highlight",
-    "`locations` entry, and to any `path:line` you cite in your prose. Submitting is rejected if a path is not a real file",
+    "never `login.spec.ts`. That applies to `file`, to every `references` entry, and to any",
+    "`path:line` you cite in your prose, the overview included. Submitting is rejected if a path is not a real file",
     "in the repository, so use `bb code-review files` or the diff to check one you are unsure of.",
     "",
-    "## Point out what is worth a look",
+    "## Write the overview",
     "",
-    "`highlights` is for the reviewer, and is never posted. Findings say what is wrong;",
-    "highlights say where to spend attention — the parts of the change a careful reviewer",
-    "would want to read closely even if nothing there is broken:",
+    "The overview is for the reviewer, and is never posted. It is the first thing they read,",
+    "before any issue: the clearest possible account of what this pull request does and how.",
+    "It comes in two parts, both Markdown, and both made of bullets that open with a short",
+    "**bold clause** saying the point, followed by the detail. No paragraphs of prose.",
     "",
-    "- the heart of the change, where the new behaviour actually lives",
-    "- a design decision, a new abstraction, or a contract that other code now depends on",
-    "- a behaviour that changes for existing callers, or something deleted that did a job",
-    "- subtle or risky code: concurrency, caching, migrations, auth, error handling",
+    "`overview` is the condensed version, always on screen: three to five bullets, one or two",
+    "lines each. The first says what the change does for a user or caller; the rest say how.",
+    "Inline code (`like this`) for the one name that matters is fine; code blocks are not.",
     "",
-    "Each has a `title`, a `summary` of one or two sentences saying what is happening there",
-    "and why it deserves a look, and `locations` — the code doing it, in the same shape as",
-    "`references`, with a one-line `note` each. The panel shows that code under the summary,",
-    "so point at the lines themselves rather than describing them.",
+    "`overviewDetails` opens when the reviewer clicks the overview. Take the same points in",
+    "the same order and give each one the code that makes it: a bullet, then a small",
+    "snippet — usually three to eight lines, never more than about twelve — copied from the",
+    "checkout, with its full repo-relative `path:line` on the line above. Cut each snippet to",
+    "the lines that make the point and mark cuts with `// …`. Use a ```diff block when the",
+    "point is a line that changed meaning. Add a bullet of context where it helps the",
+    "reviewer judge the approach: how the code behaved before, whether this is the usual way",
+    "to do it, the obvious alternative. Keep it to a screenful.",
     "",
-    "Aim for two to six, in the order you would read them. Skip the routine — renames,",
-    "boilerplate, test fixtures — and do not repeat a finding here: if it is a problem, it",
-    "belongs in `findings`. A highlight is not praise or criticism, just a pointer.",
+    "Pick code that explains the change — the new core function, the changed condition, the",
+    "contract other code now depends on — not boilerplate, renames or tests. Describe; do not",
+    "judge. Problems belong in `findings`, and nothing in the overview should read like one.",
+    "",
+    "For example, `overview`:",
+    "",
+    "```markdown",
+    "- **Sessions now expire on the server.** A token idle past its limit is rejected even",
+    "  if the browser still holds it.",
+    "- **Every request checks last-seen time** in `loadSession`, then refreshes it.",
+    "- **Before, expiry lived only in the cookie**, so a copied token never expired.",
+    "```",
+    "",
+    "and `overviewDetails`:",
+    "",
+    "````markdown",
+    "- **Sessions now expire on the server.** A token idle longer than `IDLE_LIMIT_MS` is",
+    "  deleted and the request is treated as signed out.",
+    "",
+    "  `src/server/session.ts:44`",
+    "  ```ts",
+    "  if (now - session.lastSeenAt > IDLE_LIMIT_MS) {",
+    "    await sessions.delete(session.id);",
+    "    return null;",
+    "  }",
+    "  ```",
+    "",
+    "- **Every request refreshes last-seen time**, so active users are never cut off.",
+    "",
+    "  `src/server/session.ts:52`",
+    "  ```ts",
+    "  await sessions.touch(session.id, now);",
+    "  ```",
+    "",
+    "- **This is the usual sliding-expiry pattern.** It costs one write per request, which",
+    "  the store already batches.",
+    "````",
     "",
     "## 4. Submit them",
     "",
@@ -473,7 +462,7 @@ export function buildReviewPrompt(args: ReviewPromptArgs): string {
     "  reviewed and posted by hand from the Code Review panel.",
     "- Do NOT modify the PR, push commits, or edit files in the checkout.",
     "- If you find nothing, still submit a file with an empty `findings` array — and still",
-    "  include the `highlights`, which are worth having on a clean change too.",
+    "  write the overview, which is worth having on a clean change too.",
   ]
     // Only the conditional lines above are dropped; the literal blank strings
     // are the paragraph breaks that make this render as Markdown.
@@ -1393,32 +1382,6 @@ export function findingLocations(
   for (const citation of extractCitations(prose)) {
     locations.push({ ...citation, note: "", isPrimary: false });
   }
-  return dedupeLocations(locations, resolvePath);
-}
-
-/**
- * Every place a highlight points at: its own locations, in the order the agent
- * gave them, then anything its summary cites in prose. None is primary — a
- * highlight anchors nowhere, it only shows code.
- */
-export function highlightLocations(
-  highlight: { summary: string; locations: Reference[] },
-  resolvePath: (file: string) => string = (file) => file,
-): FindingLocation[] {
-  const locations: FindingLocation[] = highlight.locations.map((location) => ({
-    ...location,
-    isPrimary: false,
-  }));
-  for (const citation of extractCitations(highlight.summary)) {
-    locations.push({ ...citation, note: "", isPrimary: false });
-  }
-  return dedupeLocations(locations, resolvePath);
-}
-
-function dedupeLocations(
-  locations: FindingLocation[],
-  resolvePath: (file: string) => string,
-): FindingLocation[] {
   const seen = new Set<string>();
   return locations
     .map((location) => ({ ...location, file: resolvePath(location.file) }))
@@ -1582,8 +1545,8 @@ export function needsPathResolution(file: string, knownPaths: readonly string[])
 
 /** A finding path that does not name a real file in the repository. */
 export interface BadPath {
-  /** Which entry of the submitted file, e.g. "finding 2" or "highlight 1". */
-  entry: string;
+  /** 1-based index of the finding in the submitted file. */
+  finding: number;
   field: string;
   file: string;
   candidates: string[];
@@ -1597,30 +1560,25 @@ export interface BadPath {
  * than leaving the panel to guess later.
  */
 export function findBadPaths(
-  report: { findings: readonly Finding[]; highlights: readonly Highlight[] },
+  findings: readonly Finding[],
   repoPaths: readonly string[],
 ): BadPath[] {
   if (repoPaths.length === 0) return [];
   const known = new Set(repoPaths);
   const bad: BadPath[] = [];
-  const check = (entry: string, field: string, file: string) => {
+  const check = (index: number, field: string, file: string) => {
     if (known.has(file)) return;
     bad.push({
-      entry,
+      finding: index + 1,
       field,
       file,
       candidates: citationCandidates(file, repoPaths).slice(0, 5),
     });
   };
-  report.findings.forEach((finding, index) => {
-    check(`finding ${index + 1}`, "file", finding.file);
+  findings.forEach((finding, index) => {
+    check(index, "file", finding.file);
     finding.references.forEach((reference, refIndex) => {
-      check(`finding ${index + 1}`, `references[${refIndex}].file`, reference.file);
-    });
-  });
-  report.highlights.forEach((highlight, index) => {
-    highlight.locations.forEach((location, locIndex) => {
-      check(`highlight ${index + 1}`, `locations[${locIndex}].file`, location.file);
+      check(index, `references[${refIndex}].file`, reference.file);
     });
   });
   return bad;
@@ -1639,7 +1597,7 @@ export function formatBadPaths(bad: readonly BadPath[]): string {
           : entry.candidates.length > 1
             ? `  -> could be: ${entry.candidates.join(", ")}`
             : "  -> no file with that name exists at this commit";
-      return `${entry.entry}, ${entry.field}: ${entry.file}\n${suggestion}`;
+      return `finding ${entry.finding}, ${entry.field}: ${entry.file}\n${suggestion}`;
     }),
     "",
     "Fix the paths and submit again.",

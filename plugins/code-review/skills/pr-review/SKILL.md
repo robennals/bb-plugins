@@ -83,35 +83,37 @@ Each finding has these parts, and they are not interchangeable:
   numbers only when commenting on a deleted line. A finding with no line
   anchors still works — it posts as a general PR comment instead.
 
-## Pointing out what is worth a look
+## The overview
 
-Beside `findings`, the file has a `highlights` array. Findings say what is
-wrong; highlights tell the reviewer where to spend attention — the parts of the
-change worth reading closely even if nothing there is broken:
+Beside `findings`, the file has the overview: Markdown the reviewer reads
+before any issue, and never posted — the clearest possible account of what
+the pull request does and how. Both parts are bullets that open with a short
+**bold clause** stating the point, then the detail; no paragraphs.
 
-- the heart of the change, where the new behaviour actually lives
-- a design decision, a new abstraction, or a contract other code now depends on
-- a behaviour that changes for existing callers, or a deletion that did a job
-- subtle or risky code: concurrency, caching, migrations, auth, error handling
+- **`overview`** — the condensed version, always on screen. Three to five
+  bullets of a line or two: first what the change does for a user or caller,
+  then how. Inline code for a key name is fine; code blocks are not.
+- **`overviewDetails`** — opens when the reviewer clicks the overview. The
+  same points in the same order, each followed by a small snippet copied from
+  the checkout (usually three to eight lines, never more than about twelve),
+  with its full `path:line` on the line above. Trim to the lines that make the
+  point, mark cuts with `// …`, and use a `diff` block for a line that changed
+  meaning. Add a context bullet where it helps judge the approach: how the
+  code behaved before, whether this is the usual way, the obvious alternative.
+  Keep it to a screenful.
 
-Each is `{ title, summary, locations }`. `summary` is one or two sentences on
-what is happening there and why it deserves a look; `locations` is the code
-doing it, in the same `{ file, startLine, endLine, note }` shape as
-`references`, at least one. The panel shows that code under the summary.
-
-Aim for two to six, in reading order. Skip the routine — renames, boilerplate,
-fixtures — and never repeat a finding as a highlight. Highlights are never
-posted, and are neither praise nor criticism: just a pointer.
+Describe; do not judge: problems go in `findings`, and nothing in the
+overview should read like one.
 
 Report only what you verified against the code. A finding you cannot point at
 a specific file and line for is not worth the user's time to triage. If you
 find nothing, submit a file with an empty `findings` array — that is a
-meaningful result, not a failure — and still include the `highlights`.
+meaningful result, not a failure — and still write the overview.
 
 ## Paths must be full and real
 
-Every path you write — `file`, every `references` and highlight `locations`
-entry, and any `path:line` you cite in prose — must be the **full repo-relative path**:
+Every path you write — `file`, every `references` entry, and any `path:line`
+you cite in prose — must be the **full repo-relative path**:
 
 ```
 e2e-tests/tests/login.spec.ts:28     yes

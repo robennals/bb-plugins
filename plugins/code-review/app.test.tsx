@@ -2,7 +2,7 @@
 import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { describe, expect, it, vi } from "vitest";
-import type { FindingDto, HighlightDto, PullRequestDto, QuestionDto, ReviewDto } from "./server";
+import type { FindingDto, QuestionDto, PullRequestDto, ReviewDto } from "./server";
 
 /**
  * BB rebuilds `useBbNavigate()`'s object whenever anything it closes over
@@ -63,7 +63,8 @@ const REVIEW: ReviewDto = {
   number: 7,
   title: "Add a thing",
   status: "reported",
-  summary: "",
+  overview: "",
+  overviewDetails: "",
   error: null,
   threadId: "thr_1",
   findingsPath: "/w/f.json",
@@ -165,25 +166,6 @@ const CODE = {
   ],
 };
 
-const HIGHLIGHT: HighlightDto = {
-  id: "h1",
-  reviewId: "acme/app#7",
-  title: "Retries moved into the client",
-  summary: "Every caller now goes through one retry loop.",
-  locations: [
-    { file: "src/a.ts", startLine: 10, endLine: 12, note: "the new loop" },
-    { file: "src/other.ts", startLine: 20, endLine: 20, note: "the pattern this should match" },
-  ],
-};
-
-/** CODE's locations, as a highlight's: none of them is an anchor. */
-const HIGHLIGHT_CODE = {
-  ...CODE,
-  headSha: "sha7",
-  isReviewedCommit: true,
-  locations: CODE.locations.map((location) => ({ ...location, isPrimary: false })),
-};
-
 /** The panel's RPC surface, with per-test overrides. */
 /** Radix tabs activate on mousedown, not click. */
 function clickTab(element: HTMLElement): void {
@@ -200,11 +182,9 @@ function rpc(overrides: Record<string, unknown> = {}) {
       pullRequest: PR,
       review: REVIEW,
       findings: [FINDING],
-      highlights: [],
       hasPendingReview: false,
     }),
     getFindingCode: () => CODE,
-    getHighlightCode: () => HIGHLIGHT_CODE,
     askAboutFinding: () => ({ threadId: REVIEW.threadId }),
     startReview: () => ({ review: REVIEW }),
     openReview: () => ({ threadId: "thr_1", review: REVIEW }),
@@ -1371,69 +1351,61 @@ describe("the review tab", () => {
   });
 });
 
-describe("highlights on the review tab", () => {
-  const withHighlight = {
+describe("the overview on the review tab", () => {
+  const withOverview = (overview: string, overviewDetails = "") => ({
     getPullRequest: () => ({
       pullRequest: PR,
-      review: REVIEW,
+      review: { ...REVIEW, overview, overviewDetails },
       findings: [FINDING],
-      highlights: [HIGHLIGHT],
       hasPendingReview: false,
     }),
-  };
+  });
 
-  it("lists what is worth a look above the issues, with the files involved", async () => {
+  it("shows the condensed overview above the issues", async () => {
     const app = await load();
-    const slot = reviewTab(app, withHighlight);
-    const title = await slot.findByText("Retries moved into the client");
-    await slot.findByText("Worth a look (1)");
-    await slot.findByText("src/a.ts, src/other.ts");
+    const slot = reviewTab(app, withOverview("- **Retries move into the client.**"));
+    // The test harness renders Markdown as its source text.
+    const brief = await slot.findByText("- **Retries move into the client.**");
     const issue = await slot.findByText("Off by one");
-    // Orientation first: the highlight precedes the first issue on the page.
-    expect(
-      title.compareDocumentPosition(issue) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    // What it does comes before what is wrong with it.
+    expect(brief.compareDocumentPosition(issue) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Nothing more to open, so nothing offers to open it.
+    expect(slot.queryByLabelText("Open the overview's details")).toBeNull();
     slot.lifecycle.unmount();
   });
 
-  it("has no section at all when the review pointed nothing out", async () => {
+  it("opens the details, code and all, from the condensed card, and back", async () => {
+    const app = await load();
+    const slot = reviewTab(
+      app,
+      withOverview(
+        "- **Retries move into the client.**",
+        "- **Retries move into the client.**\n\n  ```ts\n  await retry(call);\n  ```",
+      ),
+    );
+    fireEvent.click(await slot.findByLabelText("Open the overview's details"));
+    const details = await slot.findByText(/await retry\(call\);/);
+    expect(details.textContent).toContain("- **Retries move into the client.**");
+    expect(slot.queryByText("Off by one")).toBeNull();
+
+    fireEvent.click(slot.getByText("All issues"));
+    await slot.findByText("Off by one");
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the details from the keyboard too", async () => {
+    const app = await load();
+    const slot = reviewTab(app, withOverview("- **Brief.**", "- **In full.**"));
+    fireEvent.keyDown(await slot.findByLabelText("Open the overview's details"), { key: "Enter" });
+    await slot.findByText("- **In full.**");
+    slot.lifecycle.unmount();
+  });
+
+  it("has no section at all when the review wrote none", async () => {
     const app = await load();
     const slot = reviewTab(app);
     await slot.findByText("Off by one");
-    expect(slot.queryByText(/Worth a look/)).toBeNull();
-    slot.lifecycle.unmount();
-  });
-
-  it("opens a highlight to its summary and the code doing it, and back", async () => {
-    const app = await load();
-    const slot = reviewTab(app, withHighlight);
-    fireEvent.click(await slot.findByText("Retries moved into the client"));
-    await slot.findByText("Back to review");
-    await slot.findByText("Every caller now goes through one retry loop.");
-    // Both snippets, each with its own note, and nothing to post.
-    await slot.findByText("const x = 1;");
-    await slot.findByText("retry(() => run());");
-    await slot.findByText("the pattern this should match");
-    expect(slot.queryByText("Post comment")).toBeNull();
-    const call = slot.inspection.rpcCalls.find((entry) => entry.method === "getHighlightCode");
-    expect(call?.input).toEqual({ highlightId: "h1", context: 3 });
-
-    fireEvent.click(slot.getByText("Back to review"));
-    await slot.findByText("Worth a look (1)");
-    slot.lifecycle.unmount();
-  });
-
-  it("asks for more context around every snippet at once", async () => {
-    const app = await load();
-    const slot = reviewTab(app, withHighlight);
-    fireEvent.click(await slot.findByText("Retries moved into the client"));
-    fireEvent.click(await slot.findByText("More context (±25)"));
-    await waitFor(() => {
-      const calls = slot.inspection.rpcCalls.filter(
-        (entry) => entry.method === "getHighlightCode",
-      );
-      expect(calls.at(-1)?.input).toEqual({ highlightId: "h1", context: 25 });
-    });
+    expect(slot.queryByText("Overview")).toBeNull();
     slot.lifecycle.unmount();
   });
 });
