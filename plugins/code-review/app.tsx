@@ -23,14 +23,7 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type {
-  FindingDto,
-  HighlightDto,
-  PullRequestDto,
-  QuestionDto,
-  ReviewDto,
-  rpcContract,
-} from "./server";
+import type { FindingDto, PullRequestDto, QuestionDto, ReviewDto, rpcContract } from "./server";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
@@ -848,28 +841,38 @@ function QuestionsBadge({ questions }: { questions: QuestionDto[] }) {
 }
 
 /**
- * One thing the review says is worth a look. Deliberately quieter than an
- * issue — no severity, nothing to act on — and it names the files involved,
- * since where the change happens is half of what it is telling you.
+ * The change at a glance. When the review wrote the details too, the whole
+ * card opens them. It is a clickable region rather than a button because the
+ * Markdown inside can hold links and code.
  */
-function HighlightRow({ highlight, onOpen }: { highlight: HighlightDto; onOpen: () => void }) {
-  const files = [...new Set(highlight.locations.map((location) => location.file))];
-  return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="flex w-full flex-col gap-1 rounded-lg border border-border bg-card px-3 py-2.5 text-left transition-colors hover:bg-accent/50"
-    >
-      <div className="flex items-start gap-2">
-        <Icon name="Eye" className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 text-sm font-medium leading-snug">{highlight.title}</span>
-        <Icon name="ChevronRight" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+function OverviewCard({ overview, onOpen }: { overview: string; onOpen: (() => void) | null }) {
+  if (onOpen === null) {
+    return (
+      <div className="rounded-lg border border-border bg-card p-3">
+        <Markdown content={overview} />
       </div>
-      <p className="line-clamp-3 text-xs leading-relaxed text-muted-foreground">
-        {highlight.summary}
-      </p>
-      <p className="truncate font-mono text-[11px] text-muted-foreground/80">{files.join(", ")}</p>
-    </button>
+    );
+  }
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label="Open the overview's details"
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      className="flex cursor-pointer flex-col gap-2 rounded-lg border border-border bg-card p-3 text-left transition-colors hover:bg-accent/50"
+    >
+      <Markdown content={overview} />
+      <span className="flex items-center gap-1 self-end text-xs text-muted-foreground">
+        Details
+        <Icon name="ChevronRight" className="size-3.5" />
+      </span>
+    </div>
   );
 }
 
@@ -926,14 +929,14 @@ function PrFindingsView({
   number,
   skills,
   onOpenFinding,
-  onOpenHighlight,
+  onOpenOverview,
 }: {
   rpc: Rpc;
   repo: string;
   number: number;
   skills: string[];
   onOpenFinding: (findingId: string) => void;
-  onOpenHighlight: (highlightId: string) => void;
+  onOpenOverview: () => void;
 }) {
   const { data, error, isLoading } = useLiveQuery(
     () => rpc.call("getPullRequest", { repo, number }),
@@ -965,7 +968,7 @@ function PrFindingsView({
     );
   }
   const pr = data?.pullRequest ?? null;
-  const highlights = data?.highlights ?? [];
+  const overview = data?.review?.overview ?? "";
   const isEmpty =
     grouped.open.length === 0 && grouped.posted.length === 0 && grouped.dismissed.length === 0;
 
@@ -1033,19 +1036,14 @@ function PrFindingsView({
         skills={data?.review?.skills ?? skills}
       />
 
-      {/* Where to look comes before what is wrong: it is the map the issues
-          below are read against. */}
-      {highlights.length === 0 ? null : (
-        <Section title={`Worth a look (${highlights.length})`}>
-          <div className="flex flex-col gap-2">
-            {highlights.map((highlight) => (
-              <HighlightRow
-                key={highlight.id}
-                highlight={highlight}
-                onOpen={() => onOpenHighlight(highlight.id)}
-              />
-            ))}
-          </div>
+      {/* What the change does comes before what is wrong with it: it is what
+          the issues below are read against. */}
+      {overview === "" ? null : (
+        <Section title="Overview">
+          <OverviewCard
+            overview={overview}
+            onOpen={(data?.review?.overviewDetails ?? "") === "" ? null : onOpenOverview}
+          />
         </Section>
       )}
 
@@ -1243,36 +1241,6 @@ function LocationCard({ location }: { location: LocationDto }) {
         <CodeSnippet location={location} />
       )}
     </div>
-  );
-}
-
-/** Cycles how much code surrounds each snippet: ±3, ±25, ±100, and back. */
-function ContextButton({
-  contextStep,
-  onChange,
-}: {
-  contextStep: number;
-  onChange: (step: number) => void;
-}) {
-  const nextContext = CONTEXT_STEPS[contextStep + 1];
-  return (
-    <Button
-      variant="ghost"
-      size="sm"
-      className="h-7 text-xs"
-      onClick={() => onChange((contextStep + 1) % CONTEXT_STEPS.length)}
-    >
-      {nextContext === undefined ? "Less context" : `More context (±${nextContext})`}
-    </Button>
-  );
-}
-
-function StaleCodeNotice() {
-  return (
-    <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-      This code is the pull request&apos;s current head, not the commit the review ran against —
-      that commit was not recorded. Line numbers may have moved since the review was written.
-    </p>
   );
 }
 
@@ -1767,11 +1735,19 @@ function FindingDetailView({
   const locations: LocationDto[] = code.data?.locations ?? [];
   const primary = locations.find((location) => location.isPrimary);
   const others = locations.filter((location) => !location.isPrimary);
+  const nextContext = CONTEXT_STEPS[contextStep + 1];
   const isStale = code.data !== null && !code.data.isReviewedCommit && locations.length > 0;
 
   const contextButton =
     locations.length === 0 ? null : (
-      <ContextButton contextStep={contextStep} onChange={setContextStep} />
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 text-xs"
+        onClick={() => setContextStep((step) => (step + 1) % CONTEXT_STEPS.length)}
+      >
+        {nextContext === undefined ? "Less context" : `More context (±${nextContext})`}
+      </Button>
     );
 
   return (
@@ -1836,7 +1812,13 @@ function FindingDetailView({
             </p>
             {contextButton}
           </div>
-          {isStale ? <StaleCodeNotice /> : null}
+          {isStale ? (
+            <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              This code is the pull request&apos;s current head, not the commit the review ran
+              against — that commit was not recorded. Line numbers may have moved since the issue
+              was written.
+            </p>
+          ) : null}
           {code.error !== null ? (
             <EmptyState icon="AlertTriangle" title="Could not load the code" detail={code.error} />
           ) : code.isLoading && code.data === null ? (
@@ -1878,101 +1860,6 @@ function FindingDetailView({
   );
 }
 
-/**
- * One highlight: what is happening, then the code doing it. There is nothing
- * to post, so unlike an issue this is only reading matter.
- */
-function HighlightDetailView({
-  rpc,
-  repo,
-  number,
-  highlightId,
-  onBack,
-}: {
-  rpc: Rpc;
-  repo: string;
-  number: number;
-  highlightId: string;
-  onBack: () => void;
-}) {
-  const [contextStep, setContextStep] = useState(0);
-  const context = CONTEXT_STEPS[contextStep] ?? CONTEXT_STEPS[0];
-
-  const pr = useLiveQuery(() => rpc.call("getPullRequest", { repo, number }), [rpc, repo, number]);
-  const code = useLiveQuery(
-    () => rpc.call("getHighlightCode", { highlightId, context }),
-    [rpc, highlightId, context],
-  );
-
-  const highlight = useMemo(
-    () => (pr.data?.highlights ?? []).find((entry) => entry.id === highlightId) ?? null,
-    [pr.data, highlightId],
-  );
-
-  if (pr.isLoading && pr.data === null) {
-    return (
-      <div className="flex flex-col gap-3">
-        <BackButton onBack={onBack} label="Back to review" />
-        <Skeleton className="h-40 w-full rounded-lg" />
-      </div>
-    );
-  }
-  if (highlight === null) {
-    return (
-      <div className="flex flex-col gap-3">
-        <BackButton onBack={onBack} label="Back to review" />
-        <EmptyState
-          icon="Eye"
-          title="This highlight is gone"
-          detail="It was probably replaced by a re-run of the review."
-        />
-      </div>
-    );
-  }
-
-  const locations: LocationDto[] = code.data?.locations ?? [];
-  const isStale = code.data !== null && !code.data.isReviewedCommit && locations.length > 0;
-
-  return (
-    <div className="flex flex-col gap-4">
-      <BackButton onBack={onBack} label="Back to review" />
-
-      <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
-        <div className="flex items-start gap-2">
-          <Icon name="Eye" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-          <h2 className="min-w-0 flex-1 text-sm font-semibold leading-snug">{highlight.title}</h2>
-        </div>
-        <Markdown content={highlight.summary} />
-      </div>
-
-      <Section
-        title={`The code (${highlight.locations.length})`}
-        action={
-          locations.length === 0 ? null : (
-            <ContextButton contextStep={contextStep} onChange={setContextStep} />
-          )
-        }
-      >
-        {isStale ? <StaleCodeNotice /> : null}
-        {code.error !== null ? (
-          <EmptyState icon="AlertTriangle" title="Could not load the code" detail={code.error} />
-        ) : code.isLoading && code.data === null ? (
-          <Skeleton className="h-32 w-full rounded-lg" />
-        ) : (
-          <div className="flex flex-col gap-3">
-            {locations.map((location) => (
-              <LocationCard
-                key={`${location.file}:${location.startLine ?? ""}`}
-                location={location}
-              />
-            ))}
-          </div>
-        )}
-      </Section>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // The review tab, and opening it in a thread
 // ---------------------------------------------------------------------------
@@ -1993,9 +1880,8 @@ function ReviewTab({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const review = useLiveQuery(() => rpc.call("getReviewForThread", { threadId }), [rpc, threadId]);
   const subject = review.data;
-  const [opened, setOpened] = useState<{ kind: "finding" | "highlight"; id: string } | null>(
-    null,
-  );
+  const [openFindingId, setOpenFindingId] = useState<string | null>(null);
+  const [isOverviewOpen, setIsOverviewOpen] = useState(false);
   const status = useLiveQuery(() => rpc.call("status"), [rpc]);
 
   useEffect(() => {
@@ -2013,25 +1899,24 @@ function ReviewTab({ threadId }: { threadId: string }) {
       />
     );
   }
-  if (opened?.kind === "finding") {
+  if (openFindingId !== null) {
     return (
       <FindingDetailView
         rpc={rpc}
         repo={subject.repo}
         number={subject.number}
-        findingId={opened.id}
-        onBack={() => setOpened(null)}
+        findingId={openFindingId}
+        onBack={() => setOpenFindingId(null)}
       />
     );
   }
-  if (opened?.kind === "highlight") {
+  if (isOverviewOpen) {
     return (
-      <HighlightDetailView
+      <OverviewDetailsView
         rpc={rpc}
         repo={subject.repo}
         number={subject.number}
-        highlightId={opened.id}
-        onBack={() => setOpened(null)}
+        onBack={() => setIsOverviewOpen(false)}
       />
     );
   }
@@ -2041,8 +1926,8 @@ function ReviewTab({ threadId }: { threadId: string }) {
       repo={subject.repo}
       number={subject.number}
       skills={status.data?.skills ?? []}
-      onOpenFinding={(id) => setOpened({ kind: "finding", id })}
-      onOpenHighlight={(id) => setOpened({ kind: "highlight", id })}
+      onOpenFinding={setOpenFindingId}
+      onOpenOverview={() => setIsOverviewOpen(true)}
     />
   );
 }
@@ -2088,6 +1973,45 @@ function ReviewThreadHeaderAction({ threadId }: { threadId: string }) {
       <Icon name="Bug" className="size-3.5" />
       Code review
     </Button>
+  );
+}
+
+/** The overview in full: each point with the code that makes it. */
+function OverviewDetailsView({
+  rpc,
+  repo,
+  number,
+  onBack,
+}: {
+  rpc: Rpc;
+  repo: string;
+  number: number;
+  onBack: () => void;
+}) {
+  const { data, isLoading } = useLiveQuery(
+    () => rpc.call("getPullRequest", { repo, number }),
+    [rpc, repo, number],
+  );
+  const details = data?.review?.overviewDetails ?? "";
+  return (
+    <div className="flex flex-col gap-4">
+      <BackButton onBack={onBack} label="All issues" />
+      {isLoading && data === null ? (
+        <Skeleton className="h-40 w-full rounded-lg" />
+      ) : details === "" ? (
+        <EmptyState
+          icon="FileText"
+          title="No details for this overview"
+          detail="It was probably replaced by a re-run of the review."
+        />
+      ) : (
+        <Section title="Overview">
+          <div className="rounded-lg border border-border bg-card p-3">
+            <Markdown content={details} />
+          </div>
+        </Section>
+      )}
+    </div>
   );
 }
 

@@ -8,9 +8,6 @@ import {
   githubBlobUrl,
   formatContext,
   formatFileList,
-  findBadPaths,
-  formatBadPaths,
-  highlightLocations,
   parsePrSnapshot,
   parseReviewComments,
   buildReviewPrompt,
@@ -119,7 +116,7 @@ describe("parseReport", () => {
       JSON.stringify({ summary: "looks ok", findings: [complete] }),
     );
     expect(errors).toEqual([]);
-    expect(report?.summary).toBe("looks ok");
+    expect(report?.overview).toBe("looks ok");
     expect(report?.findings).toHaveLength(1);
     expect(report?.findings[0]?.startLine).toBe(4);
   });
@@ -178,112 +175,33 @@ describe("parseReport", () => {
     const { report, errors } = parseReport(JSON.stringify({ summary: "clean", findings: [] }));
     expect(errors).toEqual([]);
     expect(report?.findings).toEqual([]);
-    // A report from before highlights existed is still whole.
-    expect(report?.highlights).toEqual([]);
   });
 });
 
-describe("parseReport highlights", () => {
-  const highlight = {
-    title: "Sessions now expire server-side",
-    summary: "The expiry check moved from the client to the session store.",
-    locations: [{ file: "src/session.ts", startLine: 40, endLine: 61, note: "the new check" }],
-  };
-
-  it("keeps highlights in the order the agent gave them", () => {
+describe("parseReport overview", () => {
+  it("keeps both parts of the overview as written, code blocks included", () => {
+    const overview = "- **Sessions now expire.**";
+    const overviewDetails = "- **Sessions now expire.**\n\n  ```ts\n  if (stale) return null;\n  ```";
     const { report, errors } = parseReport(
-      JSON.stringify({
-        findings: [],
-        highlights: [highlight, { ...highlight, title: "Second" }],
-      }),
+      JSON.stringify({ overview, overviewDetails, findings: [] }),
     );
     expect(errors).toEqual([]);
-    expect(report?.highlights.map((entry) => entry.title)).toEqual([
-      "Sessions now expire server-side",
-      "Second",
-    ]);
-    expect(report?.highlights[0]?.locations[0]).toEqual(highlight.locations[0]);
+    expect(report?.overview).toBe(overview);
+    expect(report?.overviewDetails).toBe(overviewDetails);
   });
 
-  it("accepts references or a bare path:line string in place of locations", () => {
+  it("reads a report's old one-paragraph summary as its overview", () => {
+    const { report } = parseReport(JSON.stringify({ summary: "clean", findings: [] }));
+    expect(report?.overview).toBe("clean");
+    expect(report?.overviewDetails).toBe("");
+  });
+
+  it("ignores the highlights a report from the previous version carries", () => {
     const { report, errors } = parseReport(
-      JSON.stringify({
-        findings: [],
-        highlights: [
-          { title: "t", description: "d", references: ["src/session.ts:40-61"] },
-        ],
-      }),
+      JSON.stringify({ overview: "o", findings: [], highlights: [{ title: "t" }] }),
     );
     expect(errors).toEqual([]);
-    expect(report?.highlights[0]).toEqual({
-      title: "t",
-      summary: "d",
-      locations: [{ file: "src/session.ts", startLine: 40, endLine: 61, note: "" }],
-    });
-  });
-
-  it("drops a highlight with no code to show, keeping the rest of the report", () => {
-    const { report, errors } = parseReport(
-      JSON.stringify({
-        findings: [],
-        highlights: [{ title: "t", summary: "s", locations: [] }, highlight],
-      }),
-    );
-    expect(report?.highlights).toHaveLength(1);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("highlight 1 dropped");
-    expect(errors[0]).toContain("locations");
-  });
-
-  it("warns rather than failing when highlights is not an array", () => {
-    const { report, errors } = parseReport(
-      JSON.stringify({ findings: [], highlights: "the auth change" }),
-    );
-    expect(report?.highlights).toEqual([]);
-    expect(errors[0]).toContain('"highlights" dropped');
-  });
-});
-
-describe("highlightLocations", () => {
-  it("shows the highlight's own code, then code its summary cites, none primary", () => {
-    const locations = highlightLocations({
-      summary: "Mirrors src/old.ts:5 and again src/session.ts:40.",
-      locations: [{ file: "src/session.ts", startLine: 40, endLine: 61, note: "the new check" }],
-    });
-    expect(locations).toEqual([
-      { file: "src/session.ts", startLine: 40, endLine: 61, note: "the new check", isPrimary: false },
-      { file: "src/old.ts", startLine: 5, endLine: 5, note: "", isPrimary: false },
-    ]);
-  });
-});
-
-describe("findBadPaths", () => {
-  it("checks highlight locations as well as findings, naming which entry", () => {
-    const bad = findBadPaths(
-      {
-        findings: [],
-        highlights: [
-          {
-            title: "t",
-            summary: "s",
-            locations: [
-              { file: "src/ok.ts", startLine: 1, endLine: 1, note: "" },
-              { file: "session.ts", startLine: 1, endLine: 1, note: "" },
-            ],
-          },
-        ],
-      },
-      ["src/ok.ts", "src/session.ts"],
-    );
-    expect(bad).toEqual([
-      {
-        entry: "highlight 1",
-        field: "locations[1].file",
-        file: "session.ts",
-        candidates: ["src/session.ts"],
-      },
-    ]);
-    expect(formatBadPaths(bad)).toContain("highlight 1, locations[1].file: session.ts");
+    expect(report).toEqual({ overview: "o", overviewDetails: "", findings: [] });
   });
 });
 
@@ -309,11 +227,14 @@ describe("buildReviewPrompt", () => {
     );
   });
 
-  it("asks for highlights, kept apart from findings", () => {
+  it("asks for an overview that quotes code and stays clear of findings", () => {
     const prompt = buildReviewPrompt(base);
-    expect(prompt).toContain("## Point out what is worth a look");
-    expect(prompt).toContain('"highlights"');
-    expect(prompt).toContain("do not repeat a finding here");
+    expect(prompt).toContain("## Write the overview");
+    expect(prompt).toContain('"overview"');
+    expect(prompt).toContain('"overviewDetails"');
+    expect(prompt).toContain("**bold clause**");
+    expect(prompt).toContain("Keep it to a screenful");
+    expect(prompt).toContain("Problems belong in");
   });
 
   it("sends the agent to the plugin, never to gh", () => {
